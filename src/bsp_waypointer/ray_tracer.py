@@ -52,6 +52,24 @@ class BSPRayTracer:
             hit=False, fraction=1.0, end_pos=Vector3.zero()
         )
 
+    def point_in_solid(self, point: Vector3) -> bool:
+        """Walk the BSP tree and report whether a point is in a solid leaf."""
+        if not self.bsp.nodes:
+            return False
+        idx = 0
+        while idx >= 0:
+            if idx >= len(self.bsp.nodes):
+                return False
+            node = self.bsp.nodes[idx]
+            if node.plane_index >= len(self.bsp.planes):
+                return False
+            plane = self.bsp.planes[node.plane_index]
+            idx = node.children[0] if plane.distance_to_point(point) >= 0 else node.children[1]
+        leaf_index = -1 - idx
+        if leaf_index >= len(self.bsp.leafs):
+            return False
+        return bool(self.bsp.leafs[leaf_index].contents & ContentFlags.CONTENTS_SOLID)
+
     def line_of_sight(
         self,
         start: Vector3,
@@ -219,7 +237,7 @@ class BSPRayTracer:
         # Check if we're in a leaf
         if node_index < 0:
             leaf_index = -1 - node_index
-            self._trace_to_leaf(leaf_index, result)
+            self._trace_to_leaf(leaf_index, start_frac, result)
             return
 
         if node_index >= len(self.bsp.nodes):
@@ -371,12 +389,15 @@ class BSPRayTracer:
 
         return -offset
 
-    def _trace_to_leaf(self, leaf_index: int, result: TraceResult) -> None:
+    def _trace_to_leaf(
+        self, leaf_index: int, start_frac: float, result: TraceResult
+    ) -> None:
         """
         Check for collision with brushes in a leaf.
 
         Args:
             leaf_index: Index of the leaf to check
+            start_frac: Fraction along the trace where this segment begins
             result: TraceResult to update
         """
         if leaf_index >= len(self.bsp.leafs):
@@ -386,10 +407,12 @@ class BSPRayTracer:
 
         # Check contents
         if leaf.contents & ContentFlags.CONTENTS_SOLID:
-            result.start_solid = True
-            result.all_solid = True
-            result.fraction = 0.0
-            result.hit = True
+            if start_frac < result.fraction:
+                result.fraction = start_frac
+                result.hit = True
+            if start_frac <= 0.0:
+                result.start_solid = True
+                result.all_solid = True
 
     def _trace_to_leaf_with_extents(
         self,

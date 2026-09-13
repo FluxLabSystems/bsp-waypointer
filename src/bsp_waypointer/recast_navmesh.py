@@ -207,8 +207,8 @@ class RecastNavmeshGenerator:
         edges = []
 
         # Extract polygons from Recast navmesh
-        if hasattr(nav_data, "polygons"):
-            for i, poly_data in enumerate(nav_data.polygons):
+        if "polygons" in nav_data:
+            for i, poly_data in enumerate(nav_data["polygons"]):
                 vertices = [
                     Vector3(v[0], v[1], v[2]) for v in poly_data.vertices
                 ]
@@ -227,6 +227,9 @@ class RecastNavmeshGenerator:
                         neighbors=neighbors,
                     )
                 )
+
+        # Compute connectivity edges (same as fallback path)
+        edges = self._compute_connectivity(polygons)
 
         return NavigationMesh(
             polygons=polygons,
@@ -325,9 +328,10 @@ class RecastNavmeshGenerator:
 
             # Find coplanar neighbors to merge
             merge_candidates = self._find_merge_candidates(
-                i, polygons, spatial_hash, cell_size
+                i, polygons, spatial_hash, cell_size, merged
             )
 
+            merged_poly = None
             if merge_candidates:
                 # Merge polygons
                 merged_poly = self._merge_polygons_list(
@@ -338,7 +342,7 @@ class RecastNavmeshGenerator:
                     result.append(merged_poly)
                     for j in merge_candidates:
                         merged[j] = True
-            else:
+            if merged_poly is None:
                 poly.index = len(result)
                 result.append(poly)
 
@@ -352,6 +356,7 @@ class RecastNavmeshGenerator:
         polygons: List[NavPolygon],
         spatial_hash: dict,
         cell_size: float,
+        merged: List[bool],
     ) -> List[int]:
         """Find polygons that can be merged with the given polygon."""
         poly = polygons[poly_idx]
@@ -368,7 +373,7 @@ class RecastNavmeshGenerator:
                     continue
 
                 for j in spatial_hash[key]:
-                    if j <= poly_idx:
+                    if j <= poly_idx or merged[j]:
                         continue
 
                     other = polygons[j]
@@ -564,15 +569,14 @@ class RecastNavmeshGenerator:
         if len(vertices) < 3:
             return 0.0
 
-        # Calculate area using cross product sum
-        area = 0.0
+        # Calculate area using vector shoelace formula
+        total = Vector3.zero()
         n = len(vertices)
         for i in range(n):
             j = (i + 1) % n
-            cross = vertices[i].cross(vertices[j])
-            area += cross.length()
+            total = total + vertices[i].cross(vertices[j])
 
-        return abs(area) / 2
+        return total.length() / 2
 
 
 def is_recast_available() -> bool:

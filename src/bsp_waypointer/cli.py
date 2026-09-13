@@ -82,6 +82,19 @@ Examples:
         help=f"Maximum waypoints (default: {MAX_WAYPOINTS})",
     )
 
+    general.add_argument(
+        "--game-dir",
+        type=Path,
+        action="append",
+        default=None,
+        metavar="DIR",
+        help=(
+            "Game content directory searched for prop models (loose files "
+            "and *_dir.vpk archives); repeatable. Default: derived from the "
+            "BSP location"
+        ),
+    )
+
     # Entity options
     entities = parser.add_argument_group("Entity Options")
     entities.add_argument(
@@ -253,6 +266,7 @@ def generate_waypoints(
     debug_text: bool = False,
     visibility: bool = False,
     verbose: bool = False,
+    game_dirs: Optional[List[Path]] = None,
 ) -> int:
     """
     Generate waypoints from a BSP file.
@@ -260,6 +274,10 @@ def generate_waypoints(
     Returns:
         Exit code (0 = success, 1 = error)
     """
+    if game_dirs:
+        from .model_resolver import set_default_game_dirs
+        set_default_game_dirs(game_dirs)
+        logger.info(f"Model content dirs: {', '.join(str(d) for d in game_dirs)}")
     # Validate input
     if not bsp_path.exists():
         logger.error(f"Input file not found: {bsp_path}")
@@ -292,7 +310,12 @@ def generate_waypoints(
         mesh = extractor.extract(bsp, parser)
         ladders = extractor.get_ladders()
         logger.info(f"  Triangles: {mesh.num_triangles}")
+        brush_count, brush_tris = extractor.get_brush_entity_stats()
+        logger.info(f"  Brush entities: {brush_count} ({brush_tris} triangles)")
         logger.info(f"  Ladders detected: {len(ladders)}")
+        logger.info(f"  Static props: {len(getattr(bsp, 'static_props', []))}")
+        prop_count, prop_tris = extractor.get_prop_mesh_stats()
+        logger.info(f"  Prop collision meshes: {prop_count} ({prop_tris} triangles)")
 
         # Debug OBJ output
         if debug_obj:
@@ -312,9 +335,7 @@ def generate_waypoints(
         logger.info("Generating navigation mesh...")
 
         # Select navmesh generator
-        if navmesh_generator == "recast" or (
-            navmesh_generator == "recast" and is_recast_available()
-        ):
+        if navmesh_generator == "recast":
             if is_recast_available():
                 logger.info("  Using Recast navmesh generator")
             else:
@@ -355,6 +376,12 @@ def generate_waypoints(
             logger.info(f"  Chargers: {len(entities.chargers)}")
             logger.info(f"  Ammo pickups: {len(entities.ammo_pickups)}")
             logger.info(f"  Teleporters: {len(entities.teleporters)}")
+            logger.info(f"  Doors: {len(entities.doors)}")
+            logger.info(f"  Prop obstacles: {len(getattr(entities, 'prop_obstacles', []))}")
+            logger.info(f"  Push volumes: {len(getattr(entities, 'push_volumes', []))}")
+            logger.info(f"  Hurt volumes: {len(getattr(entities, 'hurt_volumes', []))}")
+            logger.info(f"  Useable ladders: {len(getattr(entities, 'useable_ladders', []))}")
+            logger.info(f"  Lifts: {len(getattr(entities, 'lifts', []))}")
 
             # Apply filters
             if not include_chargers:
@@ -381,6 +408,18 @@ def generate_waypoints(
         )
         waypoints = converter.convert(navmesh, entities, ladders)
         logger.info(f"  Total waypoints: {len(waypoints)}")
+        report = getattr(converter, "connectivity_report", None)
+        if report:
+            logger.info(
+                f"  Connectivity: {report['bridges']} bridges, "
+                f"{report['return_edges']} return edges, "
+                f"{report['spawn_coverage']:.0%} spawn coverage"
+            )
+            if report["bridges"] > 10:
+                logger.warning(
+                    "  High bridge count - Stage A connection thresholds "
+                    "may be wrong for this map"
+                )
 
         # Count special waypoints
         weapon_count = sum(
@@ -465,6 +504,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         debug_text=args.debug_text,
         visibility=args.visibility,
         verbose=args.verbose,
+        game_dirs=args.game_dir,
     )
 
 

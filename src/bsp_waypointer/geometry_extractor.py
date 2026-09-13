@@ -14,6 +14,7 @@ from typing import List, Optional, Set, Tuple
 import numpy as np
 
 from .bsp_parser import BSPFile, BSPParser, Face
+from .constants import NONSOLID_BRUSH_ENTITIES, SOLID_BRUSH_ENTITIES
 from .vector import BoundingBox, Triangle, Vector3
 
 
@@ -50,7 +51,7 @@ LADDER_TEXTURE_PATTERNS = frozenset(
 
 # Surface flags that indicate non-solid
 SURF_SKY = 0x4
-SURF_SKY2D = 0x8
+SURF_SKY2D = 0x2
 SURF_TRANS = 0x10
 SURF_TRIGGER = 0x40
 SURF_HITBOX = 0x8000
@@ -212,13 +213,23 @@ class GeometryExtractor:
     """
     Extracts geometry from BSP files for navmesh generation.
 
-    Handles world geometry, brush entities, and displacement surfaces.
+    Handles world geometry (model 0), displacement surfaces, and solid
+    static brush entities (e.g. func_brush, func_wall, func_breakable).
+    Brush entities are included only when their classname is in
+    SOLID_BRUSH_ENTITIES and they are solid at spawn (non-solid func_brush
+    solidity modes, start-disabled func_brush, and func_wall_toggle that
+    starts invisible are skipped). Moving brush entities (doors, trains,
+    lifts) and non-solid brush entities are excluded from the static mesh.
     """
 
     def __init__(self):
         self._bsp: Optional[BSPFile] = None
         self._parser: Optional[BSPParser] = None
         self._ladders: List[LadderSurface] = []
+        self._brush_entity_triangles: int = 0
+        self._brush_entity_count: int = 0
+        self._prop_mesh_count: int = 0
+        self._prop_mesh_triangles: int = 0
 
     def extract(self, bsp: BSPFile, parser: BSPParser) -> TriangleMesh:
         """
@@ -234,6 +245,10 @@ class GeometryExtractor:
         self._bsp = bsp
         self._parser = parser
         self._ladders = []
+        self._brush_entity_triangles = 0
+        self._brush_entity_count = 0
+        self._prop_mesh_count = 0
+        self._prop_mesh_triangles = 0
 
         # Extract world geometry (model 0)
         world_mesh = self._extract_world_geometry()
@@ -243,6 +258,13 @@ class GeometryExtractor:
 
         # Merge all meshes
         result = world_mesh.merge(disp_mesh)
+
+        # Merge in solid static brush-entity geometry
+        result = result.merge(self._extract_brush_entity_geometry())
+
+        # Merge solid static-prop collision meshes (.phy via the model
+        # resolver) so the navmesh forms on top of props
+        result = result.merge(self._extract_static_prop_geometry())
 
         return result
 
@@ -263,11 +285,29 @@ class GeometryExtractor:
             world_model.first_face, world_model.num_faces
         )
 
-    def _extract_model_geometry(self, first_face: int, num_faces: int) -> TriangleMesh:
-        """Extract geometry from a range of faces."""
+    def _extract_model_geometry(
+        self,
+        first_face: int,
+        num_faces: int,
+        offset: Optional[Vector3] = None,
+    ) -> TriangleMesh:
+        """
+        Extract geometry from a range of faces.
+
+        Args:
+            first_face: Index of the first face in the model
+            num_faces: Number of faces in the model
+            offset: Optional translation added to every vertex (used for
+                brush entities whose vertices are stored relative to the
+                entity's origin keyvalue)
+        """
         all_vertices: List[Tuple[float, float, float]] = []
         all_triangles: List[Tuple[int, int, int]] = []
         vertex_index = 0
+
+        ox = oy = oz = 0.0
+        if offset is not None:
+            ox, oy, oz = offset.x, offset.y, offset.z
 
         for i in range(first_face, first_face + num_faces):
             if i >= len(self._bsp.faces):
@@ -286,7 +326,7 @@ class GeometryExtractor:
 
             # Check for ladder textures
             if self._is_ladder_texture(tex_name):
-                self._record_ladder_surface(face)
+                self._record_ladder_surface(face, offset)
                 continue
 
             # Get face vertices
@@ -294,12 +334,18 @@ class GeometryExtractor:
             if len(face_verts) < 3:
                 continue
 
-            # Triangulate the face (fan triangulation)
+            # Triangulate the face (fan triangulation), then orient the
+            # winding to the face's TRUE normal (plane normal +- side).
+            # Stored vertex order is not reliably front-facing: on stock
+            # maps ~half the windings are reversed, which turned ceiling
+            # undersides into "walkable" floors and planted waypoints
+            # inside solid geometry.
             triangles = self._triangulate_polygon(face_verts)
+            triangles = self._orient_to_face_normal(face, face_verts, triangles)
 
             # Add vertices and triangles
             for v in face_verts:
-                all_vertices.append((v.x, v.y, v.z))
+                all_vertices.append((v.x + ox, v.y + oy, v.z + oz))
 
             for tri in triangles:
                 all_triangles.append(
@@ -317,6 +363,160 @@ class GeometryExtractor:
                 vertices=np.zeros((0, 3), dtype=np.float32),
                 triangles=np.zeros((0, 3), dtype=np.int32),
             )
+
+        return TriangleMesh(
+            vertices=np.array(all_vertices, dtype=np.float32),
+            triangles=np.array(all_triangles, dtype=np.int32),
+        )
+
+    def _extract_brush_entity_geometry(self) -> TriangleMesh:
+        """
+        Extract geometry from solid static brush entities.
+
+        Only entities whose classname is in SOLID_BRUSH_ENTITIES are
+        considered, and entities that are non-solid at spawn (func_brush
+        solidity/startdisabled, func_wall_toggle starting invisible) are
+        skipped. Each BSP model is extracted at most once even if multiple
+        entities reference it.
+        """
+        result = TriangleMesh(
+            vertices=np.zeros((0, 3), dtype=np.float32),
+            triangles=np.zeros((0, 3), dtype=np.int32),
+        )
+
+        seen_models: Set[int] = set()
+
+        for entity in self._bsp.entities:
+            classname = entity.classname
+            if classname not in SOLID_BRUSH_ENTITIES:
+                continue
+            if classname in NONSOLID_BRUSH_ENTITIES:
+                continue
+
+            # Solidity exceptions
+            if classname == "func_brush":
+                # solidity: 0 = toggle (starts solid), 1 = never solid, 2 = always solid
+                if entity.get_int("solidity", 0) == 1:
+                    continue
+                if entity.get_int("startdisabled", 0) == 1:
+                    continue
+            elif classname == "func_wall_toggle":
+                # Spawnflag 1 = starts invisible (non-solid)
+                if entity.get_int("spawnflags", 0) & 1:
+                    continue
+
+            # Resolve the entity's BSP model reference ("*N")
+            model_ref = entity.get("model", "")
+            if not model_ref.startswith("*"):
+                continue
+            try:
+                model_index = int(model_ref[1:])
+            except ValueError:
+                continue
+            # Index 0 is worldspawn and must never be re-extracted
+            if model_index == 0:
+                continue
+            if not (0 <= model_index < len(self._bsp.models)):
+                continue
+            if model_index in seen_models:
+                continue
+            seen_models.add(model_index)
+
+            model = self._bsp.models[model_index]
+            mesh = self._extract_model_geometry(
+                model.first_face,
+                model.num_faces,
+                offset=entity.get_vector("origin"),
+            )
+            if mesh.num_triangles == 0:
+                continue
+
+            result = result.merge(mesh)
+            self._brush_entity_count += 1
+            self._brush_entity_triangles += mesh.num_triangles
+
+        return result
+
+    def get_brush_entity_stats(self) -> Tuple[int, int]:
+        """Get (entity_count, triangle_count) contributed by brush entities."""
+        return (self._brush_entity_count, self._brush_entity_triangles)
+
+    def get_prop_mesh_stats(self) -> Tuple[int, int]:
+        """Get (prop_count, triangle_count) contributed by static props."""
+        return (self._prop_mesh_count, self._prop_mesh_triangles)
+
+    def _extract_static_prop_geometry(self) -> TriangleMesh:
+        """
+        Build a mesh from solid static props' .phy collision geometry.
+
+        Props whose model resolves with a collision mesh contribute
+        their triangles (rotated and translated into world space) so the
+        navmesh can form on top of them. Both windings are emitted since
+        IVP triangle orientation isn't guaranteed; the walkable-slope
+        filter keeps whichever faces up. Props without resolvable
+        geometry remain obstacle-only (handled by the entity analyzer).
+        """
+        empty = TriangleMesh(
+            vertices=np.zeros((0, 3), dtype=np.float32),
+            triangles=np.zeros((0, 3), dtype=np.int32),
+        )
+
+        static_props = getattr(self._bsp, "static_props", [])
+        if not static_props:
+            return empty
+
+        try:
+            from .model_resolver import ModelResolver, angle_matrix, rotate_point
+            resolver = ModelResolver(bsp=self._bsp)
+        except Exception:
+            return empty
+
+        all_vertices: List[Tuple[float, float, float]] = []
+        all_triangles: List[Tuple[int, int, int]] = []
+        vertex_index = 0
+
+        for prop in static_props:
+            if not prop.is_solid:
+                continue
+            try:
+                geo = resolver.resolve(prop.model_name)
+            except Exception:
+                continue
+            if geo is None or not geo.has_collision_mesh:
+                continue
+
+            # Only standable props contribute walkable surface. Narrow
+            # props (railings, poles, pipes, fences) can't support a
+            # 32u-wide player; meshing their tops planted waypoints
+            # bots hop against forever. They remain nav obstacles via
+            # the entity analyzer regardless.
+            size = geo.maxs - geo.mins
+            if min(size.x, size.y) < 48.0 or size.z > 4 * max(size.x, size.y):
+                continue
+
+            matrix = angle_matrix(prop.angles)
+            center = (geo.mins + geo.maxs) / 2
+            for tri in geo.triangles:
+                # Orient outward from the model center (IVP winding isn't
+                # guaranteed; emitting both windings planted "walkable"
+                # floors inside prop bases)
+                normal = (tri[1] - tri[0]).cross(tri[2] - tri[0])
+                centroid = (tri[0] + tri[1] + tri[2]) / 3
+                if normal.dot(centroid - center) < 0:
+                    tri = (tri[0], tri[2], tri[1])
+
+                world = [rotate_point(matrix, v) + prop.origin for v in tri]
+                base = vertex_index
+                for v in world:
+                    all_vertices.append((v.x, v.y, v.z))
+                vertex_index += 3
+                all_triangles.append((base, base + 1, base + 2))
+
+            self._prop_mesh_count += 1
+            self._prop_mesh_triangles += len(geo.triangles)
+
+        if not all_vertices:
+            return empty
 
         return TriangleMesh(
             vertices=np.array(all_vertices, dtype=np.float32),
@@ -442,10 +642,52 @@ class GeometryExtractor:
                 i3 = i2 + 1
 
                 # Two triangles per quad
-                triangles.append((i0, i2, i1))
-                triangles.append((i1, i2, i3))
+                triangles.append((i0, i1, i2))
+                triangles.append((i1, i3, i2))
+
+        # Orient the grid to the base face's true normal (plane + side):
+        # base-face vertex order is not reliably front-facing, and a
+        # reversed grid makes the walkable filter drop the terrain
+        face = self._bsp.faces[disp_info.map_face]
+        if face.plane_index < len(self._bsp.planes):
+            plane_normal = self._bsp.planes[face.plane_index].normal
+            true_normal = plane_normal if face.side == 0 else -plane_normal
+            tx = ty = tz = 0.0
+            for a, b, c in triangles:
+                ax, ay, az = vertices[a]
+                bx, by, bz = vertices[b]
+                cx, cy, cz = vertices[c]
+                ux, uy, uz = bx - ax, by - ay, bz - az
+                vx, vy, vz = cx - ax, cy - ay, cz - az
+                tx += uy * vz - uz * vy
+                ty += uz * vx - ux * vz
+                tz += ux * vy - uy * vx
+            if tx * true_normal.x + ty * true_normal.y + tz * true_normal.z < 0:
+                triangles = [(a, c, b) for a, b, c in triangles]
 
         return vertices, triangles
+
+    def _orient_to_face_normal(
+        self,
+        face: Face,
+        verts: List[Vector3],
+        triangles: List[Tuple[int, int, int]],
+    ) -> List[Tuple[int, int, int]]:
+        """Flip triangle winding when it disagrees with the true face normal."""
+        if not triangles or face.plane_index >= len(self._bsp.planes):
+            return triangles
+
+        plane_normal = self._bsp.planes[face.plane_index].normal
+        true_normal = plane_normal if face.side == 0 else -plane_normal
+
+        # Accumulated winding normal across the fan (robust to slivers)
+        total = Vector3(0.0, 0.0, 0.0)
+        for a, b, c in triangles:
+            total = total + (verts[b] - verts[a]).cross(verts[c] - verts[a])
+
+        if total.dot(true_normal) < 0:
+            return [(a, c, b) for a, b, c in triangles]
+        return triangles
 
     def _triangulate_polygon(
         self, vertices: List[Vector3]
@@ -483,11 +725,16 @@ class GeometryExtractor:
                 return True
         return False
 
-    def _record_ladder_surface(self, face: Face) -> None:
+    def _record_ladder_surface(
+        self, face: Face, offset: Optional[Vector3] = None
+    ) -> None:
         """Record a ladder surface for waypoint generation."""
         verts = self._parser.get_face_vertices(face)
         if len(verts) < 3:
             return
+
+        if offset is not None:
+            verts = [v + offset for v in verts]
 
         # Calculate bounds
         mins = Vector3(
