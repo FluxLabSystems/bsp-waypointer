@@ -1035,11 +1035,12 @@ class HL2DMWaypointConverter:
     def _detect_sniper_positions(self) -> None:
         """Detect good sniper/crossbow positions.
 
-        Runs after Stage C and never marks a W_FL_UNREACHABLE waypoint:
-        RCBot3 picks a sniper goal by flag (randomWaypointGoal) without
-        testing W_FL_UNREACHABLE, so a flagged sniper spot would send a
-        crossbow bot at a place it has no route to. Only long connections to
-        live waypoints count as sight lines.
+        Runs after Stage C and never marks a W_FL_UNREACHABLE waypoint.
+        RCBot3 builds before rcbot3 dae0c423 pick a sniper goal by flag
+        (randomWaypointGoal) without testing W_FL_UNREACHABLE, so a flagged
+        sniper spot sends a crossbow bot at a place it has no route to; from
+        dae0c423 RCBot3 never takes a flagged goal, so the spot would be
+        wasted. Only long connections to live waypoints count as sight lines.
         """
         if len(self._waypoints) < 10:
             return

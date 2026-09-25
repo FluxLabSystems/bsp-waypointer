@@ -344,8 +344,18 @@ mypy src
 - Some complex geometry may not generate optimal waypoints
 - Areas the traversal model cannot prove reachable are flagged `W_FL_UNREACHABLE`, so bots
   never route through them (on dm_lockdown about a quarter of the waypoints, including
-  some pickups and one spawn room). RCBot3 still walks at a pickup it finds by classname,
-  whatever the waypoint flags say
+  some pickups and one spawn room). RCBot3 builds before rcbot3 `dae0c423` still walk at a
+  pickup they find by classname, whatever the waypoint flags say, and still take a flagged
+  waypoint as a goal. From `dae0c423` they do neither for this generator's files: a pickup
+  whose nearest waypoint is flagged is never sought, so a pickup the model wrongly isolates
+  is skipped. (From rcbot3 `f8a21910` the pickup rule reads the file's author, so a file
+  written with `-a` set to a name that starts with neither `BSP-Waypoint` nor
+  `HL2DM-Manager` keeps its flagged pickups.)
+- The ground probe under a climb reads world brushes only. A climb onto a brush entity or
+  a displacement is judged by the eye line and the hull sweep alone. A climb that rises
+  over a surface the probe cannot see (a brush entity, a prop or a displacement) onto a
+  world floor or ledge is refused, because the probe reads the lower world floor under it
+  (likewise a pool's floor under water)
 - Without ray tracing (`--no-raytracing`, or a library caller that passes no tracer), a
   connection is checked only against the vertical and slope rules and prop boxes
 - Displacement surface support is basic

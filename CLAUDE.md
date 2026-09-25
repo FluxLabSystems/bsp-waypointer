@@ -338,14 +338,19 @@ mypy src                    # Type check
    slope rules and prop boxes. With or without one, a single ladder endpoint connects to
    anything within 200 units with no line-of-sight test. The tracer sees world brushes
    only: the ground probe cannot see displacements, props or brush entities, so a climb
-   onto one of them is judged by the hull sweep and the eye line alone; `line_of_sight`
-   reads leaf contents and misses func_detail brushes, and a flat connection of 256 units
-   or less gets no hull sweep
+   onto one of them is judged by the hull sweep and the eye line alone (onto a prop, also
+   by its box), and a climb that rises over one of them onto a world floor or ledge is
+   refused, because the probe reads the lower world floor under it (likewise a pool's
+   floor under water); `line_of_sight` reads leaf contents and misses func_detail
+   brushes, and a flat connection of 256 units or less gets no hull sweep
 3. **Displacement Surfaces**: Basic support, complex displacements may have issues
 4. **Unproven Areas**: Areas the traversal model cannot prove reachable are flagged
    `W_FL_UNREACHABLE` (about a quarter of dm_lockdown, including some pickups and one
-   spawn room). RCBot3 never routes through them, but it still walks at a pickup it finds
-   by classname, whatever the waypoint flags say
+   spawn room). RCBot3 never routes through them. RCBot3 builds before rcbot3 `dae0c423`
+   still walk at a pickup they find by classname and take flagged goals; from `dae0c423`
+   they do neither for this generator's files, so a pickup the model wrongly isolates is
+   skipped (from rcbot3 `f8a21910` the pickup rule applies only to files whose author
+   starts with `BSP-Waypoint`, or `HL2DM-Manager`)
 
 ## Future Enhancement Areas
 
