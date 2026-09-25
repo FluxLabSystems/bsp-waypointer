@@ -24,7 +24,8 @@ from bsp_waypointer.navmesh_generator import NavigationMesh
 from bsp_waypointer.ray_tracer import BSPRayTracer
 from bsp_waypointer.rcw_validator import validate
 from bsp_waypointer.rcw_writer import RCWWriter
-from bsp_waypointer.vector import ConvexHull, Plane, Vector3, swept_box_intersects_hull
+from bsp_waypointer.vector import (ConvexHull, Plane, Vector3, segment_intersects_aabb,
+                                   swept_box_intersects_hull)
 from bsp_waypointer.waypoint_converter import HL2DMWaypointConverter, Waypoint
 
 UNREACH = WaypointFlag.W_FL_UNREACHABLE
@@ -459,6 +460,99 @@ class TestPropCollision:
         _, two = convert(container_scene())
         assert [(w.origin.to_tuple(), int(w.flags), w.connections) for w in one] == \
                [(w.origin.to_tuple(), int(w.flags), w.connections) for w in two]
+
+
+# ----------------------------------------------------------------------
+# A drop is not its chord. A bot holds the upper height to the ledge,
+# falls, and walks the rest at the lower height, so its path is above the
+# chord near the top and below it near the bottom. The chord threads over
+# a crate standing on the lower floor that the real path walks into.
+# ----------------------------------------------------------------------
+
+CRATE = "models/props_junk/wood_crate001a.mdl"
+LEDGE, LOWER = V(0, 0, 200), V(320, 0, 0)
+
+
+def drop_conv(pieces):
+    conv = HL2DMWaypointConverter(ray_tracer=None)
+    conv._solid_obstacles = [prop(pieces, model=CRATE)]
+    return conv
+
+
+class TestDropPath:
+    def test_the_chord_of_this_drop_really_does_clear_the_crate(self):
+        # the premise of the next test: at 9983a1b the swept chord passed
+        # over the crate and the edge was admitted, so only the legs can
+        # refuse it
+        hulls = prop([((180, -40, 0), (230, 40, 60))], model=CRATE).collision
+        half, lift = V(16, 16, 27), V(0, 0, 45)
+        assert not any(swept_box_intersects_hull(LEDGE + lift, LOWER + lift, half, h)
+                       for h in hulls)
+
+    def test_a_drop_into_a_crate_on_the_lower_floor_is_refused(self):
+        conv = drop_conv([((180, -40, 0), (230, 40, 60))])
+        assert not conv._can_connect(Waypoint(0, LEDGE), Waypoint(1, LOWER))
+
+    def test_a_drop_off_a_ledge_still_connects(self):
+        # nothing on the path: the clear drop is kept
+        conv = drop_conv([((180, 200, 0), (230, 280, 60))])
+        assert conv._can_connect(Waypoint(0, LEDGE), Waypoint(1, LOWER))
+        # a crate against the foot of the ledge is flown over, not walked
+        # into: the landing leg starts where the fall ends, so sweeping
+        # both legs over the whole run (which would refuse this) is wrong
+        crate = prop([((-20, -40, 0), (30, 40, 60))], model=CRATE)
+        assert HL2DMWaypointConverter._clear_of_prop(crate, LEDGE, LOWER, -200.0)
+        conv = drop_conv([((-20, -40, 0), (30, 40, 60))])
+        assert conv._can_connect(Waypoint(0, LEDGE), Waypoint(1, LOWER))
+
+    def test_a_drop_the_chord_refused_is_still_refused(self):
+        # the chord stays in the test beside the legs, so nothing the
+        # straight line blocks becomes walkable: here a pillar in the
+        # middle of the fall, which neither leg passes through
+        pillar = prop([((150, -40, 60), (190, 40, 190))], model=CRATE)
+        half, lift = V(16, 16, 27), V(0, 0, 45)
+        assert any(swept_box_intersects_hull(LEDGE + lift, LOWER + lift, half, h)
+                   for h in pillar.collision)
+        assert not HL2DMWaypointConverter._clear_of_prop(pillar, LEDGE, LOWER, -200.0)
+        conv = drop_conv([((150, -40, 60), (190, 40, 190))])
+        assert not conv._can_connect(Waypoint(0, LEDGE), Waypoint(1, LOWER))
+
+    def test_a_beam_over_the_walk_out_is_refused(self):
+        # the other leg: a beam over the upper walk, at the head height of
+        # a bot still on the ledge but above the chord, which by then has
+        # fallen past it. The box phase only offers the collision test the
+        # props near the body line, so the rule itself is asked here
+        beam = prop([((150, -40, 250), (190, 40, 300))], model=CRATE)
+        half, lift = V(16, 16, 27), V(0, 0, 45)
+        assert not any(swept_box_intersects_hull(LEDGE + lift, LOWER + lift, half, h)
+                       for h in beam.collision)
+        assert not HL2DMWaypointConverter._clear_of_prop(beam, LEDGE, LOWER, -200.0)
+
+    def test_a_shallow_drop_keeps_the_chord(self):
+        # within a crouch-jump the chord is the path; a kerb is stepped over
+        conv = drop_conv([((150, -40, 0), (200, 40, 12))])
+        assert conv._can_connect(Waypoint(0, V(0, 0, 30)), Waypoint(1, LOWER))
+
+
+class TestPropBroadPhase:
+    def test_the_grid_offers_every_prop_a_full_scan_would_test(self):
+        import random
+        rng = random.Random(7)
+        props = []
+        for _ in range(200):
+            x, y = rng.uniform(-3000, 3000), rng.uniform(-3000, 3000)
+            props.append(prop([((x, y, 0.0), (x + rng.uniform(8, 400),
+                                              y + rng.uniform(8, 400), 80.0))], model=CRATE))
+        conv = HL2DMWaypointConverter(ray_tracer=None)
+        conv._solid_obstacles = props
+        assert len(props) > 32                       # above OBSTACLE_GRID_MIN
+        for _ in range(300):
+            a = V(rng.uniform(-3000, 3000), rng.uniform(-3000, 3000), rng.uniform(-40, 120))
+            b = a + V(rng.uniform(-400, 400), rng.uniform(-400, 400), rng.uniform(-100, 100))
+            near = {id(o) for o in conv._obstacles_near(a, b)}
+            hit = [o for o in props
+                   if segment_intersects_aabb(a, b, o.mins, o.maxs, expand=16.0)]
+            assert all(id(o) in near for o in hit)
 
 
 class TestGraphContract:

@@ -7,6 +7,7 @@ HL2DM-specific flags and metadata.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
 
@@ -28,6 +29,8 @@ from .constants import (
     MAX_PATHS_PER_WAYPOINT,
     MAX_WAYPOINTS,
     MIN_WAYPOINT_DISTANCE,
+    PLAYER_RUN_SPEED,
+    WORLD_GRAVITY,
     WaypointFlag,
 )
 from .entity_analyzer import (
@@ -56,6 +59,35 @@ from .vector import Vector3, segment_intersects_aabb, swept_box_intersects_hull
 
 if TYPE_CHECKING:
     from .ray_tracer import BSPRayTracer
+
+
+# Broad phase for the solid-prop blocking test: props are bucketed into a
+# uniform XY grid, so an edge only meets the props near it. Below this many
+# props the grid costs more than the scan it saves, and a prop whose padded
+# box covers more cells than this is kept in a list every query sees.
+OBSTACLE_GRID_CELL = 256.0
+OBSTACLE_GRID_MIN = 32
+OBSTACLE_GRID_MAX_CELLS = 64
+
+
+def _build_obstacle_grid(obstacles) -> Tuple[Dict[Tuple[int, int], List[int]], List[int]]:
+    """Bucket obstacle indices by the XY cells their padded box covers."""
+    size = OBSTACLE_GRID_CELL
+    pad = DEFAULT_PLAYER_DIMS.radius
+    cells: Dict[Tuple[int, int], List[int]] = {}
+    everywhere: List[int] = []
+    for i, obs in enumerate(obstacles):
+        x0 = int(math.floor((obs.mins.x - pad) / size))
+        x1 = int(math.floor((obs.maxs.x + pad) / size))
+        y0 = int(math.floor((obs.mins.y - pad) / size))
+        y1 = int(math.floor((obs.maxs.y + pad) / size))
+        if (x1 - x0 + 1) * (y1 - y0 + 1) > OBSTACLE_GRID_MAX_CELLS:
+            everywhere.append(i)
+            continue
+        for cx in range(x0, x1 + 1):
+            for cy in range(y0, y1 + 1):
+                cells.setdefault((cx, cy), []).append(i)
+    return cells, everywhere
 
 
 @dataclass
@@ -911,6 +943,10 @@ class HL2DMWaypointConverter:
         path has no step taller than a crouch-jump (ladders/lifts provide
         explicit edges); drops are allowed one-way down to
         MAX_DROP_CONNECTION.
+
+        A solid prop is judged by its own collision (_clear_of_prop), and
+        a drop deeper than a crouch-jump by the two legs of its real
+        walk-off-and-fall path, not by its straight chord.
         """
         distance = wp_a.origin.distance_to(wp_b.origin)
 
@@ -965,17 +1001,31 @@ class HL2DMWaypointConverter:
         # more expensive ray tracing. A prop whose box the body line
         # touches is then judged by its own collision when that is known
         # (_clear_of_prop): an open container or a tree canopy no longer
-        # cuts off the item inside or under it
+        # cuts off the item inside or under it. On a drop the body line
+        # runs the two legs of the real path as well as the chord, so
+        # that the box phase offers the mesh phase every prop any of the
+        # three can meet
         body_lift = Vector3(0, 0, DEFAULT_PLAYER_DIMS.step_height)
         seg_a = wp_a.origin + body_lift
         seg_b = wp_b.origin + body_lift
         for hz in getattr(self, "_hazards", []):
             if segment_intersects_aabb(seg_a, seg_b, hz.mins, hz.maxs):
                 return False
-        for obs in getattr(self, "_solid_obstacles", []):
-            if segment_intersects_aabb(
-                seg_a, seg_b, obs.mins, obs.maxs,
-                expand=DEFAULT_PLAYER_DIMS.radius,
+        legs = ((seg_a, seg_b),)
+        if rise < -CROUCH_JUMP_RISE:
+            split = self._drop_walk_split(wp_a.origin, wp_b.origin)
+            legs = (
+                (seg_a, seg_b),
+                (seg_a, seg_a + split),
+                (Vector3(seg_b.x - split.x, seg_b.y - split.y, seg_b.z), seg_b),
+            )
+        for obs in self._obstacles_near(seg_a, seg_b):
+            if any(
+                segment_intersects_aabb(
+                    leg_a, leg_b, obs.mins, obs.maxs,
+                    expand=DEFAULT_PLAYER_DIMS.radius,
+                )
+                for leg_a, leg_b in legs
             ) and not self._clear_of_prop(obs, wp_a.origin, wp_b.origin, rise):
                 return False
 
@@ -1017,20 +1067,68 @@ class HL2DMWaypointConverter:
 
         return True
 
+    def _obstacles_near(self, seg_a: Vector3, seg_b: Vector3):
+        """
+        The solid props whose padded box can meet the segment's column.
+
+        The blocking test is O(pairs x props), and a conversion runs it
+        tens of millions of times, so the props are bucketed once into a
+        uniform XY grid (their boxes already padded by the player radius)
+        and a query returns only the buckets the segment's XY bounds
+        cover. That is a superset of the props the box test can hit, so
+        the answer is the same as scanning them all. The grid is rebuilt
+        whenever the obstacle list is replaced (tests set it directly),
+        and a short list is scanned as before.
+        """
+        obstacles = getattr(self, "_solid_obstacles", [])
+        if len(obstacles) <= OBSTACLE_GRID_MIN:
+            return obstacles
+        cached = getattr(self, "_obstacle_grid", None)
+        if cached is None or cached[0] is not obstacles or cached[1] != len(obstacles):
+            cached = (obstacles, len(obstacles)) + _build_obstacle_grid(obstacles)
+            self._obstacle_grid = cached
+        cells, everywhere = cached[2], cached[3]
+        size = OBSTACLE_GRID_CELL
+        x0 = int(math.floor(min(seg_a.x, seg_b.x) / size))
+        x1 = int(math.floor(max(seg_a.x, seg_b.x) / size))
+        y0 = int(math.floor(min(seg_a.y, seg_b.y) / size))
+        y1 = int(math.floor(max(seg_a.y, seg_b.y) / size))
+        if not everywhere and x0 == x1 and y0 == y1:
+            bucket = cells.get((x0, y0))
+            if not bucket:
+                return ()
+            return [obstacles[i] for i in bucket]
+        found = set(everywhere)
+        for cx in range(x0, x1 + 1):
+            for cy in range(y0, y1 + 1):
+                bucket = cells.get((cx, cy))
+                if bucket:
+                    found.update(bucket)
+        return [obstacles[i] for i in sorted(found)]
+
     @staticmethod
     def _clear_of_prop(obs, a: Vector3, b: Vector3, rise: float) -> bool:
         """
         Whether a path whose body line touches a prop's box clears the
         prop's own collision.
 
-        The player box (radius 16) is swept from A to B between step
-        height and head height, as the engine traces a player hull, and
-        tested against each convex piece of the prop's .phy. Anything
-        lower is stepped over. A prop with no known collision (no .phy,
-        a mopp or partial mesh, SOLID_BBOX) keeps its box, and so does a
-        climb (a rise above CROUCH_JUMP_RISE): the ground probe cannot
-        see props, so over one the box is all that refuses a climb up its
-        side onto its top.
+        The player box (radius 16) is swept between step height and head
+        height, as the engine traces a player hull, and tested against
+        each convex piece of the prop's .phy.
+
+        On a flat edge (a rise or drop of no more than CROUCH_JUMP_RISE)
+        the sweep follows the straight chord, and anything lower than
+        step height is stepped over. A drop deeper than that is not its
+        chord: the bot walks out at A's height to the ledge, falls, and
+        walks on at B's height, a path that runs above the chord near A
+        and below it near B. Such a drop must clear the two legs of that
+        path as well as the chord (_clear_of_drop), so the collision test
+        can only refuse more drops than the chord alone, never fewer.
+
+        A prop with no known collision (no .phy, a mopp or partial mesh,
+        SOLID_BBOX) keeps its box, and so does a climb (a rise above
+        CROUCH_JUMP_RISE): the ground probe cannot see props, so over one
+        the box is all that refuses a climb up its side onto its top.
         """
         hulls = getattr(obs, "collision", None)
         if not hulls or rise > CROUCH_JUMP_RISE:
@@ -1039,9 +1137,60 @@ class HL2DMWaypointConverter:
         half_height = (dims.standing_height - dims.step_height) / 2
         lift = Vector3(0, 0, dims.step_height + half_height)
         half = Vector3(dims.radius, dims.radius, half_height)
+        if rise < -CROUCH_JUMP_RISE:
+            return HL2DMWaypointConverter._clear_of_drop(hulls, a, b, half, lift)
         start, end = a + lift, b + lift
         return not any(
             swept_box_intersects_hull(start, end, half, hull) for hull in hulls
+        )
+
+    @staticmethod
+    def _drop_walk_split(a: Vector3, b: Vector3) -> Vector3:
+        """
+        How much of a drop's horizontal run each leg of it walks.
+
+        A bot holds A's height until it runs off the ledge, falls, and
+        walks the rest at B's height. Where it leaves is not known, so
+        each leg takes every part of the run it could cover. The fall
+        takes sqrt(2h/g) seconds and carries the bot `reach` units of
+        ground in that time, so the walk-out ends at least `reach` short
+        of B and the landing walk starts at least `reach` past A. The
+        returned offset is that shared horizontal stretch, measured from
+        A along the run; it is zero when the fall outruns the run, which
+        leaves the two standing boxes alone (the bot steps off at A and
+        is still falling at B).
+        """
+        span = a.distance_to_2d(b)
+        reach = PLAYER_RUN_SPEED * math.sqrt(2.0 * (a.z - b.z) / WORLD_GRAVITY)
+        frac = max(0.0, span - reach) / span if span > 0.0 else 0.0
+        return Vector3((b.x - a.x) * frac, (b.y - a.y) * frac, 0.0)
+
+    @staticmethod
+    def _clear_of_drop(
+        hulls, a: Vector3, b: Vector3, half: Vector3, lift: Vector3
+    ) -> bool:
+        """
+        Whether a drop clears a prop's collision on all three of its
+        lines: the chord, the walk-out leg and the landing leg.
+
+        The walk-out is swept at A's height and the landing walk at B's,
+        each over the stretch of the run _drop_walk_split gives it. The
+        straight chord stays in the test beside them. It is not a line
+        the bot walks, but it is what the box phase and the eye line use,
+        and keeping it means the two legs can only take drops away from
+        the chord's verdict, never add one: no drop the chord refused
+        becomes walkable here. It also stands in for the fall itself,
+        which is the stretch of the path neither leg covers.
+        """
+        flat = HL2DMWaypointConverter._drop_walk_split(a, b)
+        start, end = a + lift, b + lift
+        walk_out_end = a + flat + lift
+        landing_start = Vector3(b.x - flat.x, b.y - flat.y, b.z) + lift
+        return not any(
+            swept_box_intersects_hull(start, end, half, hull)
+            or swept_box_intersects_hull(start, walk_out_end, half, hull)
+            or swept_box_intersects_hull(landing_start, end, half, hull)
+            for hull in hulls
         )
 
     def _assign_geometry_flags(self, navmesh: NavigationMesh) -> None:

@@ -337,8 +337,11 @@ mypy src                    # Type check
 2. **Line-of-Sight**: Without a ray tracer, connection validity uses only the vertical and
    slope rules and the props. A solid prop is judged by its own collision: the player box,
    swept from step height to head height, must clear each convex piece of its `.phy`
-   (`_clear_of_prop`). Its box decides instead when that collision is unknown (no `.phy`,
-   a partial or concave one, `SOLID_BBOX`) and for a climb (a rise above a crouch-jump);
+   (`_clear_of_prop`). A flat edge is swept along its straight chord; a drop deeper than a
+   crouch-jump must clear the two legs of its real path as well as the chord, because a bot
+   walks out at the upper height, falls, and walks on at the lower one (`_clear_of_drop`).
+   Its box decides instead when that collision is unknown (no `.phy`, a partial or concave
+   one, `SOLID_BBOX`) and for a climb (a rise above a crouch-jump);
    placement still drops the navmesh samples inside a prop's box
    (`_cull_blocked_samples`). With or without a tracer, a single ladder endpoint connects to
    anything within 200 units with no line-of-sight test. The tracer sees world brushes

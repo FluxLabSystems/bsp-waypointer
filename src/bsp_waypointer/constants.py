@@ -576,6 +576,16 @@ CROUCH_JUMP_RISE = 45.0
 # Maximum one-way drop connection depth (survivable fall)
 MAX_DROP_CONNECTION = 600.0
 
+# The walk-off-and-fall path of a drop. A bot leaves the upper surface at a
+# ledge, falls, then walks on at the lower height, so how far it travels
+# while falling decides how much of the path belongs to each height.
+# HL2DM's normal run speed (hl2_normspeed; sprinting is 320) and the
+# default sv_gravity. The slower speed is the conservative choice: it
+# shortens the fall's horizontal reach, so each leg of the path is swept
+# over more of it.
+PLAYER_RUN_SPEED = 190.0
+WORLD_GRAVITY = 600.0
+
 # Fraction of spawn waypoints expected to reach the traversable component;
 # below it the CLI warns
 SPAWN_REACH_COVERAGE = 0.95

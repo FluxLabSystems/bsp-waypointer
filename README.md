@@ -357,10 +357,15 @@ mypy src
   world floor or ledge is refused, because the probe reads the lower world floor under it
   (likewise a pool's floor under water)
 - A solid prop is judged by its own collision (the convex pieces of its `.phy`, which the
-  player box swept from step height to head height must clear). Its box is used instead
-  when that collision is unknown (no `.phy`, a partial or concave one, `SOLID_BBOX`) and for
-  a climb over it. A waypoint within a player radius of a prop's collision (an item lying
-  against a prop, whose waypoint is on the item) is still cut off: no player can stand there
+  player box swept from step height to head height must clear). A flat edge is swept along
+  its straight chord; a drop deeper than a crouch-jump must clear the two legs of the real
+  path (walk out at the upper height, fall, walk on at the lower one) as well as the chord,
+  since the chord is not a line a bot is ever on. Neither leg models where the bot actually
+  leaves the ledge, and there is no landing or ground check under a drop. The prop's box is
+  used instead when that collision is unknown (no `.phy`, a partial or concave one,
+  `SOLID_BBOX`) and for a climb over it. A waypoint within a player radius of a prop's
+  collision (an item lying against a prop, whose waypoint is on the item) is still cut
+  off: no player can stand there
 - Without ray tracing (`--no-raytracing`, or a library caller that passes no tracer), a
   connection is checked only against the vertical and slope rules and the props
 - Displacement surface support is basic
