@@ -1,6 +1,6 @@
 # BSP Waypoint Generator for HL2DM
 
-A standalone command-line tool that parses Source Engine `.bsp` map files and automatically generates RCBot2 waypoints for **Half-Life 2: Deathmatch** without requiring the game engine to be running.
+A standalone command-line tool that parses Source Engine `.bsp` map files and automatically generates RCBot3 waypoints for **Half-Life 2: Deathmatch** without requiring the game engine to be running.
 
 ## Features
 
@@ -17,10 +17,14 @@ A standalone command-line tool that parses Source Engine `.bsp` map files and au
   - Buttons and doors
 - **Smart Waypoint Generation**:
   - Navigation mesh generation from geometry
-  - Automatic connection computation
+  - Automatic connection computation; every connection passes the traversal model
+  - Waypoints no traversable connection joins to the main component are flagged
+    `W_FL_UNREACHABLE`, never bridged
   - Sniper position detection
-  - Waypoint count optimization (respects RCBot2's 2048 limit)
-- **RCBot2 Compatible Output**: Writes `.rcw` waypoint files with proper flags
+  - Waypoint count optimization (respects RCBot3's 2048-waypoint and 255-path limits)
+  - Reproducible: the same map converts to the same file on every run
+- **RCBot3 Output**: Writes `.rcw` v5 files with RCBot3's own flag table, checked against
+  RCBot3's loader and its load-time graph audit before an existing file is replaced
 
 ## Installation
 
@@ -73,7 +77,7 @@ hl2dm-waypoint-gen [OPTIONS] <input.bsp> [output.rcw]
 General Options:
   -a, --author NAME       Author name for waypoint file
   -d, --density FLOAT     Waypoint density (0.1-1.0, default: 0.5)
-  -m, --max-waypoints N   Maximum waypoints (default: 2048)
+  -m, --max-waypoints N   Maximum waypoints, 2..2048 (default: 2048)
 
 Entity Options:
   --weapon-priority       Prioritize weapon spawn waypoints
@@ -102,7 +106,7 @@ Debug Options:
   --debug-obj FILE        Output debug geometry as OBJ
   --debug-navmesh FILE    Output navmesh as OBJ
   --debug-text            Output waypoints as readable text file
-  --visibility            Generate visibility table (.rcv)
+  --metadata              Also write a .rcm sidecar (RCBot3 does not read it)
 
 Other:
   -v, --verbose           Verbose output
@@ -129,14 +133,33 @@ for f in maps/dm_*.bsp; do hl2dm-waypoint-gen "$f"; done
 
 ## Output Files
 
-- `.rcw` - RCBot2 waypoint file (binary format)
-- `.rcm` - Waypoint metadata file (text format, optional)
-- `.rcv` - Visibility table (binary format, optional)
+- `.rcw` - RCBot3 waypoint file (binary format, version 5)
+- `.rcm` - Waypoint metadata sidecar (text format, only with `--metadata`; RCBot3 does not read it)
 - `.txt` - Human-readable waypoint list (debug, optional)
+
+No `.rcv` visibility file is written, and the `.rcw` header never announces one: RCBot3
+computes its own visibility table with engine traces when it loads the map.
+
+RCBot3 opens `<rcbot3>/waypoints/<mod folder>/<map>.rcw` (the mod folder is the game
+directory's name, for example `hl2mp`), and refuses a file whose header names another
+map. The header map name is the BSP file name; the writer warns when the output file is
+named differently.
+
+### Checking a file
+
+```bash
+# RCBot3's loader checks, its load-time audit and the graph contract
+python -m bsp_waypointer.rcw_validator dm_lockdown.rcw [map_name]
+
+# The same, plus checks against the map's geometry and entities
+python -m bsp_waypointer.crosscheck dm_lockdown.rcw dm_lockdown.bsp
+```
 
 ## Waypoint Flags
 
-The generator automatically assigns appropriate flags based on entity types:
+The flag table is RCBot3's (`CWaypointTypes` in `bot_waypoint.h`), aliases included;
+`tests/test_rcbot3_flags.py` pins it. The generator automatically assigns appropriate
+flags based on entity types:
 
 | Flag | Description | Detection Method |
 |------|-------------|------------------|
@@ -151,6 +174,7 @@ The generator automatically assigns appropriate flags based on entity types:
 | `W_FL_USE` | Requires USE key | Chargers, buttons |
 | `W_FL_FALL` | Falling hazard | Drop > 200 units |
 | `W_FL_BREAKABLE` | Breakable object | `func_breakable` entity |
+| `W_FL_UNREACHABLE` | Outside the main component; bots never route through it | No traversable connection joins it to the largest component a spawn can reach |
 
 ## Weapon Priority
 
@@ -217,9 +241,12 @@ entities = analyzer.analyze(bsp)
 converter = HL2DMWaypointConverter(ray_tracer=ray_tracer)
 waypoints = converter.convert(navmesh, entities, ladders)
 
-# Write output
+# Write output (map_name is required: RCBot3 refuses a file naming another map)
 writer = RCWWriter()
-writer.write("dm_lockdown.rcw", waypoints)
+writer.write("dm_lockdown.rcw", waypoints, map_name="dm_lockdown")
+
+# How the graph was finished: proven edges added, waypoints flagged unreachable
+print(converter.connectivity_report)
 ```
 
 ### Ray Tracing API
@@ -263,7 +290,10 @@ bsp-waypointer/
 │   ├── ray_tracer.py         # BSP ray tracing for line-of-sight
 │   ├── entity_analyzer.py    # HL2DM entity analysis
 │   ├── waypoint_converter.py # Waypoint conversion
-│   └── rcw_writer.py         # RCW file writer
+│   ├── graph_contract.py     # Components, classification, RCBot3 load-audit model
+│   ├── rcw_writer.py         # RCW file writer
+│   ├── rcw_validator.py      # RCBot3 loader and load-audit checks
+│   └── crosscheck.py         # Check a .rcw against its BSP
 ├── tests/                    # Unit tests
 ├── pyproject.toml            # Project configuration
 └── README.md                 # This file
@@ -291,6 +321,10 @@ pip install -e ".[all]"
 pytest
 ```
 
+`tests/test_rcbot3_flags.py` also compares the pinned flag snapshot with RCBot3's live
+`bot_waypoint.h` when `RCBOT3_SRC` points to an rcbot3 checkout (or `../rcbot3` exists);
+without one, that test skips.
+
 ### Code Style
 
 ```bash
@@ -308,7 +342,11 @@ mypy src
 
 - Without PyRecastDetour installed, navmesh generation uses an enhanced fallback algorithm
 - Some complex geometry may not generate optimal waypoints
-- Visibility table generation uses distance heuristics
+- Areas the traversal model cannot prove reachable are flagged `W_FL_UNREACHABLE`, so bots
+  do not go there (on dm_lockdown about a fifth of the waypoints, including some pickups
+  and one spawn room)
+- Without ray tracing (`--no-raytracing`, or a library caller that passes no tracer), a
+  connection is checked only against the vertical and slope rules and prop boxes
 - Displacement surface support is basic
 
 ## Features

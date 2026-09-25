@@ -1,7 +1,7 @@
 """
 Command Line Interface for BSP Waypoint Generator.
 
-Provides the main entry point for generating RCBot2 waypoints from BSP files.
+Provides the main entry point for generating RCBot3 waypoints from BSP files.
 """
 
 from __future__ import annotations
@@ -14,7 +14,13 @@ from typing import List, Optional
 
 from . import __version__
 from .bsp_parser import BSPParser
-from .constants import DEFAULT_PLAYER_DIMS, DEFAULT_WAYPOINT_SPACING, MAX_WAYPOINTS, PlayerDimensions
+from .constants import (
+    DEFAULT_PLAYER_DIMS,
+    DEFAULT_WAYPOINT_SPACING,
+    MAX_WAYPOINTS,
+    SPAWN_REACH_COVERAGE,
+    PlayerDimensions,
+)
 from .entity_analyzer import HL2DMEntityAnalyzer
 from .geometry_extractor import GeometryExtractor
 from .navmesh_generator import NavmeshConfig, NavmeshGenerator
@@ -32,11 +38,19 @@ logging.basicConfig(
 logger = logging.getLogger("bsp_waypointer")
 
 
+def _waypoint_budget(text: str) -> int:
+    """argparse type: RCBot3 refuses a file with more than MAX_WAYPOINTS waypoints."""
+    value = int(text)
+    if not 2 <= value <= MAX_WAYPOINTS:
+        raise argparse.ArgumentTypeError(f"must be 2..{MAX_WAYPOINTS}")
+    return value
+
+
 def create_parser() -> argparse.ArgumentParser:
     """Create the argument parser."""
     parser = argparse.ArgumentParser(
         prog="hl2dm-waypoint-gen",
-        description="Generate RCBot2 waypoints from HL2DM BSP files.",
+        description="Generate RCBot3 waypoints from HL2DM BSP files.",
         epilog="""
 Examples:
   hl2dm-waypoint-gen dm_lockdown.bsp
@@ -76,10 +90,10 @@ Examples:
     )
     general.add_argument(
         "-m", "--max-waypoints",
-        type=int,
+        type=_waypoint_budget,
         default=MAX_WAYPOINTS,
         metavar="N",
-        help=f"Maximum waypoints (default: {MAX_WAYPOINTS})",
+        help=f"Maximum waypoints, 2..{MAX_WAYPOINTS} (RCBot3's limit; default: {MAX_WAYPOINTS})",
     )
 
     general.add_argument(
@@ -205,9 +219,9 @@ Examples:
         help="Output waypoints as readable text file",
     )
     debug.add_argument(
-        "--visibility",
+        "--metadata",
         action="store_true",
-        help="Generate visibility table (.rcv)",
+        help="Also write a .rcm sidecar (for people and tools; RCBot3 does not read it)",
     )
 
     # Verbosity
@@ -264,7 +278,7 @@ def generate_waypoints(
     debug_obj: Optional[Path] = None,
     debug_navmesh: Optional[Path] = None,
     debug_text: bool = False,
-    visibility: bool = False,
+    metadata: bool = False,
     verbose: bool = False,
     game_dirs: Optional[List[Path]] = None,
 ) -> int:
@@ -411,14 +425,23 @@ def generate_waypoints(
         report = getattr(converter, "connectivity_report", None)
         if report:
             logger.info(
-                f"  Connectivity: {report['bridges']} bridges, "
-                f"{report['return_edges']} return edges, "
-                f"{report['spawn_coverage']:.0%} spawn coverage"
+                f"  Connectivity: main component {report['main_size']} of "
+                f"{len(waypoints)} waypoints, {report['repair_edges']} repair and "
+                f"{report['bridges']} bridge edges (all traversal-checked), "
+                f"{report['spawn_coverage']:.0%} of spawns can reach it"
             )
-            if report["bridges"] > 10:
+            if report["unreachable_flagged"]:
                 logger.warning(
-                    "  High bridge count - Stage A connection thresholds "
-                    "may be wrong for this map"
+                    f"  {report['unreachable_flagged']} waypoints flagged unreachable "
+                    f"({report['unreachable_sources']} one-way exits, "
+                    f"{report['unreachable_sinks']} traps, "
+                    f"{report['unreachable_islands']} islands): no traversable "
+                    f"edge joins them to the main component"
+                )
+            if report["spawn_coverage"] < SPAWN_REACH_COVERAGE:
+                logger.warning(
+                    f"  {report['spawns_outside_main']} spawn waypoints are outside "
+                    f"the main component"
                 )
 
         # Count special waypoints
@@ -441,8 +464,7 @@ def generate_waypoints(
             waypoints,
             map_name=map_name,
             author=author,
-            include_metadata=True,
-            include_visibility=visibility,
+            include_metadata=metadata,
             debug_text=debug_text,
         )
 
@@ -502,7 +524,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         debug_obj=args.debug_obj,
         debug_navmesh=args.debug_navmesh,
         debug_text=args.debug_text,
-        visibility=args.visibility,
+        metadata=args.metadata,
         verbose=args.verbose,
         game_dirs=args.game_dir,
     )

@@ -1,7 +1,7 @@
 """
 Waypoint Converter Module for BSP Waypoint Generator.
 
-Converts navigation mesh and entity data to RCBot2 waypoints with
+Converts navigation mesh and entity data to RCBot3 waypoints with
 HL2DM-specific flags and metadata.
 """
 
@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
 import numpy as np
 
 from .constants import (
+    BRIDGE_RANGE,
     CONNECTION_RANGE_LOCAL,
     CROUCH_JUMP_RISE,
     DEFAULT_PLAYER_DIMS,
@@ -24,9 +25,9 @@ from .constants import (
     MAX_CONNECTION_DISTANCE,
     MAX_DROP_CONNECTION,
     MAX_PUSH_CONNECTION_DISTANCE,
+    MAX_PATHS_PER_WAYPOINT,
     MAX_WAYPOINTS,
     MIN_WAYPOINT_DISTANCE,
-    SPAWN_REACH_COVERAGE,
     WaypointFlag,
 )
 from .entity_analyzer import (
@@ -44,6 +45,12 @@ from .entity_analyzer import (
     WeaponSpawn,
 )
 from .geometry_extractor import LadderSurface
+from .graph_contract import (
+    choose_main_component,
+    classify_against_main,
+    permutation_to_front,
+    strongly_connected_components,
+)
 from .navmesh_generator import NavigationMesh
 from .vector import Vector3, segment_intersects_aabb
 
@@ -65,13 +72,17 @@ class WaypointMetadata:
 
 @dataclass
 class Waypoint:
-    """RCBot2 waypoint structure."""
+    """RCBot3 waypoint structure."""
     index: int
     origin: Vector3
     flags: WaypointFlag = WaypointFlag.W_FL_NONE
     radius: float = 0.0  # Waypoint activation radius
     connections: List[int] = field(default_factory=list)
     metadata: WaypointMetadata = field(default_factory=WaypointMetadata)
+    # A player spawn is here. Kept apart from metadata, which a merge with a
+    # higher-priority entity replaces (and which a spawn merged into a plain
+    # navmesh sample never receives): the main-component choice needs every spawn.
+    is_spawn: bool = False
 
     def has_flag(self, flag: WaypointFlag) -> bool:
         """Check if waypoint has a specific flag."""
@@ -91,9 +102,27 @@ class Waypoint:
             self.connections.append(other_index)
 
 
+def _empty_connectivity_report(n: int) -> Dict[str, float]:
+    """Report keys. bridges/return_edges/spawn_coverage are read by name by
+    hl2dm_manager modules/waypointer.py; return_edges is always 0 now."""
+    return {
+        "bridges": 0,                # proven cross-component edges added in Stage C
+        "return_edges": 0,           # retained for callers; nothing is reversed any more
+        "spawn_coverage": 1.0,       # fraction of spawn waypoints that can reach the main component
+        "repair_edges": 0,           # proven edges added by Stage B
+        "components": 1 if n else 0, # strongly connected components after Stage C
+        "main_size": n,
+        "unreachable_flagged": 0,    # waypoints flagged W_FL_UNREACHABLE by Stage C
+        "unreachable_sources": 0,    # can reach main, not reachable from it
+        "unreachable_sinks": 0,      # reachable from main, cannot return
+        "unreachable_islands": 0,    # neither
+        "spawns_outside_main": 0,
+    }
+
+
 class HL2DMWaypointConverter:
     """
-    Converts navigation mesh and entities to RCBot2 waypoints.
+    Converts navigation mesh and entities to RCBot3 waypoints.
 
     Handles placement, connections, and HL2DM-specific flag assignment.
     """
@@ -121,9 +150,7 @@ class HL2DMWaypointConverter:
         self._waypoints: List[Waypoint] = []
         self._spatial_hash: Dict[Tuple[int, int, int], List[int]] = {}
         self._cell_size = 128.0
-        self.connectivity_report: Dict[str, float] = {
-            "bridges": 0, "return_edges": 0, "spawn_coverage": 1.0,
-        }
+        self.connectivity_report: Dict[str, float] = _empty_connectivity_report(0)
 
     def convert(
         self,
@@ -204,8 +231,9 @@ class HL2DMWaypointConverter:
         # Stage B: repair zero-degree waypoints with relaxed ranges
         self._repair_degrees()
 
-        # Stage C: guarantee a single connected, spawn-reachable graph
-        # (raises rather than allowing a fragmented file to be written)
+        # Stage C: add the cross-component edges that can be proven and
+        # flag everything outside the main component W_FL_UNREACHABLE
+        # (raises only when no spawn can reach a usable graph)
         self._ensure_connectivity()
 
         # Assign additional flags based on geometry
@@ -344,7 +372,7 @@ class HL2DMWaypointConverter:
                 entity_origin=item.origin,
                 requires_use=item.requires_use,
             )
-            flags = WaypointFlag.W_FL_HEALTH  # RCBot2 uses HEALTH for armor too
+            flags = WaypointFlag.W_FL_HEALTH  # RCBot3 has no armor flag; HEALTH covers it
             if item.requires_use:
                 flags |= WaypointFlag.W_FL_USE
             self._add_waypoint(item.origin, flags, metadata)
@@ -385,7 +413,8 @@ class HL2DMWaypointConverter:
                 subtype=HL2DMWaypointSubType.SPAWN_POINT,
                 entity_origin=spawn.origin,
             )
-            self._add_waypoint(spawn.origin, WaypointFlag.W_FL_NONE, metadata)
+            idx = self._add_waypoint(spawn.origin, WaypointFlag.W_FL_NONE, metadata)
+            self._waypoints[idx].is_spawn = True
 
     def _place_teleporter_waypoints(self, teleporters: List[Teleporter]) -> None:
         """Place waypoints at teleporter entrances and exits."""
@@ -668,271 +697,176 @@ class HL2DMWaypointConverter:
 
     def _repair_degrees(self) -> None:
         """
-        Stage B: repair zero-degree waypoints.
+        Stage B: repair zero-degree waypoints with proven edges only.
 
-        Retries connection candidates with stepwise-relaxed distance
-        bounds, preferring edges that pass the full walkability check;
-        falls back to the nearest neighbor unconditionally so no live
-        waypoint is left with a missing direction.
+        Retries connection candidates with stepwise-relaxed distance bounds;
+        an edge is added only when _can_connect passes at that range. A
+        waypoint no candidate can serve stays unrepaired: Stage C flags it
+        W_FL_UNREACHABLE instead of inventing an edge (M-087).
         """
         n = len(self._waypoints)
+        self._repair_edge_count = 0
         if n < 2:
             return
 
-        def in_degrees() -> List[int]:
-            degrees = [0] * n
-            for wp in self._waypoints:
-                for c in wp.connections:
-                    if 0 <= c < n:
-                        degrees[c] += 1
-            return degrees
+        def first_proven(i: int, outgoing: bool) -> Optional[int]:
+            wp = self._waypoints[i]
+            for range_ in DEGREE_REPAIR_RANGES:
+                for j in self._find_nearby_waypoints(wp.origin, range_):
+                    if j == i:
+                        continue
+                    src, dst = (wp, self._waypoints[j]) if outgoing else (self._waypoints[j], wp)
+                    if len(src.connections) >= MAX_PATHS_PER_WAYPOINT:
+                        continue
+                    if self._can_connect(src, dst, max_range=range_):
+                        return j
+            return None
 
         # Outgoing repair
         for i, wp in enumerate(self._waypoints):
             if any(0 <= c < n for c in wp.connections):
                 continue
-            repaired = False
-            for range_ in DEGREE_REPAIR_RANGES:
-                for j in self._find_nearby_waypoints(wp.origin, range_):
-                    if j == i:
-                        continue
-                    if self._can_connect(wp, self._waypoints[j], max_range=range_):
-                        wp.add_connection(j)
-                        repaired = True
-                        break
-                if repaired:
-                    break
-            if not repaired:
-                # Unconditional nearest-neighbor fallback
-                nearest = self._nearest_waypoint(i)
-                if nearest is not None:
-                    wp.add_connection(nearest)
+            j = first_proven(i, outgoing=True)
+            if j is not None:
+                wp.add_connection(j)
+                self._repair_edge_count += 1
 
         # Incoming repair
-        degrees = in_degrees()
-        for i, wp in enumerate(self._waypoints):
+        degrees = [0] * n
+        for wp in self._waypoints:
+            for c in wp.connections:
+                if 0 <= c < n:
+                    degrees[c] += 1
+        for i in range(n):
             if degrees[i] > 0:
                 continue
-            repaired = False
-            for range_ in DEGREE_REPAIR_RANGES:
-                for j in self._find_nearby_waypoints(wp.origin, range_):
-                    if j == i:
-                        continue
-                    src = self._waypoints[j]
-                    if self._can_connect(src, wp, max_range=range_):
-                        src.add_connection(i)
-                        repaired = True
-                        break
-                if repaired:
-                    break
-            if not repaired:
-                nearest = self._nearest_waypoint(i)
-                if nearest is not None:
-                    self._waypoints[nearest].add_connection(i)
+            j = first_proven(i, outgoing=False)
+            if j is not None:
+                self._waypoints[j].add_connection(i)
+                self._repair_edge_count += 1
 
-    def _nearest_waypoint(self, index: int) -> Optional[int]:
-        """Index of the nearest other waypoint (brute force fallback)."""
-        wp = self._waypoints[index]
-        best = None
-        best_dist = float("inf")
-        for j, other in enumerate(self._waypoints):
-            if j == index:
-                continue
-            d = wp.origin.distance_to(other.origin)
-            if d < best_dist:
-                best_dist = d
-                best = j
-        return best
+    def _adjacency(self) -> List[List[int]]:
+        n = len(self._waypoints)
+        return [[c for c in wp.connections if 0 <= c < n] for wp in self._waypoints]
 
     def _ensure_connectivity(self) -> None:
         """
-        Stage C: guarantee one connected, spawn-reachable graph.
+        Stage C: prove what can be proven, flag the rest (never invent).
 
-        Bridges weakly-connected components pairwise at their closest
-        waypoints, then verifies strong (directed) reachability from
-        every spawn waypoint, adding return edges along one-way
-        bottlenecks until coverage reaches SPAWN_REACH_COVERAGE.
-        Raises RuntimeError rather than allowing a fragmented graph to
-        reach the writer. Populates self.connectivity_report.
+        C1 tries every cross-component pair within BRIDGE_RANGE that has an
+        endpoint outside the provisional main component, each direction
+        separately, through _can_connect. C2 picks the main strongly
+        connected component (the largest one a spawn waypoint can reach,
+        then most spawns inside, then lowest index: choose_main_component)
+        and flags every waypoint outside it W_FL_UNREACHABLE: RCBot3 never
+        routes through such a waypoint (CBot::canGotoWaypoint) and its
+        load-time audit neither stitches nor bridges it. C3 moves a main
+        waypoint to index 0, where RCBot3's audit starts its reachability
+        walk.
+
+        Raises RuntimeError only when no usable graph remains: the main
+        component has fewer than two waypoints, or spawns exist and none of
+        them is inside the main component or on a one-way exit into it.
+        Populates self.connectivity_report.
         """
         n = len(self._waypoints)
-        self.connectivity_report = {"bridges": 0, "return_edges": 0, "spawn_coverage": 1.0}
+        rep = _empty_connectivity_report(n)
+        rep["repair_edges"] = getattr(self, "_repair_edge_count", 0)
+        self.connectivity_report = rep
         if n < 2:
             return
 
-        def weak_components() -> List[List[int]]:
-            comp_of = [-1] * n
-            comps: List[List[int]] = []
-            undirected: List[Set[int]] = [set() for _ in range(n)]
-            for i, wp in enumerate(self._waypoints):
-                for c in wp.connections:
-                    if 0 <= c < n:
-                        undirected[i].add(c)
-                        undirected[c].add(i)
-            for start in range(n):
-                if comp_of[start] != -1:
-                    continue
-                members = [start]
-                comp_of[start] = len(comps)
-                queue = [start]
-                while queue:
-                    node = queue.pop()
-                    for m in undirected[node]:
-                        if comp_of[m] == -1:
-                            comp_of[m] = len(comps)
-                            members.append(m)
-                            queue.append(m)
-                comps.append(members)
-            return comps
+        spawns = [
+            i for i, wp in enumerate(self._waypoints)
+            if wp.is_spawn or wp.metadata.subtype == HL2DMWaypointSubType.SPAWN_POINT
+        ]
 
-        # Bridge components at their closest cross-pair, smallest first
-        comps = weak_components()
-        while len(comps) > 1:
-            comps.sort(key=len)
-            small = comps[0]
-            rest = [i for comp in comps[1:] for i in comp]
-
-            best_pair = None
-            best_dist = float("inf")
-            for u in small:
-                ou = self._waypoints[u].origin
-                for v in rest:
-                    d = ou.distance_to(self._waypoints[v].origin)
-                    if d < best_dist:
-                        best_dist = d
-                        best_pair = (u, v)
-
-            u, v = best_pair
-            self._waypoints[u].add_connection(v)
-            self._waypoints[v].add_connection(u)
-            self.connectivity_report["bridges"] += 1
-            # Merge the two components
-            target = next(
-                idx for idx, comp in enumerate(comps[1:], start=1) if v in set(comp)
-            )
-            comps[target] = comps[target] + small
-            comps.pop(0)
-
-        # Collapse to a single strongly-connected component: bots spawn
-        # anywhere and the RCBot3 validator probes from an arbitrary
-        # waypoint, so spawn-outward coverage alone is not enough (a
-        # sloped map full of one-way drop edges degenerates into a
-        # downhill DAG otherwise). Each round reverses one cross-SCC
-        # bottleneck edge per component pair, merging SCCs until one
-        # remains.
-        for _ in range(n):
-            sccs = self._strongly_connected_components()
-            if len(sccs) <= 1:
-                break
+        # C1: proven cross-component edges
+        sccs = strongly_connected_components(self._adjacency())
+        if len(sccs) > 1:
             comp_of = [0] * n
             for ci, comp in enumerate(sccs):
-                for node in comp:
-                    comp_of[node] = ci
-            reversed_pairs: Set[Tuple[int, int]] = set()
-            added = False
-            for u in range(n):
-                cu = comp_of[u]
-                for v in self._waypoints[u].connections:
-                    if not (0 <= v < n):
+                for v in comp:
+                    comp_of[v] = ci
+            main_ci = choose_main_component(self._adjacency(), sccs, spawns)
+            for i in range(n):
+                if comp_of[i] == main_ci:
+                    continue
+                wi = self._waypoints[i]
+                for j in self._find_nearby_waypoints(wi.origin, BRIDGE_RANGE):
+                    if j == i or comp_of[j] == comp_of[i]:
                         continue
-                    cv = comp_of[v]
-                    if cu != cv and (cu, cv) not in reversed_pairs:
-                        self._waypoints[v].add_connection(u)
-                        self.connectivity_report["return_edges"] += 1
-                        reversed_pairs.add((cu, cv))
-                        added = True
-            if not added:
-                break
+                    wj = self._waypoints[j]
+                    if (j not in wi.connections
+                            and len(wi.connections) < MAX_PATHS_PER_WAYPOINT
+                            and self._can_connect(wi, wj, max_range=BRIDGE_RANGE)):
+                        wi.add_connection(j)
+                        rep["bridges"] += 1
+                    # j -> i from a main waypoint; a non-main j is handled
+                    # when the loop reaches j
+                    if (comp_of[j] == main_ci
+                            and i not in wj.connections
+                            and len(wj.connections) < MAX_PATHS_PER_WAYPOINT
+                            and self._can_connect(wj, wi, max_range=BRIDGE_RANGE)):
+                        wj.add_connection(i)
+                        rep["bridges"] += 1
+            sccs = strongly_connected_components(self._adjacency())
 
-        # Report strong coverage from every spawn waypoint (fall back to
-        # waypoint 0 when the map defines no spawns)
-        spawn_indices = [
-            wp.index
-            for wp in self._waypoints
-            if wp.metadata.subtype == HL2DMWaypointSubType.SPAWN_POINT
-        ] or [0]
-
-        def directed_reach(start: int) -> Set[int]:
-            reach = {start}
-            queue = [start]
-            while queue:
-                node = queue.pop()
-                for c in self._waypoints[node].connections:
-                    if 0 <= c < n and c not in reach:
-                        reach.add(c)
-                        queue.append(c)
-            return reach
-
-        min_coverage = min(
-            len(directed_reach(spawn)) / n for spawn in spawn_indices
+        # C2: classify against the main component and flag the rest
+        adj = self._adjacency()
+        main = set(sccs[choose_main_component(adj, sccs, spawns)])
+        cls = classify_against_main(adj, main)
+        for v in cls.outside:
+            self._waypoints[v].add_flag(WaypointFlag.W_FL_UNREACHABLE)
+        in_main = sum(1 for s in spawns if s in main)
+        # a spawn on a one-way exit (source) still delivers its bot to main
+        reaching = sum(1 for s in spawns if s in main or s in cls.sources)
+        rep.update(
+            components=len(sccs),
+            main_size=len(main),
+            unreachable_flagged=len(cls.outside),
+            unreachable_sources=len(cls.sources),
+            unreachable_sinks=len(cls.sinks),
+            unreachable_islands=len(cls.islands),
+            spawns_outside_main=len(spawns) - in_main,
+            spawn_coverage=(reaching / len(spawns)) if spawns else 1.0,
         )
-        self.connectivity_report["spawn_coverage"] = min_coverage
 
-        # Hard guarantee: refuse to hand a fragmented graph to the writer
-        final_comps = weak_components()
-        if len(final_comps) > 1:
-            sizes = sorted((len(c) for c in final_comps), reverse=True)
+        # C3: RCBot3's audit walks from the first used waypoint
+        if 0 not in main:
+            self._apply_permutation(permutation_to_front(n, min(main)))
+
+        if len(main) < 2:
             raise RuntimeError(
-                f"waypoint graph still fragmented after connectivity repair: "
-                f"{len(final_comps)} components (sizes {sizes[:10]})"
+                "no usable waypoint graph: the largest traversable component "
+                f"has {len(main)} waypoint(s)"
             )
-        if min_coverage < SPAWN_REACH_COVERAGE:
+        if spawns and reaching == 0:
             raise RuntimeError(
-                f"spawn strong-reachability {min_coverage:.0%} below required "
-                f"{SPAWN_REACH_COVERAGE:.0%} after repair"
+                f"none of the {len(spawns)} spawn waypoints can reach the traversable "
+                f"component ({len(main)} waypoints)"
             )
+
+    def _apply_permutation(self, perm: List[int]) -> None:
+        """Renumber waypoints: perm[old] = new. Remaps connections and teleporter targets."""
+        n = len(self._waypoints)
+        reordered: List[Optional[Waypoint]] = [None] * n
+        for old, wp in enumerate(self._waypoints):
+            reordered[perm[old]] = wp
+        for wp in reordered:
+            wp.connections = [perm[c] for c in wp.connections if 0 <= c < n]
+            if 0 <= wp.metadata.target_waypoint < n:
+                wp.metadata.target_waypoint = perm[wp.metadata.target_waypoint]
+        for i, wp in enumerate(reordered):
+            wp.index = i
+        self._waypoints = reordered
+        self._spatial_hash = {}
+        for i, wp in enumerate(self._waypoints):
+            self._add_to_spatial_hash(wp.origin, i)
 
     def _strongly_connected_components(self) -> List[List[int]]:
         """Kosaraju SCC over the current directed connection graph."""
-        n = len(self._waypoints)
-        adj = [
-            [c for c in self._waypoints[i].connections if 0 <= c < n]
-            for i in range(n)
-        ]
-        radj: List[List[int]] = [[] for _ in range(n)]
-        for u in range(n):
-            for v in adj[u]:
-                radj[v].append(u)
-
-        # Pass 1: post-order over the forward graph (iterative DFS)
-        visited = [False] * n
-        order: List[int] = []
-        for start in range(n):
-            if visited[start]:
-                continue
-            visited[start] = True
-            stack = [(start, iter(adj[start]))]
-            while stack:
-                node, it = stack[-1]
-                advanced = False
-                for nxt in it:
-                    if not visited[nxt]:
-                        visited[nxt] = True
-                        stack.append((nxt, iter(adj[nxt])))
-                        advanced = True
-                        break
-                if not advanced:
-                    order.append(node)
-                    stack.pop()
-
-        # Pass 2: reverse graph in reverse post-order
-        comp = [-1] * n
-        sccs: List[List[int]] = []
-        for start in reversed(order):
-            if comp[start] != -1:
-                continue
-            members = [start]
-            comp[start] = len(sccs)
-            queue = [start]
-            while queue:
-                u = queue.pop()
-                for v in radj[u]:
-                    if comp[v] == -1:
-                        comp[v] = len(sccs)
-                        members.append(v)
-                        queue.append(v)
-            sccs.append(members)
-        return sccs
+        return strongly_connected_components(self._adjacency())
 
     def _compute_connections(self) -> None:
         """
@@ -941,6 +875,8 @@ class HL2DMWaypointConverter:
         Each ordered pair (A, B) within CONNECTION_RANGE_LOCAL is
         evaluated independently, so survivable drops become legitimate
         one-way A -> B connections while the climb back is refused.
+        Nearest candidates first; at most MAX_PATHS_PER_WAYPOINT per
+        waypoint (RCBot3 rejects a file with more).
         """
         for i, wp_a in enumerate(self._waypoints):
             nearby = self._find_nearby_waypoints(
@@ -948,6 +884,8 @@ class HL2DMWaypointConverter:
             )
 
             for j in nearby:
+                if len(wp_a.connections) >= MAX_PATHS_PER_WAYPOINT:
+                    break
                 if j == i or j in wp_a.connections:
                     continue
 
