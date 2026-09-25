@@ -358,9 +358,10 @@ mypy src                    # Type check
    still walk at a pickup they find by classname and take flagged goals; from `dae0c423`
    they do neither for this generator's files, so a pickup the model wrongly isolates is
    skipped (from rcbot3 `f8a21910` the pickup rule applies only to files whose author
-   starts with `BSP-Waypoint`, or `HL2DM-Manager`). A waypoint within a player radius of a
-   prop's collision (an item lying against a prop, whose waypoint is on the item) stays
-   isolated: no player can stand there
+   starts with `BSP-Waypoint`, or is exactly `HL2DM-Manager` -- RCBot3 matches the
+   manager's name by an exact comparison, not as a prefix). A waypoint within a player
+   radius of a prop's collision (an item lying against a prop, whose waypoint is on the
+   item) stays isolated: no player can stand there
 
 ## Future Enhancement Areas
 
