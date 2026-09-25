@@ -38,7 +38,7 @@ from .constants import (
     WEAPON_DEFINITIONS,
     WaypointFlag,
 )
-from .vector import BoundingBox, Vector3
+from .vector import BoundingBox, ConvexHull, Vector3
 
 
 @dataclass
@@ -170,6 +170,10 @@ class PropObstacle:
     # True when bounds come from the model's actual .mdl/.phy geometry
     # rather than name-based size hints
     exact: bool = False
+    # The prop's collision as world-space convex hulls (its .phy pieces),
+    # when it collides by that mesh (solid 6, SOLID_VPHYSICS) and the
+    # whole mesh parsed; empty means only the box is known
+    collision: List[ConvexHull] = field(default_factory=list)
 
 
 @dataclass
@@ -618,6 +622,27 @@ class HL2DMEntityAnalyzer:
                     )
                 )
 
+    def _prop_collision(
+        self, model_name: str, origin: Vector3, angles: Vector3, solid: int
+    ) -> List[ConvexHull]:
+        """
+        World-space convex hulls of a prop's .phy, or [] (box only).
+
+        Only a prop that collides by its mesh (SOLID_VPHYSICS, 6) gets
+        them: SOLID_BBOX (2) collides by a box.
+        """
+        if solid != 6 or self._model_resolver is None:
+            return []
+        try:
+            geo = self._model_resolver.resolve(model_name)
+        except Exception:
+            return []
+        if geo is None:
+            return []
+
+        from .model_resolver import world_collision_hulls
+        return world_collision_hulls(geo, angles, origin)
+
     def _exact_prop_bounds(
         self, model_name: str, origin: Vector3, angles: Vector3
     ) -> Optional[Tuple[Vector3, Vector3]]:
@@ -703,17 +728,22 @@ class HL2DMEntityAnalyzer:
                     classname="prop_static",
                     movable=False,
                     exact=exact_bounds is not None,
+                    collision=self._prop_collision(
+                        prop.model_name, prop.origin, prop.angles, prop.solid
+                    ),
                 )
             )
 
     def _parse_prop_entities(self) -> None:
         """Parse physics and dynamic prop point entities."""
         for entity in self._bsp.entities:
+            solid = 6
             if entity.classname in PHYSICS_PROP_ENTITIES:
                 movable = True
             elif entity.classname in DYNAMIC_PROP_ENTITIES:
                 # Skip explicitly non-solid dynamic props
-                if entity.get_int("solid", 6) == 0:
+                solid = entity.get_int("solid", 6)
+                if solid == 0:
                     continue
                 movable = False
             else:
@@ -742,6 +772,10 @@ class HL2DMEntityAnalyzer:
                     classname=entity.classname,
                     movable=movable,
                     exact=exact_bounds is not None,
+                    # movable props are never obstacles to the converter
+                    collision=[] if movable else self._prop_collision(
+                        model_name, origin, angles, solid
+                    ),
                 )
             )
 

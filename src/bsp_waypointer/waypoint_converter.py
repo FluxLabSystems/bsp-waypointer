@@ -52,7 +52,7 @@ from .graph_contract import (
     strongly_connected_components,
 )
 from .navmesh_generator import NavigationMesh
-from .vector import Vector3, segment_intersects_aabb
+from .vector import Vector3, segment_intersects_aabb, swept_box_intersects_hull
 
 if TYPE_CHECKING:
     from .ray_tracer import BSPRayTracer
@@ -962,7 +962,10 @@ class HL2DMWaypointConverter:
             return False
 
         # Cheap AABB blocking against hazards and solid props before the
-        # more expensive ray tracing
+        # more expensive ray tracing. A prop whose box the body line
+        # touches is then judged by its own collision when that is known
+        # (_clear_of_prop): an open container or a tree canopy no longer
+        # cuts off the item inside or under it
         body_lift = Vector3(0, 0, DEFAULT_PLAYER_DIMS.step_height)
         seg_a = wp_a.origin + body_lift
         seg_b = wp_b.origin + body_lift
@@ -973,7 +976,7 @@ class HL2DMWaypointConverter:
             if segment_intersects_aabb(
                 seg_a, seg_b, obs.mins, obs.maxs,
                 expand=DEFAULT_PLAYER_DIMS.radius,
-            ):
+            ) and not self._clear_of_prop(obs, wp_a.origin, wp_b.origin, rise):
                 return False
 
         # Use ray tracing for accurate line-of-sight check
@@ -1013,6 +1016,33 @@ class HL2DMWaypointConverter:
                 return False
 
         return True
+
+    @staticmethod
+    def _clear_of_prop(obs, a: Vector3, b: Vector3, rise: float) -> bool:
+        """
+        Whether a path whose body line touches a prop's box clears the
+        prop's own collision.
+
+        The player box (radius 16) is swept from A to B between step
+        height and head height, as the engine traces a player hull, and
+        tested against each convex piece of the prop's .phy. Anything
+        lower is stepped over. A prop with no known collision (no .phy,
+        a mopp or partial mesh, SOLID_BBOX) keeps its box, and so does a
+        climb (a rise above CROUCH_JUMP_RISE): the ground probe cannot
+        see props, so over one the box is all that refuses a climb up its
+        side onto its top.
+        """
+        hulls = getattr(obs, "collision", None)
+        if not hulls or rise > CROUCH_JUMP_RISE:
+            return False
+        dims = DEFAULT_PLAYER_DIMS
+        half_height = (dims.standing_height - dims.step_height) / 2
+        lift = Vector3(0, 0, dims.step_height + half_height)
+        half = Vector3(dims.radius, dims.radius, half_height)
+        start, end = a + lift, b + lift
+        return not any(
+            swept_box_intersects_hull(start, end, half, hull) for hull in hulls
+        )
 
     def _assign_geometry_flags(self, navmesh: NavigationMesh) -> None:
         """Assign flags based on geometry (jump, crouch, fall)."""

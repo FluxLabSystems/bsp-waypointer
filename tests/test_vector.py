@@ -6,11 +6,13 @@ import pytest
 
 from bsp_waypointer.vector import (
     BoundingBox,
+    ConvexHull,
     Plane,
     Triangle,
     Vector3,
     angle_between_vectors,
     point_in_triangle_2d,
+    swept_box_intersects_hull,
 )
 
 
@@ -161,3 +163,60 @@ class TestPointInTriangle:
         v2 = Vector3(5, 10, 0)
         point = Vector3(20, 20, 0)
         assert not point_in_triangle_2d(point, v0, v1, v2)
+
+
+def box_triangles(mins, maxs):
+    """The 12 triangles of an axis-aligned box, windings mixed on purpose."""
+    (x0, y0, z0), (x1, y1, z1) = mins, maxs
+    c = [Vector3(x, y, z) for x in (x0, x1) for y in (y0, y1) for z in (z0, z1)]
+    quads = [(0, 1, 3, 2), (4, 6, 7, 5), (0, 4, 5, 1), (2, 3, 7, 6), (0, 2, 6, 4), (1, 5, 7, 3)]
+    tris = []
+    for i, (a, b, cc, d) in enumerate(quads):
+        tris.append((c[a], c[b], c[cc]))
+        tris.append((c[a], c[d], c[cc]) if i % 2 else (c[a], c[cc], c[d]))
+    return tris
+
+
+class TestSweptBoxAgainstHull:
+    """The player box swept along a path, against one convex collision piece."""
+
+    WALL = ConvexHull.from_triangles(box_triangles((100, -50, 0), (110, 50, 120)))
+    HALF = Vector3(16, 16, 27)
+
+    def hits(self, a, b, hull=None):
+        return swept_box_intersects_hull(Vector3(*a), Vector3(*b), self.HALF, hull or self.WALL)
+
+    def test_through_the_wall(self):
+        assert self.hits((0, 0, 45), (200, 0, 45))
+
+    def test_beside_the_wall(self):
+        assert not self.hits((0, 80, 45), (200, 80, 45))      # 30 u clear of the box's side
+        assert self.hits((0, 60, 45), (200, 60, 45))          # the box's side is 6 u into it
+
+    def test_over_the_wall(self):
+        assert not self.hits((0, 0, 150), (200, 0, 150))      # box bottom at 123
+
+    def test_touching_is_not_a_hit(self):
+        assert not self.hits((0, 66, 45), (200, 66, 45))      # side face exactly on the wall
+
+    def test_diagonal_sweep_is_the_box_not_a_line(self):
+        # on a diagonal the box's corner leads: the centre line passes the
+        # wall's corner (110, 50) 18.4 u away, more than the radius, but the
+        # box reaches 16 * sqrt(2) = 22.6 u to that side
+        assert self.hits((150, 36, 45), (60, 126, 45))
+        assert not self.hits((160, 36, 45), (70, 126, 45))    # 25.5 u away
+
+    def test_inside_the_hull(self):
+        big = ConvexHull.from_triangles(box_triangles((-500, -500, -500), (500, 500, 500)))
+        assert self.hits((0, 0, 45), (10, 0, 45), big)
+
+    def test_slanted_piece(self):
+        # a wedge whose sloped face rises from (0,..,0) to (100,..,100)
+        tri = [Vector3(0, -50, 0), Vector3(100, -50, 0), Vector3(100, -50, 100),
+               Vector3(0, 50, 0), Vector3(100, 50, 0), Vector3(100, 50, 100)]
+        wedge = ConvexHull.from_triangles([(tri[0], tri[1], tri[2]), (tri[3], tri[4], tri[5]),
+                                           (tri[0], tri[2], tri[5]), (tri[0], tri[5], tri[3]),
+                                           (tri[1], tri[2], tri[5]), (tri[1], tri[5], tri[4]),
+                                           (tri[0], tri[1], tri[4]), (tri[0], tri[4], tri[3])])
+        assert not self.hits((0, 0, 100), (40, 0, 140), wedge)   # above the slope
+        assert self.hits((20, 0, 60), (80, 0, 60), wedge)        # into it

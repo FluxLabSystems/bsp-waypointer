@@ -17,14 +17,14 @@ from bsp_waypointer.bsp_parser import Brush, BrushSide, BSPLeaf, BSPNode
 from bsp_waypointer.constants import (FLAGGED_SPAWN_AREA_WARN, ContentFlags,
                                       HL2DMWaypointSubType as ST, WaypointFlag)
 from bsp_waypointer.entity_analyzer import (AmmoPickup, HealthItem, HL2DMEntityData, Lift,
-                                            SpawnPoint, WeaponSpawn)
+                                            PropObstacle, SpawnPoint, WeaponSpawn)
 from bsp_waypointer.graph_contract import (choose_main_component, classify_against_main,
                                            rcbot3_load_audit, strongly_connected_components)
 from bsp_waypointer.navmesh_generator import NavigationMesh
 from bsp_waypointer.ray_tracer import BSPRayTracer
 from bsp_waypointer.rcw_validator import validate
 from bsp_waypointer.rcw_writer import RCWWriter
-from bsp_waypointer.vector import Plane, Vector3
+from bsp_waypointer.vector import ConvexHull, Plane, Vector3, swept_box_intersects_hull
 from bsp_waypointer.waypoint_converter import HL2DMWaypointConverter, Waypoint
 
 UNREACH = WaypointFlag.W_FL_UNREACHABLE
@@ -359,6 +359,106 @@ class TestWallClimbs:
         RCWWriter().write(out, wps, map_name="dm_ledge")
         s = validate(out)
         assert s.components == 1 and s.excluded_unreachable == 1
+
+
+# ----------------------------------------------------------------------
+# Props by their collision, not their box. A shipping container open at its
+# -x end, like dm_runoff's cargo_container01b: floor, roof, two sides and a
+# closed end, five convex pieces. Its box holds the AR2 inside it, so the
+# box alone cut the AR2's waypoint off (RCBot3 dae0c423 then never seeks
+# it). The swept player box clears the pieces through the open end and not
+# through a wall.
+# ----------------------------------------------------------------------
+
+def box_triangles(mins, maxs):
+    (x0, y0, z0), (x1, y1, z1) = mins, maxs
+    c = [V(x, y, z) for x in (x0, x1) for y in (y0, y1) for z in (z0, z1)]
+    quads = [(0, 1, 3, 2), (4, 6, 7, 5), (0, 4, 5, 1), (2, 3, 7, 6), (0, 2, 6, 4), (1, 5, 7, 3)]
+    return [t for a, b, cc, d in quads for t in ((c[a], c[b], c[cc]), (c[a], c[cc], c[d]))]
+
+
+def prop(pieces, model="models/props_wasteland/cargo_container01b.mdl", mesh=True):
+    mins = V(*(min(p[0][k] for p in pieces) for k in range(3)))
+    maxs = V(*(max(p[1][k] for p in pieces) for k in range(3)))
+    hulls = [ConvexHull.from_triangles(box_triangles(*p)) for p in pieces] if mesh else []
+    return PropObstacle(origin=V(0, 0, 0), mins=mins, maxs=maxs, model_name=model,
+                        classname="prop_static", movable=False, exact=True, collision=hulls)
+
+
+CONTAINER = [((0, -68, -4), (408, 68, 0)),       # floor
+             ((0, -68, 110), (408, 68, 118)),    # roof
+             ((0, 60, 0), (408, 68, 110)),       # sides
+             ((0, -68, 0), (408, -60, 110)),
+             ((400, -60, 0), (408, 60, 110))]    # the closed end; -x is open
+IN_CONTAINER = V(200, 0, 0)
+BEHIND_END = V(560, 0, 0)
+BESIDE = V(200, 200, 0)
+
+
+def container_scene(mesh=True):
+    e = HL2DMEntityData()
+    e.spawn_points = [spawn(x, y, 0) for x in (-300, -150) for y in (-150, 0, 150)]
+    e.weapons = [WeaponSpawn(IN_CONTAINER, "weapon_ar2", ST.WEAPON_AR2, 80, 30.0)]
+    e.ammo_pickups = [AmmoPickup(p, "item_ammo_smg1", ST.ITEM_AMMO_SMG1, "")
+                      for p in (V(-100, 200, 0), BESIDE, V(560, 200, 0), BEHIND_END)]
+    e.prop_obstacles = [prop(CONTAINER, mesh=mesh)]
+    return e
+
+
+class TestPropCollision:
+    def test_the_item_in_an_open_container_is_live(self):
+        conv, wps = convert(container_scene())
+        ar2 = at(wps, IN_CONTAINER)
+        assert not ar2.has_flag(UNREACH)
+        outside = [w for w in wps if w.origin.x < 0 and abs(w.origin.y) <= 16]
+        assert outside and all(ar2.index in w.connections and w.index in ar2.connections
+                               for w in outside if w.origin.distance_to(IN_CONTAINER) <= 400)
+
+    def test_no_edge_goes_through_a_wall(self):
+        conv, wps = convert(container_scene())
+        ar2, behind, beside = at(wps, IN_CONTAINER), at(wps, BEHIND_END), at(wps, BESIDE)
+        for w in (behind, beside):
+            assert w.index not in ar2.connections and ar2.index not in w.connections
+        assert not behind.has_flag(UNREACH)             # it is reached round the side
+        hulls = container_scene().prop_obstacles[0].collision
+        half, lift = V(16, 16, 27), V(0, 0, 45)
+        for a in wps:
+            for c in a.connections:
+                b = wps[c]
+                assert not any(swept_box_intersects_hull(a.origin + lift, b.origin + lift, half, h)
+                               for h in hulls), (a.origin, b.origin)
+
+    def test_a_prop_without_a_mesh_keeps_its_box(self):
+        conv, wps = convert(container_scene(mesh=False))
+        assert at(wps, IN_CONTAINER).has_flag(UNREACH)
+
+    def test_a_climb_over_a_prop_keeps_its_box(self):
+        # the ground probe cannot see a prop: onto the roof, the box refuses
+        # what the swept box alone would pass over the roof's edge
+        conv = HL2DMWaypointConverter(ray_tracer=None)
+        conv._solid_obstacles = [prop(CONTAINER)]
+        floor, roof = Waypoint(0, V(-300, 0, 0)), Waypoint(1, V(10, 0, 118))
+        assert not conv._can_connect(floor, roof)
+        assert conv._can_connect(roof, floor)                   # the drop is fine
+        assert conv._can_connect(Waypoint(2, V(-150, 0, 0)), Waypoint(3, IN_CONTAINER))
+
+    def test_a_table_top_between_step_and_head_height_blocks(self):
+        table = [((-40, -30, 30), (40, 30, 34)),              # top
+                 ((-40, -30, 0), (-36, -26, 30)), ((36, -30, 0), (40, -26, 30)),
+                 ((-40, 26, 0), (-36, 30, 30)), ((36, 26, 0), (40, 30, 30))]
+        conv = HL2DMWaypointConverter(ray_tracer=None)
+        conv._solid_obstacles = [prop(table, model="models/props_c17/furnituretable001a.mdl")]
+        a, b = Waypoint(0, V(-150, 0, 0)), Waypoint(1, V(150, 0, 0))
+        assert not conv._can_connect(a, b)                      # under the top, between the legs
+        low = [((-40, -30, 0), (40, 30, 12))]                   # a kerb: stepped over
+        conv._solid_obstacles = [prop(low, model="models/props_junk/kerb.mdl")]
+        assert conv._can_connect(a, b)
+
+    def test_conversion_is_deterministic(self):
+        _, one = convert(container_scene())
+        _, two = convert(container_scene())
+        assert [(w.origin.to_tuple(), int(w.flags), w.connections) for w in one] == \
+               [(w.origin.to_tuple(), int(w.flags), w.connections) for w in two]
 
 
 class TestGraphContract:

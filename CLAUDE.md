@@ -335,7 +335,12 @@ mypy src                    # Type check
 
 1. **Navmesh Generation**: Uses simplified grid-based approach, not Recast/Detour
 2. **Line-of-Sight**: Without a ray tracer, connection validity uses only the vertical and
-   slope rules and prop boxes. With or without one, a single ladder endpoint connects to
+   slope rules and the props. A solid prop is judged by its own collision: the player box,
+   swept from step height to head height, must clear each convex piece of its `.phy`
+   (`_clear_of_prop`). Its box decides instead when that collision is unknown (no `.phy`,
+   a partial or concave one, `SOLID_BBOX`) and for a climb (a rise above a crouch-jump);
+   placement still drops the navmesh samples inside a prop's box
+   (`_cull_blocked_samples`). With or without a tracer, a single ladder endpoint connects to
    anything within 200 units with no line-of-sight test. The tracer sees world brushes
    only: the ground probe cannot see displacements, props or brush entities, so a climb
    onto one of them is judged by the hull sweep and the eye line alone (onto a prop, also
@@ -345,12 +350,14 @@ mypy src                    # Type check
    brushes, and a flat connection of 256 units or less gets no hull sweep
 3. **Displacement Surfaces**: Basic support, complex displacements may have issues
 4. **Unproven Areas**: Areas the traversal model cannot prove reachable are flagged
-   `W_FL_UNREACHABLE` (about a quarter of dm_lockdown, including some pickups and one
-   spawn room). RCBot3 never routes through them. RCBot3 builds before rcbot3 `dae0c423`
+   `W_FL_UNREACHABLE` (about a fifth of dm_lockdown, including some pickups).
+   RCBot3 never routes through them. RCBot3 builds before rcbot3 `dae0c423`
    still walk at a pickup they find by classname and take flagged goals; from `dae0c423`
    they do neither for this generator's files, so a pickup the model wrongly isolates is
    skipped (from rcbot3 `f8a21910` the pickup rule applies only to files whose author
-   starts with `BSP-Waypoint`, or `HL2DM-Manager`)
+   starts with `BSP-Waypoint`, or `HL2DM-Manager`). A waypoint within a player radius of a
+   prop's collision (an item lying against a prop, whose waypoint is on the item) stays
+   isolated: no player can stand there
 
 ## Future Enhancement Areas
 

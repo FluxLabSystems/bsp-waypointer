@@ -343,8 +343,8 @@ mypy src
 - Without PyRecastDetour installed, navmesh generation uses an enhanced fallback algorithm
 - Some complex geometry may not generate optimal waypoints
 - Areas the traversal model cannot prove reachable are flagged `W_FL_UNREACHABLE`, so bots
-  never route through them (on dm_lockdown about a quarter of the waypoints, including
-  some pickups and one spawn room). RCBot3 builds before rcbot3 `dae0c423` still walk at a
+  never route through them (on dm_lockdown about a fifth of the waypoints, including
+  some pickups). RCBot3 builds before rcbot3 `dae0c423` still walk at a
   pickup they find by classname, whatever the waypoint flags say, and still take a flagged
   waypoint as a goal. From `dae0c423` they do neither for this generator's files: a pickup
   whose nearest waypoint is flagged is never sought, so a pickup the model wrongly isolates
@@ -356,8 +356,13 @@ mypy src
   over a surface the probe cannot see (a brush entity, a prop or a displacement) onto a
   world floor or ledge is refused, because the probe reads the lower world floor under it
   (likewise a pool's floor under water)
+- A solid prop is judged by its own collision (the convex pieces of its `.phy`, which the
+  player box swept from step height to head height must clear). Its box is used instead
+  when that collision is unknown (no `.phy`, a partial or concave one, `SOLID_BBOX`) and for
+  a climb over it. A waypoint within a player radius of a prop's collision (an item lying
+  against a prop, whose waypoint is on the item) is still cut off: no player can stand there
 - Without ray tracing (`--no-raytracing`, or a library caller that passes no tracer), a
-  connection is checked only against the vertical and slope rules and prop boxes
+  connection is checked only against the vertical and slope rules and the props
 - Displacement surface support is basic
 
 ## Features
