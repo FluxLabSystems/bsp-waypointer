@@ -80,7 +80,14 @@ Examples:
         "-a", "--author",
         type=str,
         default="BSP-Waypoint-Generator-HL2DM",
-        help="Author name for waypoint file",
+        help=(
+            "Author name for waypoint file. RCBot3 treats the file as generated -- "
+            "and so never seeks a pickup whose nearest waypoint is flagged "
+            "W_FL_UNREACHABLE -- only when the author starts with 'BSP-Waypoint' or "
+            "is exactly 'HL2DM-Manager' (an exact comparison, not a prefix). Any "
+            "other author turns that rule off, and flagged pickups are sought again "
+            "(default: %(default)s)"
+        ),
     )
     general.add_argument(
         "-d", "--density",
