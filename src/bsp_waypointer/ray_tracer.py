@@ -19,6 +19,15 @@ from .vector import Plane, Vector3
 DIST_EPSILON = 0.03125  # 1/32 unit
 ON_EPSILON = 0.1
 
+# World brush contents a player stands on or is stopped by: MASK_PLAYERSOLID
+# without its entity bits (CONTENTS_MOVEABLE, CONTENTS_MONSTER)
+PLAYER_SOLID_CONTENTS = (
+    ContentFlags.CONTENTS_SOLID
+    | ContentFlags.CONTENTS_WINDOW
+    | ContentFlags.CONTENTS_GRATE
+    | ContentFlags.CONTENTS_PLAYERCLIP
+)
+
 
 @dataclass
 class TraceResult:
@@ -210,6 +219,159 @@ class BSPRayTracer:
         result = self.trace_hull(start_raised, end_raised, mins, maxs)
 
         return result.fraction >= 1.0 and not result.start_solid
+
+    def ground_height(
+        self,
+        x: float,
+        y: float,
+        feet_z: float,
+        probe_up: float = 60.0,
+        probe_down: float = 128.0,
+        step_height: float = 18.0,
+    ) -> Optional[float]:
+        """
+        Height of the ground under a player whose feet are at (x, y, feet_z).
+
+        Looks at the world brushes (structural and func_detail, player-solid
+        contents) in the leaves the vertical segment feet_z + probe_up ..
+        feet_z - probe_down passes through. A brush the vertical line at
+        (x, y) crosses is ground when it starts no higher than step_height
+        above the feet (a brush that starts higher is an overhang the player
+        walks under). The ground is the highest top among them, so a block
+        rising through the feet line reports its real top. None when no
+        ground lies in the window.
+
+        Unlike trace_line, which reads leaf contents only, this sees detail
+        brushes. It does not see displacements, props or brush entities.
+        """
+        top_z = feet_z + probe_up
+        bottom_z = feet_z - probe_down
+        best: Optional[float] = None
+        seen = set()
+        for leaf_index in self._leaves_on_vertical(x, y, top_z, bottom_z):
+            leaf = self.bsp.leafs[leaf_index]
+            for k in range(leaf.num_leaf_brushes):
+                lb = leaf.first_leaf_brush + k
+                if lb >= len(self.bsp.leaf_brushes):
+                    continue
+                brush_index = self.bsp.leaf_brushes[lb]
+                if brush_index in seen or brush_index >= len(self.bsp.brushes):
+                    continue
+                seen.add(brush_index)
+                brush = self.bsp.brushes[brush_index]
+                if not (brush.contents & PLAYER_SOLID_CONTENTS):
+                    continue
+                span = self._brush_z_span(brush, x, y)
+                if span is None:
+                    continue
+                lo, hi = span
+                if lo > feet_z + step_height or hi < bottom_z:
+                    continue
+                if best is None or hi > best:
+                    best = hi
+        return best
+
+    def ground_steps_ok(
+        self,
+        start: Vector3,
+        end: Vector3,
+        max_step: float,
+        sample_spacing: float = 16.0,
+        probe_up: float = 60.0,
+        probe_down: float = 128.0,
+        step_height: float = 18.0,
+    ) -> bool:
+        """
+        Check that the ground under the straight path start -> end never
+        steps up by more than max_step.
+
+        Samples the 2D path every sample_spacing units, both ends included,
+        finds the ground under the straight feet line at each sample
+        (ground_height), and compares consecutive samples where ground was
+        found. Drops pass: a downward step makes a one-way edge, which is
+        what the caller asked about. A sample with no ground in its window
+        (open air, or a surface this tracer cannot see) is skipped, so a
+        step is measured from the last ground found.
+        """
+        horizontal = start.distance_to_2d(end)
+        samples = max(1, int(-(-horizontal // sample_spacing)))
+        previous: Optional[float] = None
+        for k in range(samples + 1):
+            p = start.lerp(end, k / samples)
+            ground = self.ground_height(
+                p.x, p.y, p.z,
+                probe_up=probe_up, probe_down=probe_down, step_height=step_height,
+            )
+            if ground is None:
+                continue
+            if previous is not None and ground - previous > max_step:
+                return False
+            previous = ground
+        return True
+
+    def _leaves_on_vertical(
+        self, x: float, y: float, top_z: float, bottom_z: float
+    ) -> List[int]:
+        """World leaves the vertical segment (x, y, top_z) -> (x, y, bottom_z) passes through."""
+        leaves: List[int] = []
+        if not self.bsp.nodes:
+            return leaves
+        stack = [(0, top_z, bottom_z)]
+        while stack:
+            index, z1, z2 = stack.pop()
+            if index < 0:
+                if -1 - index < len(self.bsp.leafs):
+                    leaves.append(-1 - index)
+                continue
+            if index >= len(self.bsp.nodes):
+                continue
+            node = self.bsp.nodes[index]
+            if node.plane_index >= len(self.bsp.planes):
+                continue
+            plane = self.bsp.planes[node.plane_index]
+            n = plane.normal
+            base = n.x * x + n.y * y - plane.dist
+            d1 = base + n.z * z1
+            d2 = base + n.z * z2
+            if d1 >= 0 and d2 >= 0:
+                stack.append((node.children[0], z1, z2))
+            elif d1 < 0 and d2 < 0:
+                stack.append((node.children[1], z1, z2))
+            else:
+                zm = z1 + (z2 - z1) * (d1 / (d1 - d2))
+                if d1 >= 0:
+                    stack.append((node.children[0], z1, zm))
+                    stack.append((node.children[1], zm, z2))
+                else:
+                    stack.append((node.children[1], z1, zm))
+                    stack.append((node.children[0], zm, z2))
+        return leaves
+
+    def _brush_z_span(
+        self, brush: Brush, x: float, y: float
+    ) -> Optional[Tuple[float, float]]:
+        """The z interval a convex brush occupies on the vertical line at (x, y), or None."""
+        lo, hi = float("-inf"), float("inf")
+        for k in range(brush.num_sides):
+            side_index = brush.first_side + k
+            if side_index >= len(self.bsp.brush_sides):
+                continue
+            side = self.bsp.brush_sides[side_index]
+            if side.plane_index >= len(self.bsp.planes):
+                continue
+            plane = self.bsp.planes[side.plane_index]
+            n = plane.normal
+            c = n.x * x + n.y * y - plane.dist     # inside: c + n.z * z <= 0
+            if abs(n.z) < 1e-6:
+                if c > ON_EPSILON:
+                    return None
+            elif n.z > 0:
+                hi = min(hi, -c / n.z)
+            else:
+                lo = max(lo, -c / n.z)
+        if not (lo < hi) or lo == float("-inf") or hi == float("inf"):
+            return None
+        return lo, hi
 
     def _recursive_hull_check(
         self,

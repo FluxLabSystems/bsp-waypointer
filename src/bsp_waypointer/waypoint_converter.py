@@ -117,6 +117,11 @@ def _empty_connectivity_report(n: int) -> Dict[str, float]:
         "unreachable_sinks": 0,      # reachable from main, cannot return
         "unreachable_islands": 0,    # neither
         "spawns_outside_main": 0,
+        # waypoints in the largest strongly connected component that holds a
+        # flagged spawn (0 when every spawn is in main): RCBot3 cannot use the
+        # edges inside a flagged area, so a bot spawning in a flagged room
+        # starts from the nearest live waypoint instead of following them
+        "largest_flagged_spawn_component": 0,
     }
 
 
@@ -233,7 +238,7 @@ class HL2DMWaypointConverter:
 
         # Stage C: add the cross-component edges that can be proven and
         # flag everything outside the main component W_FL_UNREACHABLE
-        # (raises only when no spawn can reach a usable graph)
+        # (raises only when the main component has fewer than two waypoints)
         self._ensure_connectivity()
 
         # Assign additional flags based on geometry
@@ -764,10 +769,11 @@ class HL2DMWaypointConverter:
         waypoint to index 0, where RCBot3's audit starts its reachability
         walk.
 
-        Raises RuntimeError only when no usable graph remains: the main
-        component has fewer than two waypoints, or spawns exist and none of
-        them is inside the main component or on a one-way exit into it.
-        Populates self.connectivity_report.
+        Raises RuntimeError only when the main component has fewer than two
+        waypoints. Spawns that all miss main cannot happen: main is chosen
+        among the components a spawn waypoint can reach, so at least one
+        spawn is inside it or on a one-way exit into it. Populates
+        self.connectivity_report.
         """
         n = len(self._waypoints)
         rep = _empty_connectivity_report(n)
@@ -819,6 +825,7 @@ class HL2DMWaypointConverter:
         for v in cls.outside:
             self._waypoints[v].add_flag(WaypointFlag.W_FL_UNREACHABLE)
         in_main = sum(1 for s in spawns if s in main)
+        flagged_spawns = {s for s in spawns if s in cls.outside}
         # a spawn on a one-way exit (source) still delivers its bot to main
         reaching = sum(1 for s in spawns if s in main or s in cls.sources)
         rep.update(
@@ -830,6 +837,9 @@ class HL2DMWaypointConverter:
             unreachable_islands=len(cls.islands),
             spawns_outside_main=len(spawns) - in_main,
             spawn_coverage=(reaching / len(spawns)) if spawns else 1.0,
+            largest_flagged_spawn_component=max(
+                [len(c) for c in sccs if flagged_spawns.intersection(c)] or [0]
+            ),
         )
 
         # C3: RCBot3's audit walks from the first used waypoint
@@ -840,11 +850,6 @@ class HL2DMWaypointConverter:
             raise RuntimeError(
                 "no usable waypoint graph: the largest traversable component "
                 f"has {len(main)} waypoint(s)"
-            )
-        if spawns and reaching == 0:
-            raise RuntimeError(
-                f"none of the {len(spawns)} spawn waypoints can reach the traversable "
-                f"component ({len(main)} waypoints)"
             )
 
     def _apply_permutation(self, perm: List[int]) -> None:
@@ -901,9 +906,11 @@ class HL2DMWaypointConverter:
         """
         Check whether a DIRECTED connection A -> B is traversable.
 
-        Vertical rules: rises above crouch-jump height are refused
-        (ladders/lifts provide explicit edges); drops are allowed one-way
-        down to MAX_DROP_CONNECTION.
+        Vertical rules: a rise above crouch-jump height passes only as a
+        walkable gradient, and with a tracer only when the ground under the
+        path has no step taller than a crouch-jump (ladders/lifts provide
+        explicit edges); drops are allowed one-way down to
+        MAX_DROP_CONNECTION.
         """
         distance = wp_a.origin.distance_to(wp_b.origin)
 
@@ -921,14 +928,23 @@ class HL2DMWaypointConverter:
         ):
             return True
 
-        # Ladder rules: rungs of the same column connect freely; a single
+        # Ladder rules: two ladder waypoints of one column connect freely
+        # within one rung gap (LADDER_RUNG_SPACING) of each other; a single
         # ladder endpoint connects within mount/dismount reach. Anything
-        # further falls through to the normal LOS/walkability checks
-        # (the old blanket exemption let ladders connect through walls).
+        # further falls through to the normal vertical, LOS and walkability
+        # checks (the old blanket exemption let ladders connect through
+        # walls). One rung gap, because RCBot3 only climbs the ladder it is
+        # on: while m_hLadder is set it holds forward toward the next
+        # waypoint (no move carries it from one ladder to another), and it
+        # counts a ladder waypoint touched once it is within
+        # rcbot_ladder_offs (42) units below it. A pair further apart is
+        # either one ladder, which _place_ladder_chain already links rung by
+        # rung, or two ladders stacked with a floor between them, which the
+        # vertical rules judge like any other pair.
         a_ladder = wp_a.has_flag(WaypointFlag.W_FL_LADDER)
         b_ladder = wp_b.has_flag(WaypointFlag.W_FL_LADDER)
         if a_ladder and b_ladder:
-            if horizontal_dist < 64:
+            if horizontal_dist < 64 and abs(rise) <= LADDER_RUNG_SPACING:
                 return True
         elif a_ladder or b_ladder:
             if distance < 200:
@@ -970,10 +986,11 @@ class HL2DMWaypointConverter:
             ):
                 return False
 
-            # For longer flat stretches, also check if a player hull can
-            # walk the path (skipped for drops: falling needs no walk
-            # clearance)
-            if distance > 256 and rise >= -CROUCH_JUMP_RISE:
+            # A climb at any length, or a longer flat stretch, also needs a
+            # player hull to walk the path (skipped for drops: falling needs
+            # no walk clearance)
+            climb = rise > CROUCH_JUMP_RISE
+            if (climb or distance > 256) and rise >= -CROUCH_JUMP_RISE:
                 if not self.ray_tracer.can_walk_between(
                     wp_a.origin,
                     wp_b.origin,
@@ -982,6 +999,18 @@ class HL2DMWaypointConverter:
                     step_height=DEFAULT_PLAYER_DIMS.step_height,
                 ):
                     return False
+
+            # The gradient rule assumes the ground rises along the path. Once
+            # the line has risen above a wall, the eye line and the straight
+            # hull sweep both pass over it into the ledge behind, so walk the
+            # ground: no upward step may exceed a crouch-jump (M-087)
+            if climb and not self.ray_tracer.ground_steps_ok(
+                wp_a.origin,
+                wp_b.origin,
+                max_step=CROUCH_JUMP_RISE,
+                step_height=DEFAULT_PLAYER_DIMS.step_height,
+            ):
+                return False
 
         return True
 
@@ -1004,7 +1033,14 @@ class HL2DMWaypointConverter:
                     wp.add_flag(WaypointFlag.W_FL_FALL)
 
     def _detect_sniper_positions(self) -> None:
-        """Detect good sniper/crossbow positions."""
+        """Detect good sniper/crossbow positions.
+
+        Runs after Stage C and never marks a W_FL_UNREACHABLE waypoint:
+        RCBot3 picks a sniper goal by flag (randomWaypointGoal) without
+        testing W_FL_UNREACHABLE, so a flagged sniper spot would send a
+        crossbow bot at a place it has no route to. Only long connections to
+        live waypoints count as sight lines.
+        """
         if len(self._waypoints) < 10:
             return
 
@@ -1012,16 +1048,21 @@ class HL2DMWaypointConverter:
         avg_z = sum(wp.origin.z for wp in self._waypoints) / len(self._waypoints)
 
         for wp in self._waypoints:
+            if wp.has_flag(WaypointFlag.W_FL_UNREACHABLE):
+                continue
+
             # High ground check
             if wp.origin.z < avg_z + 256:
                 continue
 
-            # Check for long sight lines
+            # Check for long sight lines to waypoints a bot can stand on
             long_connections = 0
             for conn_idx in wp.connections:
                 if conn_idx >= len(self._waypoints):
                     continue
                 conn_wp = self._waypoints[conn_idx]
+                if conn_wp.has_flag(WaypointFlag.W_FL_UNREACHABLE):
+                    continue
                 dist = wp.origin.distance_to(conn_wp.origin)
                 if dist > 512:
                     long_connections += 1

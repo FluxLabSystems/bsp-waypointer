@@ -17,6 +17,7 @@ from .bsp_parser import BSPParser
 from .constants import (
     DEFAULT_PLAYER_DIMS,
     DEFAULT_WAYPOINT_SPACING,
+    FLAGGED_SPAWN_AREA_WARN,
     MAX_WAYPOINTS,
     SPAWN_REACH_COVERAGE,
     PlayerDimensions,
@@ -247,6 +248,37 @@ Examples:
     return parser
 
 
+def log_connectivity_report(report: dict, total_waypoints: int) -> None:
+    """Log the converter's connectivity report and warn about what it flagged."""
+    logger.info(
+        f"  Connectivity: main component {report['main_size']} of "
+        f"{total_waypoints} waypoints, {report['repair_edges']} repair and "
+        f"{report['bridges']} bridge edges (all traversal-checked), "
+        f"{report['spawn_coverage']:.0%} of spawns can reach it"
+    )
+    if report["unreachable_flagged"]:
+        logger.warning(
+            f"  {report['unreachable_flagged']} waypoints flagged unreachable "
+            f"({report['unreachable_sources']} one-way exits, "
+            f"{report['unreachable_sinks']} traps, "
+            f"{report['unreachable_islands']} islands): no traversable "
+            f"edge joins them to the main component"
+        )
+    if report["spawn_coverage"] < SPAWN_REACH_COVERAGE:
+        logger.warning(
+            f"  {report['spawns_outside_main']} spawn waypoints are outside "
+            f"the main component"
+        )
+    area = report.get("largest_flagged_spawn_component", 0)
+    if area > FLAGGED_SPAWN_AREA_WARN:
+        logger.warning(
+            f"  a spawn is inside a flagged area of {area} waypoints: RCBot3 "
+            f"never routes through flagged waypoints, so a bot spawning there "
+            f"cannot follow that area's own paths and heads straight for the "
+            f"nearest live waypoint"
+        )
+
+
 def calculate_spacing(density: float) -> float:
     """Calculate waypoint spacing from density value."""
     # Density 1.0 = spacing 75, density 0.1 = spacing 300
@@ -424,25 +456,7 @@ def generate_waypoints(
         logger.info(f"  Total waypoints: {len(waypoints)}")
         report = getattr(converter, "connectivity_report", None)
         if report:
-            logger.info(
-                f"  Connectivity: main component {report['main_size']} of "
-                f"{len(waypoints)} waypoints, {report['repair_edges']} repair and "
-                f"{report['bridges']} bridge edges (all traversal-checked), "
-                f"{report['spawn_coverage']:.0%} of spawns can reach it"
-            )
-            if report["unreachable_flagged"]:
-                logger.warning(
-                    f"  {report['unreachable_flagged']} waypoints flagged unreachable "
-                    f"({report['unreachable_sources']} one-way exits, "
-                    f"{report['unreachable_sinks']} traps, "
-                    f"{report['unreachable_islands']} islands): no traversable "
-                    f"edge joins them to the main component"
-                )
-            if report["spawn_coverage"] < SPAWN_REACH_COVERAGE:
-                logger.warning(
-                    f"  {report['spawns_outside_main']} spawn waypoints are outside "
-                    f"the main component"
-                )
+            log_connectivity_report(report, len(waypoints))
 
         # Count special waypoints
         weapon_count = sum(

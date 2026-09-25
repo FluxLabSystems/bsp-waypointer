@@ -232,13 +232,20 @@ W_FL_USE = 1 << 30          # Requires +USE
 ### The RCBot3 Output Contract
 - **Edges are proven.** Apart from the explicit entity edges (teleporter, ladder rungs and
   dismounts, door sides, lift pairs, jump pads), every connection passes `_can_connect`.
-  No stage adds an edge the traversal model refuses.
+  No stage adds an edge the traversal model refuses. With a tracer, a climb (a rise above
+  `CROUCH_JUMP_RISE`) also needs the straight hull sweep at any length and
+  `BSPRayTracer.ground_steps_ok`: no step up taller than a crouch-jump in the world
+  brushes under the path, so a line that has risen above a wall cannot carry an edge
+  onto the ledge behind it. Two ladder waypoints link freely only within one rung gap.
 - **What cannot be proven is flagged.** The main component is the largest strongly
   connected component a spawn can reach. Every waypoint outside it is flagged
   `W_FL_UNREACHABLE`, and a main waypoint is index 0. The converter raises only when the
-  main component has fewer than two waypoints, or no spawn is in it or on a one-way exit
-  into it. `connectivity_report` keeps `bridges`, `return_edges` and `spawn_coverage`,
-  which hl2dm_manager reads by name.
+  main component has fewer than two waypoints (main is chosen among the components a
+  spawn can reach, so some spawn always reaches it). `connectivity_report` keeps
+  `bridges`, `return_edges` and `spawn_coverage`, which hl2dm_manager reads by name, and
+  `largest_flagged_spawn_component` says whether a spawn sits in a flagged room rather
+  than on a ledge (the CLI warns above `FLAGGED_SPAWN_AREA_WARN`). `W_FL_SNIPER` never
+  goes on a flagged waypoint.
 - **The validator is RCBot3's loader.** `rcw_validator.parse` makes `CWaypoints::load`'s
   checks in its order (stricter only where `STRICTER_THAN_LOADER` says).
   `graph_contract.rcbot3_load_audit` models `auditAndRepairGraph`, which a generated file
@@ -329,10 +336,16 @@ mypy src                    # Type check
 1. **Navmesh Generation**: Uses simplified grid-based approach, not Recast/Detour
 2. **Line-of-Sight**: Without a ray tracer, connection validity uses only the vertical and
    slope rules and prop boxes. With or without one, a single ladder endpoint connects to
-   anything within 200 units with no line-of-sight test
+   anything within 200 units with no line-of-sight test. The tracer sees world brushes
+   only: the ground probe cannot see displacements, props or brush entities, so a climb
+   onto one of them is judged by the hull sweep and the eye line alone; `line_of_sight`
+   reads leaf contents and misses func_detail brushes, and a flat connection of 256 units
+   or less gets no hull sweep
 3. **Displacement Surfaces**: Basic support, complex displacements may have issues
 4. **Unproven Areas**: Areas the traversal model cannot prove reachable are flagged
-   `W_FL_UNREACHABLE` (about a fifth of dm_lockdown, including some pickups and one spawn)
+   `W_FL_UNREACHABLE` (about a quarter of dm_lockdown, including some pickups and one
+   spawn room). RCBot3 never routes through them, but it still walks at a pickup it finds
+   by classname, whatever the waypoint flags say
 
 ## Future Enhancement Areas
 

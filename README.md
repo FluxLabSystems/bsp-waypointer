@@ -343,8 +343,9 @@ mypy src
 - Without PyRecastDetour installed, navmesh generation uses an enhanced fallback algorithm
 - Some complex geometry may not generate optimal waypoints
 - Areas the traversal model cannot prove reachable are flagged `W_FL_UNREACHABLE`, so bots
-  do not go there (on dm_lockdown about a fifth of the waypoints, including some pickups
-  and one spawn room)
+  never route through them (on dm_lockdown about a quarter of the waypoints, including
+  some pickups and one spawn room). RCBot3 still walks at a pickup it finds by classname,
+  whatever the waypoint flags say
 - Without ray tracing (`--no-raytracing`, or a library caller that passes no tracer), a
   connection is checked only against the vertical and slope rules and prop boxes
 - Displacement surface support is basic
@@ -356,6 +357,8 @@ mypy src
 The tool uses BSP tree traversal for accurate line-of-sight checks:
 - Traces rays through the BSP tree to detect solid geometry
 - Supports hull tracing for player collision detection
+- Probes the ground under a climbing connection (world and func_detail brushes), so a
+  straight sweep that has risen above a wall cannot connect the floor to the ledge behind it
 - Validates waypoint connections against actual map geometry
 
 ### Recast/Detour Integration

@@ -1,24 +1,31 @@
-"""M-087: the converter never invents an edge its own traversal model refuses.
+"""M-087: the converter never invents an edge its own traversal model refuses,
+and the model itself refuses a climb up a wall.
 
-The scenes run the real HL2DMWaypointConverter.convert() with an empty navmesh
+Most scenes run the real HL2DMWaypointConverter.convert() with an empty navmesh
 (entity-placed waypoints only) and a stub tracer describing flat floors joined
-by vertical cliffs: line of sight everywhere, walkable only on one floor.
+by vertical cliffs: line of sight everywhere, walkable only on one floor. The
+wall-climb scenes use the real BSPRayTracer over a small hand-built BSP.
 """
 
 import copy
+import logging
 
 import pytest
 
-from bsp_waypointer.constants import HL2DMWaypointSubType as ST, WaypointFlag
+from bsp_waypointer import cli
+from bsp_waypointer.bsp_parser import Brush, BrushSide, BSPLeaf, BSPNode
+from bsp_waypointer.constants import (FLAGGED_SPAWN_AREA_WARN, ContentFlags,
+                                      HL2DMWaypointSubType as ST, WaypointFlag)
 from bsp_waypointer.entity_analyzer import (AmmoPickup, HealthItem, HL2DMEntityData, Lift,
                                             SpawnPoint, WeaponSpawn)
 from bsp_waypointer.graph_contract import (choose_main_component, classify_against_main,
                                            rcbot3_load_audit, strongly_connected_components)
 from bsp_waypointer.navmesh_generator import NavigationMesh
+from bsp_waypointer.ray_tracer import BSPRayTracer
 from bsp_waypointer.rcw_validator import validate
 from bsp_waypointer.rcw_writer import RCWWriter
-from bsp_waypointer.vector import Vector3
-from bsp_waypointer.waypoint_converter import HL2DMWaypointConverter
+from bsp_waypointer.vector import Plane, Vector3
+from bsp_waypointer.waypoint_converter import HL2DMWaypointConverter, Waypoint
 
 UNREACH = WaypointFlag.W_FL_UNREACHABLE
 
@@ -120,12 +127,15 @@ class TestNoInventedEdges:
         s = validate(out)
         assert s.components == 1 and s.excluded_unreachable == 4
 
-    def test_raises_when_no_spawn_can_reach_the_graph(self):
+    def test_raises_when_the_main_component_is_a_single_waypoint(self):
+        # the only spawn is alone in a pit: the one component it can reach is
+        # itself, so main has one waypoint. (Every spawn missing main cannot
+        # happen: main is chosen among the components a spawn can reach.)
         e = HL2DMEntityData()
-        e.spawn_points = [spawn(0, 0, -300)]                           # alone in a pit
+        e.spawn_points = [spawn(0, 0, -300)]
         e.ammo_pickups = [AmmoPickup(V(x, 0, 0), "item_ammo_smg1", ST.ITEM_AMMO_SMG1, "")
                           for x in (0, 200, 400)]
-        with pytest.raises(RuntimeError, match="usable|spawn"):
+        with pytest.raises(RuntimeError, match="usable waypoint graph.*has 1 waypoint"):
             convert(e)
 
     def test_spawn_on_a_drop_out_ledge_is_fine(self):
@@ -136,6 +146,219 @@ class TestNoInventedEdges:
         conv, wps = convert(e)
         assert conv.connectivity_report["spawn_coverage"] == 1.0
         assert by_subtype(wps, ST.SPAWN_POINT)[0].has_flag(UNREACH)
+
+
+def spawn_room_scene():
+    """The spawn floor of scene() plus a raised room (z=300) of six waypoints,
+    one of them a spawn, whose only way out is a drop to the floor."""
+    e = HL2DMEntityData()
+    e.spawn_points = [spawn(x, y, 0) for x in (0, 300, 600) for y in (0, 300, 600)]
+    e.spawn_points.append(spawn(0, 1000, 300))
+    e.ammo_pickups = [AmmoPickup(V(x, y, 300), "item_ammo_smg1", ST.ITEM_AMMO_SMG1, "")
+                      for x, y in ((150, 1000), (300, 1000), (0, 1150), (150, 1150), (300, 1150))]
+    e.ammo_pickups.append(AmmoPickup(V(150, 800, 0), "item_ammo_ar2", ST.ITEM_AMMO_AR2, ""))
+    return e
+
+
+class TestFlaggedSpawnArea:
+    """A spawn inside a flagged room is reported and warned about (the rule
+    that flags sources stays: RCBot3 would bridge them blindly otherwise)."""
+
+    def test_a_ledge_spawn_is_a_small_flagged_area(self):
+        conv, _ = convert(scene())
+        assert conv.connectivity_report["largest_flagged_spawn_component"] == 2
+        assert conv.connectivity_report["largest_flagged_spawn_component"] <= FLAGGED_SPAWN_AREA_WARN
+
+    def test_a_spawn_room_with_a_drop_exit_is_measured(self):
+        conv, wps = convert(spawn_room_scene())
+        rep = conv.connectivity_report
+        assert rep["largest_flagged_spawn_component"] == 6
+        assert rep["unreachable_sources"] == 6
+        # the one number the manager logs cannot see it
+        assert rep["spawn_coverage"] == pytest.approx(1.0)
+
+    def test_no_flagged_spawn_reports_zero(self):
+        e = scene()
+        e.spawn_points = [s for s in e.spawn_points if s.origin.z == 0.0]
+        conv, _ = convert(e)
+        assert conv.connectivity_report["largest_flagged_spawn_component"] == 0
+
+    def _warnings(self, report):
+        records = []
+
+        class Keep(logging.Handler):
+            def emit(self, record):
+                records.append(record)
+
+        handler = Keep(level=logging.WARNING)
+        cli.logger.addHandler(handler)
+        try:
+            cli.log_connectivity_report(report, 100)
+        finally:
+            cli.logger.removeHandler(handler)
+        return [r.getMessage() for r in records if r.levelno >= logging.WARNING]
+
+    def test_the_cli_warns_about_a_spawn_room_only(self):
+        room, _ = convert(spawn_room_scene())
+        ledge, _ = convert(scene())
+        assert any("flagged area of 6 waypoints" in m for m in self._warnings(room.connectivity_report))
+        assert not any("flagged area" in m for m in self._warnings(ledge.connectivity_report))
+
+
+class TestTraversalModelDetails:
+    def test_ladder_waypoints_link_within_one_rung_gap_only(self):
+        conv = HL2DMWaypointConverter(ray_tracer=None)
+        ladder = WaypointFlag.W_FL_LADDER
+        foot = Waypoint(0, V(0, 0, 0), flags=ladder)
+        near = Waypoint(1, V(40, 0, 70), flags=ladder)
+        far = Waypoint(2, V(40, 0, 300), flags=ladder)
+        assert conv._can_connect(foot, near) and conv._can_connect(near, foot)
+        # 300 up, 40 across: two ladders with a floor between; the vertical rule refuses
+        assert not conv._can_connect(foot, far)
+
+    def test_sniper_spots_are_live_and_see_live_waypoints(self):
+        conv = HL2DMWaypointConverter()
+        wps = [Waypoint(i, V(i * 10, 0, 0)) for i in range(10)]
+        live_far = [Waypoint(10, V(0, 1000, 0)), Waypoint(11, V(0, -1000, 0))]
+        dead_far = [Waypoint(12, V(1000, 0, 0), flags=UNREACH), Waypoint(13, V(-1000, 0, 0), flags=UNREACH)]
+        good = Waypoint(14, V(0, 0, 1000), connections=[10, 11])
+        flagged = Waypoint(15, V(50, 0, 1000), flags=UNREACH, connections=[10, 11])
+        sees_flagged = Waypoint(16, V(100, 0, 1000), connections=[12, 13])
+        conv._waypoints = wps + live_far + dead_far + [good, flagged, sees_flagged]
+        conv._detect_sniper_positions()
+        sniper = WaypointFlag.W_FL_SNIPER
+        assert good.has_flag(sniper)
+        assert not flagged.has_flag(sniper)
+        assert not sees_flagged.has_flag(sniper)
+
+
+# ----------------------------------------------------------------------
+# Wall climbs. A 150-unit box ledge, a ramp up to a platform of the same
+# height, and an overhead beam, all detail brushes in one empty leaf: like
+# func_detail on dm_lockdown, trace_line (which reads leaf contents) sees none
+# of them, while the hull sweep and the ground probe read the leaf's brushes.
+# A floor waypoint within reach of a waypoint 15 units in from the ledge's
+# edge passes the gradient rule, the eye line and the straight hull sweep:
+# once the line has risen, it clears the wall. Only the ground refuses it.
+# ----------------------------------------------------------------------
+
+class BoxLedgeBSP:
+    def __init__(self):
+        self.planes, self.brush_sides, self.brushes = [], [], []
+        detail = ContentFlags.CONTENTS_SOLID | ContentFlags.CONTENTS_DETAIL
+        self._box((-1000, -1000, -16), (2500, 1000, 0), ContentFlags.CONTENTS_SOLID)
+        self._box((300, -150, 0), (600, 150, 150), detail)           # the ledge
+        self._brush([((0, 0, -1), 0.0), ((-0.5, 0, 1), -650.0),      # ramp: z <= (x - 1300) / 2
+                     ((1, 0, 0), 1600.0), ((-1, 0, 0), -1300.0),
+                     ((0, 1, 0), 150.0), ((0, -1, 0), 150.0)], detail)
+        self._box((1600, -150, 0), (1900, 150, 150), detail)         # platform the ramp reaches
+        self._box((-200, 600, 100), (200, 650, 128), detail)         # overhead beam
+        self.leaf_brushes = list(range(len(self.brushes)))
+        self.planes.append(Plane(Vector3(0, 0, 1), -4096.0))
+        self.nodes = [BSPNode(plane_index=len(self.planes) - 1, children=(-1, -2),
+                              mins=(-4096, -4096, -4096), maxs=(4096, 4096, 4096),
+                              first_face=0, num_faces=0, area=0)]
+        self.leafs = [self._leaf(0, len(self.brushes)),
+                      self._leaf(ContentFlags.CONTENTS_SOLID, 0)]
+
+    def _brush(self, sides, contents):
+        first = len(self.brush_sides)
+        for normal, dist in sides:
+            n = Vector3(*map(float, normal))
+            length = n.length()
+            self.planes.append(Plane(n * (1.0 / length), dist / length))
+            self.brush_sides.append(BrushSide(len(self.planes) - 1, 0, -1, 0))
+        self.brushes.append(Brush(first, len(sides), int(contents)))
+
+    def _box(self, mins, maxs, contents):
+        (x0, y0, z0), (x1, y1, z1) = mins, maxs
+        self._brush([((1, 0, 0), x1), ((-1, 0, 0), -x0), ((0, 1, 0), y1),
+                     ((0, -1, 0), -y0), ((0, 0, 1), z1), ((0, 0, -1), -z0)], contents)
+
+    @staticmethod
+    def _leaf(contents, num_brushes):
+        return BSPLeaf(contents=int(contents), cluster=-1, area_flags=0,
+                       mins=(-4096, -4096, -4096), maxs=(4096, 4096, 4096),
+                       first_leaf_face=0, num_leaf_faces=0,
+                       first_leaf_brush=0, num_leaf_brushes=num_brushes,
+                       leaf_water_data_id=-1)
+
+
+LEDGE_TOP = V(315, 0, 150)
+RAMP_FOOT = V(1300, 0, 0)
+RAMP_TOP = V(1600, 0, 150)
+
+
+def ledge_scene():
+    e = HL2DMEntityData()
+    e.spawn_points = [spawn(0, 0, 0), spawn(0, -300, 0), spawn(0, 300, 0), spawn(-300, 0, 0)]
+    e.weapons = [WeaponSpawn(LEDGE_TOP, "weapon_rpg", ST.WEAPON_RPG, 95, 30.0)]
+    e.ammo_pickups = [AmmoPickup(V(x, y, 0), "item_ammo_smg1", ST.ITEM_AMMO_SMG1, "")
+                      for x, y in ((150, 0), (350, 300), (700, 300), (1050, 300))]
+    e.ammo_pickups.append(AmmoPickup(RAMP_FOOT, "item_ammo_ar2", ST.ITEM_AMMO_AR2, ""))
+    e.health_items = [HealthItem(RAMP_TOP, "item_healthkit", ST.ITEM_HEALTHKIT, 50)]
+    return e
+
+
+def convert_ledge():
+    conv = HL2DMWaypointConverter(ray_tracer=BSPRayTracer(BoxLedgeBSP()), use_ray_tracing=True)
+    return conv, conv.convert(NavigationMesh(), ledge_scene())
+
+
+def at(wps, point):
+    return next(w for w in wps if w.origin.distance_to(point) < 1.0)
+
+
+class TestWallClimbs:
+    def test_the_eye_line_and_the_straight_sweep_pass_over_the_wall(self):
+        """Guard: the long climb onto the ledge is refused by the ground alone."""
+        tracer = BSPRayTracer(BoxLedgeBSP())
+        floor = V(0, 0, 0)
+        assert tracer.line_of_sight(floor, LEDGE_TOP, player_height_offset=36.0)
+        assert tracer.can_walk_between(floor, LEDGE_TOP)
+        assert not tracer.ground_steps_ok(floor, LEDGE_TOP, max_step=45.0)
+
+    def test_ground_height_reads_detail_brushes_and_skips_overhangs(self):
+        tracer = BSPRayTracer(BoxLedgeBSP())
+        assert not tracer.trace_line(V(450, 0, 300), V(450, 0, -100)).hit   # leaf contents only
+        assert tracer.ground_height(450, 0, 150) == pytest.approx(150.0)
+        assert tracer.ground_height(0, 0, 0) == pytest.approx(0.0)
+        assert tracer.ground_height(1450, 0, 75) == pytest.approx(75.0)
+        assert tracer.ground_height(0, 625, 0) == pytest.approx(0.0)        # beam at 100..128
+        assert tracer.ground_height(5000, 0, 0) is None
+
+    def test_ground_steps(self):
+        tracer = BSPRayTracer(BoxLedgeBSP())
+        assert not tracer.ground_steps_ok(V(150, 0, 0), LEDGE_TOP, max_step=45.0)
+        assert tracer.ground_steps_ok(LEDGE_TOP, V(0, 0, 0), max_step=45.0)      # a drop
+        assert tracer.ground_steps_ok(RAMP_FOOT, RAMP_TOP, max_step=45.0)
+
+    def test_no_edge_climbs_onto_the_ledge(self):
+        conv, wps = convert_ledge()
+        ledge = at(wps, LEDGE_TOP)
+        assert not any(ledge.index in w.connections for w in wps)
+        assert ledge.connections                       # it can still drop to the floor
+        assert ledge.has_flag(UNREACH)
+        assert conv.connectivity_report["unreachable_sources"] == 1
+
+    def test_the_ramp_is_still_climbed(self):
+        conv, wps = convert_ledge()
+        foot, top = at(wps, RAMP_FOOT), at(wps, RAMP_TOP)
+        assert top.index in foot.connections
+        assert not top.has_flag(UNREACH) and not foot.has_flag(UNREACH)
+
+    def test_every_edge_passes_the_traversal_model(self):
+        conv, wps = convert_ledge()
+        for a in wps:
+            for c in a.connections:
+                assert conv._can_connect(a, wps[c], max_range=1e9), (a.origin, wps[c].origin)
+
+    def test_output_is_certified(self, tmp_path):
+        conv, wps = convert_ledge()
+        out = tmp_path / "dm_ledge.rcw"
+        RCWWriter().write(out, wps, map_name="dm_ledge")
+        s = validate(out)
+        assert s.components == 1 and s.excluded_unreachable == 1
 
 
 class TestGraphContract:

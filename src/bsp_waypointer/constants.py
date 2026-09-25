@@ -576,9 +576,15 @@ CROUCH_JUMP_RISE = 45.0
 # Maximum one-way drop connection depth (survivable fall)
 MAX_DROP_CONNECTION = 600.0
 
-# Fraction of spawn waypoints expected inside the traversable component;
-# below it the converter warns (it raises only when none is inside)
+# Fraction of spawn waypoints expected to reach the traversable component;
+# below it the CLI warns
 SPAWN_REACH_COVERAGE = 0.95
+
+# A spawn in a flagged strongly connected component with more waypoints than
+# this is in a flagged room, not on a ledge: RCBot3 never uses a flagged
+# waypoint's paths, so a bot spawning there cannot follow the room's own way
+# out. The CLI warns (report key largest_flagged_spawn_component)
+FLAGGED_SPAWN_AREA_WARN = 4
 
 # Stage C: widest range at which a cross-component edge may be proven
 BRIDGE_RANGE = DEGREE_REPAIR_RANGES[-1]
