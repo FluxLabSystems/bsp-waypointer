@@ -247,3 +247,136 @@ class TestRayTracerEdgeCases:
         result = tracer.trace_line(start, end)
 
         assert result.fraction == 1.0
+
+
+# ----------------------------------------------------------------------
+# REGRESSION: traces against ACTUAL SOLID GEOMETRY.
+#
+# Every pre-existing test in this file traces against an EMPTY BSP
+# (no nodes, no leafs), which exercises only the early-out at the top of
+# trace_line(). That is why the suite stayed green through the
+# `_trace_to_leaf` start_solid bug: the old implementation set
+#     fraction = 0.0; start_solid = True; all_solid = True
+# whenever ANY leaf along the trace was solid, regardless of WHERE along
+# the ray it occurred. Every trace that eventually hit a wall was reported
+# as "started inside a wall at fraction 0", which corrupts line-of-sight
+# and walkability for the entire waypoint connection stage.
+#
+# The fix threads start_frac through and only sets start_solid when
+# start_frac <= 0.0. These tests need real geometry to see any of it.
+# ----------------------------------------------------------------------
+
+from bsp_waypointer.bsp_parser import BSPLeaf, BSPNode  # noqa: E402
+from bsp_waypointer.constants import ContentFlags  # noqa: E402
+
+
+class SolidWallBSP:
+    """Minimal BSP: everything at x >= 100 is solid, everything else empty.
+
+    One plane, one node, two leafs.
+      node 0  : plane 0 (normal +X, dist 100)
+                children[0] = front half-space (x >= 100) -> leaf 0, SOLID
+                children[1] = back  half-space (x <  100) -> leaf 1, empty
+    Child encoding is the Source convention: negative means leaf,
+    leaf_index = -1 - child.
+    """
+
+    def __init__(self):
+        self.planes = [Plane(Vector3(1, 0, 0), 100.0)]
+        self.leafs = [
+            self._leaf(ContentFlags.CONTENTS_SOLID),  # leaf 0 -> child -1
+            self._leaf(0),                            # leaf 1 -> child -2
+        ]
+        self.nodes = [
+            BSPNode(
+                plane_index=0,
+                children=(-1, -2),
+                mins=(-4096, -4096, -4096),
+                maxs=(4096, 4096, 4096),
+                first_face=0,
+                num_faces=0,
+                area=0,
+            )
+        ]
+        self.leaf_brushes = []
+        self.brushes = []
+        self.brush_sides = []
+
+    @staticmethod
+    def _leaf(contents):
+        return BSPLeaf(
+            contents=contents,
+            cluster=-1,
+            area_flags=0,
+            mins=(-4096, -4096, -4096),
+            maxs=(4096, 4096, 4096),
+            first_leaf_face=0,
+            num_leaf_faces=0,
+            first_leaf_brush=0,
+            num_leaf_brushes=0,
+            leaf_water_data_id=-1,
+        )
+
+
+class TestRayTracerAgainstSolidGeometry:
+    """Traces through a BSP that actually contains a wall."""
+
+    def test_fixture_is_actually_solid(self):
+        """Guard: if this fails the fixture is wrong, not the tracer."""
+        tracer = BSPRayTracer(SolidWallBSP())
+        assert tracer.point_in_solid(Vector3(200, 0, 0)) is True
+        assert tracer.point_in_solid(Vector3(0, 0, 0)) is False
+
+    def test_trace_ending_in_solid_does_not_report_start_solid(self):
+        """THE regression. Start in open space, end inside the wall.
+
+        The ray begins at x=0 (empty) and ends at x=200 (solid), crossing
+        the wall plane at x=100, i.e. halfway. It must report a hit at
+        fraction ~0.5 and must NOT claim the trace started inside a wall.
+        """
+        tracer = BSPRayTracer(SolidWallBSP())
+
+        result = tracer.trace_line(Vector3(0, 0, 0), Vector3(200, 0, 0))
+
+        assert result.hit is True, "trace into a solid leaf must register a hit"
+        assert result.start_solid is False, (
+            "trace STARTED in open space at x=0 -- start_solid must be False. "
+            "Reporting start_solid for a wall hit partway along the ray is "
+            "the _trace_to_leaf bug."
+        )
+        assert result.all_solid is False
+        assert 0.0 < result.fraction <= 1.0, (
+            "fraction must locate the wall along the ray, not collapse to 0.0"
+        )
+        assert result.fraction == pytest.approx(0.5, abs=0.01)
+        assert result.end_pos.x == pytest.approx(100.0, abs=1.0)
+
+    def test_trace_that_really_starts_in_solid_does_report_start_solid(self):
+        """The negative control: start_solid is not simply hardwired False."""
+        tracer = BSPRayTracer(SolidWallBSP())
+
+        result = tracer.trace_line(Vector3(200, 0, 0), Vector3(400, 0, 0))
+
+        assert result.start_solid is True
+        assert result.all_solid is True
+        assert result.fraction == pytest.approx(0.0)
+
+    def test_trace_entirely_in_open_space_is_clear(self):
+        tracer = BSPRayTracer(SolidWallBSP())
+
+        result = tracer.trace_line(Vector3(-200, 0, 0), Vector3(0, 0, 0))
+
+        assert result.hit is False
+        assert result.start_solid is False
+        assert result.fraction == 1.0
+
+    def test_line_of_sight_blocked_by_the_wall(self):
+        """LOS across the wall must be blocked; LOS within open space clear."""
+        tracer = BSPRayTracer(SolidWallBSP())
+
+        assert tracer.line_of_sight(
+            Vector3(0, 0, 0), Vector3(200, 0, 0), player_height_offset=0.0
+        ) is False
+        assert tracer.line_of_sight(
+            Vector3(-300, 0, 0), Vector3(-100, 0, 0), player_height_offset=0.0
+        ) is True

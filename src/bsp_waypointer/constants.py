@@ -5,7 +5,7 @@ Contains waypoint flags, entity mappings, player dimensions, and weapon prioriti
 """
 
 from enum import IntEnum, IntFlag, auto
-from typing import Dict, NamedTuple
+from typing import Dict, NamedTuple, Tuple
 
 
 # =============================================================================
@@ -269,6 +269,149 @@ TELEPORT_DESTINATION = "info_teleport_destination"
 
 
 # =============================================================================
+# Navigation-Affecting Brush Entities
+# =============================================================================
+
+# Brush entities whose compiled geometry is static and solid: merged into the
+# walkable/collision mesh alongside worldspawn. func_brush honors its
+# "solidity" keyvalue (1 = never solid) at parse time.
+SOLID_BRUSH_ENTITIES = frozenset({
+    "func_brush",
+    "func_wall",
+    "func_wall_toggle",
+    "func_breakable",
+    "func_breakable_surf",
+    "func_button",
+    "func_rot_button",
+    "func_healthcharger",
+    "func_recharge",
+})
+
+# Brush entities that are never solid to players
+NONSOLID_BRUSH_ENTITIES = frozenset({
+    "func_illusionary",
+})
+
+# Brush entities that move: excluded from the static mesh so paths can
+# route through/onto them; handled via waypoint flags instead.
+MOVER_BRUSH_ENTITIES = frozenset({
+    "func_door",
+    "func_door_rotating",
+    "func_movelinear",
+    "func_plat",
+    "func_platrot",
+    "func_train",
+    "func_tracktrain",
+    "func_rotating",
+})
+
+# Vertical movers treated as lifts/elevators for waypoint flagging
+LIFT_ENTITIES = frozenset({
+    "func_movelinear",
+    "func_plat",
+    "func_platrot",
+})
+
+
+# =============================================================================
+# Trigger Volumes Affecting Navigation
+# =============================================================================
+
+PUSH_ENTITIES = frozenset({"trigger_push"})
+HURT_ENTITIES = frozenset({"trigger_hurt"})
+
+# trigger_hurt damage-per-second at or above which waypoints/connections
+# inside the volume are suppressed (small scrape damage stays navigable)
+HAZARD_DAMAGE_THRESHOLD = 5.0
+
+# Cap on how far a trigger_push one-way connection may reach
+MAX_PUSH_CONNECTION_DISTANCE = 768.0
+
+
+# =============================================================================
+# HL2 Useable Ladders
+# =============================================================================
+
+# HL2/HL2DM maps predominantly use point-based useable ladders rather than
+# the legacy goldsrc-style func_ladder brush.
+USEABLE_LADDER_ENTITIES = frozenset({"func_useableladder"})
+LADDER_DISMOUNT_ENTITIES = frozenset({"info_ladder_dismount"})
+
+# Vertical spacing between intermediate waypoints along a ladder
+LADDER_RUNG_SPACING = 72.0
+
+
+# =============================================================================
+# Prop Entities (point entities referencing studio models)
+# =============================================================================
+
+PHYSICS_PROP_ENTITIES = frozenset({
+    "prop_physics",
+    "prop_physics_multiplayer",
+    "prop_physics_respawnable",
+    "prop_physics_override",
+})
+
+DYNAMIC_PROP_ENTITIES = frozenset({
+    "prop_dynamic",
+    "prop_dynamic_override",
+})
+
+# Compiled BSPs carry no model collision data, so prop obstacle bounds are
+# estimated from model-name substrings as (half_x, half_y, height) in units.
+# First matching substring wins; checked in this order.
+STATIC_PROP_SIZE_HINTS: Tuple[Tuple[str, Tuple[float, float, float]], ...] = (
+    ("oildrum", (14.0, 14.0, 45.0)),
+    ("barrel", (14.0, 14.0, 45.0)),
+    ("dumpster", (42.0, 30.0, 55.0)),
+    ("vehicle", (105.0, 45.0, 65.0)),
+    ("car0", (105.0, 45.0, 65.0)),
+    ("van0", (105.0, 48.0, 80.0)),
+    ("truck", (110.0, 48.0, 85.0)),
+    ("crate", (20.0, 20.0, 40.0)),
+    ("cabinet", (24.0, 12.0, 72.0)),
+    ("locker", (24.0, 12.0, 72.0)),
+    ("shelf", (24.0, 12.0, 72.0)),
+    ("bookcase", (24.0, 12.0, 84.0)),
+    ("fence", (48.0, 4.0, 96.0)),
+    ("gate", (60.0, 6.0, 96.0)),
+    ("railing", (48.0, 4.0, 40.0)),
+    ("tree", (12.0, 12.0, 220.0)),
+    ("rock", (40.0, 40.0, 60.0)),
+    ("boulder", (40.0, 40.0, 60.0)),
+    ("pipe", (20.0, 20.0, 64.0)),
+    ("table", (32.0, 22.0, 36.0)),
+    ("chair", (16.0, 16.0, 40.0)),
+    ("couch", (42.0, 20.0, 34.0)),
+    ("sofa", (42.0, 20.0, 34.0)),
+    ("bed", (42.0, 30.0, 30.0)),
+    ("mattress", (42.0, 30.0, 12.0)),
+    ("machine", (32.0, 32.0, 56.0)),
+    ("generator", (32.0, 32.0, 56.0)),
+    ("console", (32.0, 16.0, 42.0)),
+    ("terminal", (32.0, 16.0, 42.0)),
+    ("pallet", (24.0, 24.0, 8.0)),
+    ("cone", (8.0, 8.0, 30.0)),
+    ("sign", (24.0, 4.0, 36.0)),
+    ("lamp", (10.0, 10.0, 80.0)),
+    ("light", (10.0, 10.0, 80.0)),
+    ("pole", (6.0, 6.0, 128.0)),
+    ("post", (6.0, 6.0, 48.0)),
+    ("hydrant", (8.0, 8.0, 30.0)),
+    ("mailbox", (10.0, 10.0, 44.0)),
+    ("trashcan", (12.0, 12.0, 36.0)),
+    ("bin", (14.0, 14.0, 36.0)),
+    ("barricade", (40.0, 12.0, 40.0)),
+    ("sawblade", (28.0, 28.0, 8.0)),
+    ("wheel", (18.0, 6.0, 36.0)),
+    ("tire", (18.0, 8.0, 36.0)),
+)
+
+# Fallback obstacle half-extents for unrecognized prop models
+DEFAULT_STATIC_PROP_HALF_EXTENTS: Tuple[float, float, float] = (16.0, 16.0, 48.0)
+
+
+# =============================================================================
 # Spawn Point Entities
 # =============================================================================
 
@@ -396,3 +539,22 @@ MAX_CONNECTION_DISTANCE = 512.0
 
 # Minimum distance between waypoints
 MIN_WAYPOINT_DISTANCE = 64.0
+
+# =============================================================================
+# Connection-Stage Tuning (RCBot3 connectivity contract)
+# =============================================================================
+
+# Stage A: local candidate edge range
+CONNECTION_RANGE_LOCAL = 400.0
+
+# Stage B: stepwise relaxed ranges for zero-degree repair
+DEGREE_REPAIR_RANGES = (512.0, 640.0, 768.0)
+
+# Maximum rise traversable with a crouch-jump (larger climbs need ladders)
+CROUCH_JUMP_RISE = 45.0
+
+# Maximum one-way drop connection depth (survivable fall)
+MAX_DROP_CONNECTION = 600.0
+
+# Required strong-reachability coverage from each spawn waypoint
+SPAWN_REACH_COVERAGE = 0.95

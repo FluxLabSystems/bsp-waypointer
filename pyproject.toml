@@ -4,15 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bsp-waypointer"
-version = "0.1.0"
-description = "BSP Waypoint Generator for Half-Life 2: Deathmatch - Generates RCBot2 waypoints from Source Engine BSP files"
+version = "0.2.0"
+description = "BSP Waypoint Generator for Half-Life 2: Deathmatch - Generates RCBot3 v5 waypoints (.rcw) from Source Engine BSP files"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.9"
 authors = [
     {name = "BSP Waypoint Generator Team"}
 ]
-keywords = ["bsp", "waypoint", "rcbot2", "hl2dm", "source-engine", "navigation"]
+keywords = ["bsp", "waypoint", "rcbot3", "rcw", "hl2dm", "source-engine", "navigation", "navmesh"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",
@@ -50,8 +50,8 @@ all = [
 hl2dm-waypoint-gen = "bsp_waypointer.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/ethanbissbort/bsp-waypointer"
-Repository = "https://github.com/ethanbissbort/bsp-waypointer"
+Homepage = "https://github.com/FluxLabSystems/bsp-waypointer"
+Repository = "https://github.com/FluxLabSystems/bsp-waypointer"
 
 [tool.setuptools.packages.find]
 where = ["src"]

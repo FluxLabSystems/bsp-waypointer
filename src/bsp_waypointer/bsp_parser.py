@@ -172,6 +172,27 @@ class DispVert:
 
 
 @dataclass
+class StaticProp:
+    """Static prop from the sprp game lump.
+
+    Compiled BSPs carry no collision hull for props, so downstream
+    consumers estimate bounds from the model name.
+    """
+    origin: Vector3
+    angles: Vector3  # pitch, yaw, roll
+    model_name: str
+    solid: int  # 0 = not solid, 2 = SOLID_BBOX, 6 = SOLID_VPHYSICS
+    flags: int
+    first_leaf: int
+    leaf_count: int
+
+    @property
+    def is_solid(self) -> bool:
+        """Whether this prop blocks player movement."""
+        return self.solid != 0
+
+
+@dataclass
 class Entity:
     """Parsed BSP entity with key-value properties."""
     classname: str
@@ -235,6 +256,10 @@ class BSPFile:
     disp_infos: List[DispInfo] = field(default_factory=list)
     disp_verts: List[DispVert] = field(default_factory=list)
     entities: List[Entity] = field(default_factory=list)
+    static_props: List[StaticProp] = field(default_factory=list)
+    static_prop_lump_version: int = 0
+    # Raw LUMP_PAKFILE bytes (a ZIP archive of map-embedded content)
+    pakfile_data: bytes = b""
     # BSP tree structures for ray tracing
     nodes: List[BSPNode] = field(default_factory=list)
     leafs: List[BSPLeaf] = field(default_factory=list)
@@ -336,6 +361,8 @@ class BSPParser:
         self._read_dispinfo()
         self._read_dispverts()
         self._read_entities()
+        self._read_game_lump()
+        self._bsp.pakfile_data = self._read_lump_data(BSPLump.PAKFILE)
         # BSP tree structures for ray tracing
         self._read_nodes()
         self._read_leafs()
@@ -411,7 +438,7 @@ class BSPParser:
                 num_prims,
                 first_prim_id,
                 smoothing_groups,
-            ) = struct.unpack_from("<HBBihhhhBBBBifiiiiHHI", data, offset)
+            ) = struct.unpack_from("<HBBihhhhBBBBifiiiiiHHI", data, offset)
 
             self._bsp.faces.append(
                 Face(
@@ -568,7 +595,7 @@ class BSPParser:
                 map_face,
                 lm_alpha_start,
                 lm_sample_start,
-            ) = struct.unpack_from("<fffiiiiifihii", data, offset)
+            ) = struct.unpack_from("<fffiiiifiHxxii", data, offset)
 
             self._bsp.disp_infos.append(
                 DispInfo(
@@ -631,7 +658,7 @@ class BSPParser:
                 first_face,
                 num_faces,
                 area,
-            ) = struct.unpack_from("<Iii6h2HH", data, offset)
+            ) = struct.unpack_from("<Iii6h2Hh", data, offset)
 
             self._bsp.nodes.append(
                 BSPNode(
@@ -677,7 +704,7 @@ class BSPParser:
                     first_leaf_brush,
                     num_leaf_brushes,
                     leaf_water_data_id,
-                ) = struct.unpack_from("<iHH6hHHHHh", data, offset)
+                ) = struct.unpack_from("<ihH6hHHHHh", data, offset)
             else:
                 # v19 format with ambient lighting data
                 (
@@ -695,7 +722,7 @@ class BSPParser:
                     first_leaf_brush,
                     num_leaf_brushes,
                     leaf_water_data_id,
-                ) = struct.unpack_from("<iHH6hHHHHh", data, offset)
+                ) = struct.unpack_from("<ihH6hHHHHh", data, offset)
                 # Skip ambient lighting data (24 bytes)
 
             self._bsp.leafs.append(
@@ -734,6 +761,149 @@ class BSPParser:
         for i in range(count):
             (brush_index,) = struct.unpack_from("<H", data, i * 2)
             self._bsp.leaf_brushes.append(brush_index)
+
+    def _read_game_lump(self) -> None:
+        """
+        Read the game lump directory and parse the static prop sub-lump.
+
+        Static props are an enrichment: any malformed or truncated game
+        lump (offsets past EOF, short reads, garbage counts) degrades to
+        "no static props" instead of failing the whole BSP load.
+        """
+        try:
+            self._read_game_lump_unchecked()
+        except (struct.error, ValueError, OSError):
+            self._bsp.static_props = []
+
+    def _read_game_lump_unchecked(self) -> None:
+        info = self._bsp.lumps.get(BSPLump.GAME_LUMP)
+        if not info or info.length < 4:
+            return
+
+        self._file.seek(info.offset)
+        header = self._file.read(info.length)
+        if len(header) < 4:
+            # Directory entry points past EOF (truncated/nonstandard BSP)
+            return
+        (lump_count,) = struct.unpack_from("<i", header, 0)
+        if lump_count <= 0 or lump_count > 64:
+            return
+
+        # Directory entries are 16 bytes: id, flags, version, fileofs, filelen
+        GAMELUMP_ENTRY_SIZE = 16
+        SPRP_ID = int.from_bytes(b"sprp", "big")
+        GAMELUMP_COMPRESSED = 0x1
+
+        for i in range(lump_count):
+            offset = 4 + i * GAMELUMP_ENTRY_SIZE
+            if offset + GAMELUMP_ENTRY_SIZE > len(header):
+                break
+            lump_id, flags, version, fileofs, filelen = struct.unpack_from(
+                "<iHHii", header, offset
+            )
+            if lump_id != SPRP_ID or filelen <= 0 or fileofs < 0:
+                continue
+            if flags & GAMELUMP_COMPRESSED:
+                # LZMA-compressed game lumps (console builds) are not supported
+                continue
+
+            self._file.seek(fileofs)
+            data = self._file.read(filelen)
+            if len(data) < 12:
+                # Short read: sub-lump extends past EOF
+                continue
+            self._bsp.static_prop_lump_version = version
+            self._parse_static_props(data, version)
+            break
+
+    def _parse_static_props(self, data: bytes, version: int) -> None:
+        """
+        Parse the sprp static prop lump.
+
+        Layout: model-name dictionary, prop leaf list, then prop entries.
+        Entry size varies by version (v4=56 .. v11=80), but the leading
+        32 bytes (origin, angles, prop_type, first_leaf, leaf_count,
+        solid, flags) are stable across v4-v11, so the entry size is
+        derived from the remaining byte count and only the stable prefix
+        is decoded.
+        """
+        PROP_NAME_SIZE = 128
+        STABLE_PREFIX_SIZE = 32
+        pos = 0
+
+        def read_int() -> Optional[int]:
+            nonlocal pos
+            if pos + 4 > len(data):
+                return None
+            (value,) = struct.unpack_from("<i", data, pos)
+            pos += 4
+            return value
+
+        # Model name dictionary
+        dict_count = read_int()
+        if dict_count is None or dict_count < 0 or dict_count > 65536:
+            return
+        if pos + dict_count * PROP_NAME_SIZE > len(data):
+            return
+        model_names: List[str] = []
+        for _ in range(dict_count):
+            raw = data[pos:pos + PROP_NAME_SIZE]
+            pos += PROP_NAME_SIZE
+            end = raw.find(b"\x00")
+            if end == -1:
+                end = len(raw)
+            model_names.append(raw[:end].decode("ascii", errors="replace"))
+
+        # Prop leaf list (uint16 leaf indices)
+        leaf_count = read_int()
+        if leaf_count is None or leaf_count < 0:
+            return
+        if pos + leaf_count * 2 > len(data):
+            return
+        pos += leaf_count * 2
+
+        # Prop entries
+        prop_count = read_int()
+        if prop_count is None or prop_count <= 0:
+            return
+        remaining = len(data) - pos
+        entry_size = remaining // prop_count
+        if entry_size < STABLE_PREFIX_SIZE:
+            return
+
+        for i in range(prop_count):
+            offset = pos + i * entry_size
+            if offset + STABLE_PREFIX_SIZE > len(data):
+                break
+            (
+                org_x,
+                org_y,
+                org_z,
+                ang_x,
+                ang_y,
+                ang_z,
+                prop_type,
+                first_leaf,
+                prop_leaf_count,
+                solid,
+                prop_flags,
+            ) = struct.unpack_from("<ffffffHHHBB", data, offset)
+
+            model_name = (
+                model_names[prop_type] if 0 <= prop_type < len(model_names) else ""
+            )
+
+            self._bsp.static_props.append(
+                StaticProp(
+                    origin=Vector3(org_x, org_y, org_z),
+                    angles=Vector3(ang_x, ang_y, ang_z),
+                    model_name=model_name,
+                    solid=solid,
+                    flags=prop_flags,
+                    first_leaf=first_leaf,
+                    leaf_count=prop_leaf_count,
+                )
+            )
 
     def _parse_entities(self, text: str) -> List[Entity]:
         """
@@ -778,14 +948,29 @@ class BSPParser:
             List of vertices in winding order
         """
         vertices = []
+        num_surfedges = len(self._bsp.surfedges)
+        num_edges = len(self._bsp.edges)
+        num_vertices = len(self._bsp.vertices)
+
         for i in range(face.num_edges):
-            surfedge = self._bsp.surfedges[face.first_edge + i]
-            if surfedge >= 0:
-                edge = self._bsp.edges[surfedge]
-                vertices.append(self._bsp.vertices[edge.v1])
-            else:
-                edge = self._bsp.edges[-surfedge]
-                vertices.append(self._bsp.vertices[edge.v2])
+            surfedge_idx = face.first_edge + i
+            # Bounds check for surfedge
+            if surfedge_idx < 0 or surfedge_idx >= num_surfedges:
+                continue
+            surfedge = self._bsp.surfedges[surfedge_idx]
+
+            # Get edge index and check bounds
+            edge_idx = abs(surfedge)
+            if edge_idx >= num_edges:
+                continue
+
+            edge = self._bsp.edges[edge_idx]
+            # Get vertex based on surfedge direction
+            vert_idx = edge.v1 if surfedge >= 0 else edge.v2
+            if vert_idx >= num_vertices:
+                continue
+
+            vertices.append(self._bsp.vertices[vert_idx])
         return vertices
 
     def get_texture_name(self, face: Face) -> str:

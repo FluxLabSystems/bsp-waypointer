@@ -246,10 +246,21 @@ class TestRecastHelpers:
         assert abs(normal.z) > 0.99
 
     def test_calculate_polygon_area(self):
-        """Test polygon area calculation."""
+        """Test polygon area calculation.
+
+        REGRESSION: the polygon at the origin is the ONE place where the
+        old magnitude-summing implementation happens to be correct, so the
+        origin case alone proves nothing. The shoelace formula requires
+        summing the cross-product VECTORS and taking one magnitude at the
+        end; summing the magnitudes term-by-term produces an error that
+        scales with distance from the world origin (measured: 126x at
+        map-scale coordinates). Every assertion below the first one is
+        there to make that failure mode loud.
+        """
         generator = RecastNavmeshGenerator()
 
-        # Unit triangle
+        # Unit triangle at the origin -- the degenerate case that used to
+        # be the only coverage.
         vertices = [
             Vector3(0, 0, 0),
             Vector3(1, 0, 0),
@@ -260,6 +271,52 @@ class TestRecastHelpers:
 
         # Area of right triangle = 0.5 * base * height
         assert abs(area - 0.5) < 0.1
+
+        # --- OFF-ORIGIN: the assertions that actually pin the bug ---
+
+        # Same unit square, translated. Area is translation-invariant.
+        square_at_origin = [
+            Vector3(0, 0, 0),
+            Vector3(1, 0, 0),
+            Vector3(1, 1, 0),
+            Vector3(0, 1, 0),
+        ]
+        assert generator._calculate_polygon_area(square_at_origin) == pytest.approx(
+            1.0, abs=1e-6
+        )
+
+        square_offset = [Vector3(v.x + 100.0, v.y + 100.0, v.z)
+                         for v in square_at_origin]
+        assert generator._calculate_polygon_area(square_offset) == pytest.approx(
+            1.0, abs=1e-3
+        ), (
+            "polygon area must be translation-invariant; a magnitude-sum "
+            "shoelace reports ~201 for this square"
+        )
+
+        # Map-scale right triangle, legs of 64 units, sitting at (2000, 2000).
+        # True area = 0.5 * 64 * 64 = 2048. The magnitude-sum bug reports
+        # 258048 here -- 126x too large.
+        map_scale_tri = [
+            Vector3(2000.0, 2000.0, 0.0),
+            Vector3(2064.0, 2000.0, 0.0),
+            Vector3(2000.0, 2064.0, 0.0),
+        ]
+        assert generator._calculate_polygon_area(map_scale_tri) == pytest.approx(
+            2048.0, rel=1e-4
+        ), (
+            "signed-shoelace area at map-scale coordinates is wrong; this "
+            "is the 126x error that made polygon areas meaningless away "
+            "from the world origin"
+        )
+
+        # And the invariance property stated directly: translating a
+        # polygon must not change its area.
+        far = [Vector3(v.x - 4096.0, v.y + 3072.0, v.z + 512.0)
+               for v in map_scale_tri]
+        assert generator._calculate_polygon_area(far) == pytest.approx(
+            generator._calculate_polygon_area(map_scale_tri), rel=1e-4
+        )
 
 
 class TestPolygonMerging:

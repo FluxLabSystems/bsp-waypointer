@@ -246,6 +246,47 @@ def point_in_triangle_2d(
     return not (has_neg and has_pos)
 
 
+def segment_intersects_aabb(
+    p0: Vector3,
+    p1: Vector3,
+    mins: Vector3,
+    maxs: Vector3,
+    expand: float = 0.0,
+) -> bool:
+    """
+    Check whether the segment p0->p1 intersects an axis-aligned box.
+
+    Uses the slab method. `expand` grows the box uniformly on all axes
+    (e.g. by player radius) before testing.
+    """
+    lo = (mins.x - expand, mins.y - expand, mins.z - expand)
+    hi = (maxs.x + expand, maxs.y + expand, maxs.z + expand)
+    start = (p0.x, p0.y, p0.z)
+    delta = (p1.x - p0.x, p1.y - p0.y, p1.z - p0.z)
+
+    t_enter = 0.0
+    t_exit = 1.0
+
+    for axis in range(3):
+        d = delta[axis]
+        s = start[axis]
+        if abs(d) < 1e-9:
+            # Parallel to this slab: reject if outside it
+            if s < lo[axis] or s > hi[axis]:
+                return False
+            continue
+        t1 = (lo[axis] - s) / d
+        t2 = (hi[axis] - s) / d
+        if t1 > t2:
+            t1, t2 = t2, t1
+        t_enter = max(t_enter, t1)
+        t_exit = min(t_exit, t2)
+        if t_enter > t_exit:
+            return False
+
+    return True
+
+
 def line_segment_intersection_2d(
     p1: Vector3, p2: Vector3, p3: Vector3, p4: Vector3
 ) -> Optional[Vector3]:

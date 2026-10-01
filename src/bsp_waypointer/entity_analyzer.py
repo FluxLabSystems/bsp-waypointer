@@ -7,6 +7,7 @@ armor, chargers, ammo, teleporters, and interactables.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -18,13 +19,22 @@ from .constants import (
     BREAKABLE_ENTITIES,
     BUTTON_ENTITIES,
     CHARGER_ENTITIES,
+    DEFAULT_STATIC_PROP_HALF_EXTENTS,
     DOOR_ENTITIES,
+    DYNAMIC_PROP_ENTITIES,
     HEALTH_ITEMS,
     HL2DMWaypointSubType,
+    HURT_ENTITIES,
+    LADDER_DISMOUNT_ENTITIES,
     LADDER_ENTITIES,
+    LIFT_ENTITIES,
+    PHYSICS_PROP_ENTITIES,
+    PUSH_ENTITIES,
     SPAWN_ENTITIES,
+    STATIC_PROP_SIZE_HINTS,
     TELEPORT_DESTINATION,
     TELEPORT_ENTRANCE,
+    USEABLE_LADDER_ENTITIES,
     WEAPON_DEFINITIONS,
     WaypointFlag,
 )
@@ -149,6 +159,68 @@ class Door:
 
 
 @dataclass
+class PropObstacle:
+    """Solid prop treated as a navigation obstacle."""
+    origin: Vector3
+    mins: Vector3
+    maxs: Vector3
+    model_name: str
+    classname: str
+    movable: bool
+    # True when bounds come from the model's actual .mdl/.phy geometry
+    # rather than name-based size hints
+    exact: bool = False
+
+
+@dataclass
+class PushVolume:
+    """trigger_push volume that shoves players."""
+    origin: Vector3
+    mins: Vector3
+    maxs: Vector3
+    direction: Vector3  # Unit push direction
+    speed: float
+
+
+@dataclass
+class HurtVolume:
+    """trigger_hurt volume that damages players."""
+    origin: Vector3
+    mins: Vector3
+    maxs: Vector3
+    damage: float
+    # True when the trigger spawns disabled (event-driven hazards like
+    # dm_runoff's button-timer kill zones) — such volumes must not
+    # influence waypoint placement or connections
+    start_disabled: bool = False
+
+
+@dataclass
+class UseableLadder:
+    """HL2-style point-based useable ladder."""
+    bottom: Vector3
+    top: Vector3
+    normal: Vector3  # Direction player faces when climbing
+
+
+@dataclass
+class LadderDismount:
+    """Ladder dismount point."""
+    origin: Vector3
+
+
+@dataclass
+class Lift:
+    """Vertical mover (elevator/platform)."""
+    origin: Vector3
+    mins: Vector3
+    maxs: Vector3
+    classname: str
+    bottom_z: float  # Standing surface height at rest
+    top_z: float  # Standing surface height when raised
+
+
+@dataclass
 class HL2DMEntityData:
     """Container for all parsed HL2DM entities."""
     spawn_points: List[SpawnPoint] = field(default_factory=list)
@@ -163,6 +235,12 @@ class HL2DMEntityData:
     breakables: List[Breakable] = field(default_factory=list)
     buttons: List[Button] = field(default_factory=list)
     doors: List[Door] = field(default_factory=list)
+    prop_obstacles: List[PropObstacle] = field(default_factory=list)
+    push_volumes: List[PushVolume] = field(default_factory=list)
+    hurt_volumes: List[HurtVolume] = field(default_factory=list)
+    useable_ladders: List[UseableLadder] = field(default_factory=list)
+    ladder_dismounts: List[LadderDismount] = field(default_factory=list)
+    lifts: List[Lift] = field(default_factory=list)
 
     @property
     def total_entities(self) -> int:
@@ -180,6 +258,12 @@ class HL2DMEntityData:
             + len(self.breakables)
             + len(self.buttons)
             + len(self.doors)
+            + len(self.prop_obstacles)
+            + len(self.push_volumes)
+            + len(self.hurt_volumes)
+            + len(self.useable_ladders)
+            + len(self.ladder_dismounts)
+            + len(self.lifts)
         )
 
 
@@ -210,6 +294,14 @@ class HL2DMEntityAnalyzer:
         self._data = HL2DMEntityData()
         self._teleport_targets = {}
 
+        # Exact prop geometry from game content (mdl/phy via
+        # pakfile/loose/VPK); name-hint estimation remains the fallback
+        try:
+            from .model_resolver import ModelResolver
+            self._model_resolver = ModelResolver(bsp=bsp)
+        except Exception:
+            self._model_resolver = None
+
         # First pass: collect teleport destinations
         self._collect_teleport_destinations()
 
@@ -226,8 +318,50 @@ class HL2DMEntityAnalyzer:
         self._parse_breakables()
         self._parse_buttons()
         self._parse_doors()
+        self._parse_static_props()
+        self._parse_prop_entities()
+        self._parse_push_volumes()
+        self._parse_hurt_volumes()
+        self._parse_useable_ladders()
+        self._parse_lifts()
 
         return self._data
+
+    def _resolve_brush_bounds(
+        self,
+        entity: Entity,
+        default_mins: Vector3,
+        default_maxs: Vector3,
+    ) -> Tuple[Vector3, Vector3, Vector3]:
+        """
+        Resolve origin and world-space bounds for a brush entity.
+
+        Compiled brush entities reference their geometry via a
+        "model" "*N" keyvalue pointing at bsp.models[N] rather than
+        carrying origin/mins/maxs keyvalues. Falls back to the entity
+        origin plus default bounds for point entities.
+
+        Returns:
+            Tuple of (origin, world mins, world maxs)
+        """
+        entity_origin = entity.get_vector("origin")
+
+        model_ref = entity.get("model", "")
+        if model_ref.startswith("*") and self._bsp is not None:
+            try:
+                model_index = int(model_ref[1:])
+            except ValueError:
+                model_index = -1
+            if 0 <= model_index < len(self._bsp.models):
+                model = self._bsp.models[model_index]
+                offset = entity_origin or Vector3.zero()
+                mins = model.mins + offset
+                maxs = model.maxs + offset
+                origin = (mins + maxs) / 2
+                return origin, mins, maxs
+
+        origin = entity_origin or Vector3.zero()
+        return origin, default_mins + origin, default_maxs + origin
 
     def _collect_teleport_destinations(self) -> None:
         """Collect all teleport destination entities."""
@@ -320,9 +454,9 @@ class HL2DMEntityAnalyzer:
         """Parse health and armor charger stations."""
         for entity in self._bsp.entities:
             if entity.classname in CHARGER_ENTITIES:
-                origin = entity.get_vector("origin") or Vector3.zero()
-                mins = entity.get_vector("mins") or Vector3(-16, -16, 0)
-                maxs = entity.get_vector("maxs") or Vector3(16, 16, 72)
+                origin, mins, maxs = self._resolve_brush_bounds(
+                    entity, Vector3(-16, -16, 0), Vector3(16, 16, 72)
+                )
 
                 charger_info = CHARGER_ENTITIES[entity.classname]
 
@@ -333,8 +467,8 @@ class HL2DMEntityAnalyzer:
                 self._data.chargers.append(
                     Charger(
                         origin=origin,
-                        mins=mins + origin,
-                        maxs=maxs + origin,
+                        mins=mins,
+                        maxs=maxs,
                         classname=entity.classname,
                         is_health=charger_info.is_health,
                         facing=facing,
@@ -384,9 +518,9 @@ class HL2DMEntityAnalyzer:
         """Parse teleporter entities."""
         for entity in self._bsp.entities:
             if entity.classname == TELEPORT_ENTRANCE:
-                origin = entity.get_vector("origin") or Vector3.zero()
-                mins = entity.get_vector("mins") or Vector3(-32, -32, 0)
-                maxs = entity.get_vector("maxs") or Vector3(32, 32, 72)
+                origin, mins, maxs = self._resolve_brush_bounds(
+                    entity, Vector3(-32, -32, 0), Vector3(32, 32, 72)
+                )
                 target = entity.get("target", "")
 
                 # Look up destination
@@ -397,8 +531,8 @@ class HL2DMEntityAnalyzer:
                 self._data.teleporters.append(
                     Teleporter(
                         entrance_origin=origin,
-                        entrance_mins=mins + origin,
-                        entrance_maxs=maxs + origin,
+                        entrance_mins=mins,
+                        entrance_maxs=maxs,
                         exit_origin=exit_origin,
                         target_name=target,
                     )
@@ -408,9 +542,9 @@ class HL2DMEntityAnalyzer:
         """Parse ladder entities."""
         for entity in self._bsp.entities:
             if entity.classname in LADDER_ENTITIES:
-                origin = entity.get_vector("origin") or Vector3.zero()
-                mins = entity.get_vector("mins") or Vector3(-16, -16, 0)
-                maxs = entity.get_vector("maxs") or Vector3(16, 16, 128)
+                origin, mins, maxs = self._resolve_brush_bounds(
+                    entity, Vector3(-16, -16, 0), Vector3(16, 16, 128)
+                )
 
                 # Calculate normal from angles
                 angles = entity.get_vector("angles") or Vector3.zero()
@@ -419,8 +553,8 @@ class HL2DMEntityAnalyzer:
                 self._data.ladders.append(
                     Ladder(
                         origin=origin,
-                        mins=mins + origin,
-                        maxs=maxs + origin,
+                        mins=mins,
+                        maxs=maxs,
                         normal=normal,
                     )
                 )
@@ -429,16 +563,16 @@ class HL2DMEntityAnalyzer:
         """Parse breakable entities."""
         for entity in self._bsp.entities:
             if entity.classname in BREAKABLE_ENTITIES:
-                origin = entity.get_vector("origin") or Vector3.zero()
-                mins = entity.get_vector("mins") or Vector3(-32, -32, 0)
-                maxs = entity.get_vector("maxs") or Vector3(32, 32, 72)
+                origin, mins, maxs = self._resolve_brush_bounds(
+                    entity, Vector3(-32, -32, 0), Vector3(32, 32, 72)
+                )
                 health = entity.get_int("health", 100)
 
                 self._data.breakables.append(
                     Breakable(
                         origin=origin,
-                        mins=mins + origin,
-                        maxs=maxs + origin,
+                        mins=mins,
+                        maxs=maxs,
                         classname=entity.classname,
                         health=health,
                     )
@@ -448,16 +582,16 @@ class HL2DMEntityAnalyzer:
         """Parse button entities."""
         for entity in self._bsp.entities:
             if entity.classname in BUTTON_ENTITIES:
-                origin = entity.get_vector("origin") or Vector3.zero()
-                mins = entity.get_vector("mins") or Vector3(-8, -8, 0)
-                maxs = entity.get_vector("maxs") or Vector3(8, 8, 16)
+                origin, mins, maxs = self._resolve_brush_bounds(
+                    entity, Vector3(-8, -8, 0), Vector3(8, 8, 16)
+                )
                 target = entity.get("target", "")
 
                 self._data.buttons.append(
                     Button(
                         origin=origin,
-                        mins=mins + origin,
-                        maxs=maxs + origin,
+                        mins=mins,
+                        maxs=maxs,
                         target=target,
                     )
                 )
@@ -466,9 +600,9 @@ class HL2DMEntityAnalyzer:
         """Parse door entities."""
         for entity in self._bsp.entities:
             if entity.classname in DOOR_ENTITIES:
-                origin = entity.get_vector("origin") or Vector3.zero()
-                mins = entity.get_vector("mins") or Vector3(-32, -4, 0)
-                maxs = entity.get_vector("maxs") or Vector3(32, 4, 108)
+                origin, mins, maxs = self._resolve_brush_bounds(
+                    entity, Vector3(-32, -4, 0), Vector3(32, 4, 108)
+                )
 
                 # Check spawnflags for USE requirement
                 spawnflags = entity.get_int("spawnflags", 0)
@@ -477,10 +611,276 @@ class HL2DMEntityAnalyzer:
                 self._data.doors.append(
                     Door(
                         origin=origin,
-                        mins=mins + origin,
-                        maxs=maxs + origin,
+                        mins=mins,
+                        maxs=maxs,
                         classname=entity.classname,
                         requires_use=requires_use,
+                    )
+                )
+
+    def _exact_prop_bounds(
+        self, model_name: str, origin: Vector3, angles: Vector3
+    ) -> Optional[Tuple[Vector3, Vector3]]:
+        """
+        World-space AABB from resolved model geometry, or None.
+
+        Applies the full pitch/yaw/roll rotation to the model-local
+        bounds, unlike the hint fallback which only handles yaw.
+        """
+        if self._model_resolver is None:
+            return None
+        try:
+            geo = self._model_resolver.resolve(model_name)
+        except Exception:
+            return None
+        if geo is None:
+            return None
+
+        from .model_resolver import transform_bounds
+        return transform_bounds(geo.mins, geo.maxs, angles, origin)
+
+    def _estimate_prop_half_extents(
+        self, model_name: str
+    ) -> Tuple[float, float, float]:
+        """
+        Estimate (half_x, half_y, height) for a prop model.
+
+        Scans STATIC_PROP_SIZE_HINTS in order for the first substring
+        contained in the lowercased model name; falls back to
+        DEFAULT_STATIC_PROP_HALF_EXTENTS for unrecognized models.
+        """
+        name = model_name.lower()
+        for pattern, extents in STATIC_PROP_SIZE_HINTS:
+            if pattern in name:
+                return extents
+        return DEFAULT_STATIC_PROP_HALF_EXTENTS
+
+    def _prop_world_bounds(
+        self,
+        origin: Vector3,
+        half_extents: Tuple[float, float, float],
+        yaw_degrees: float,
+    ) -> Tuple[Vector3, Vector3]:
+        """
+        Compute the world-space AABB of a yaw-rotated prop box.
+
+        Returns:
+            Tuple of (world mins, world maxs)
+        """
+        half_x, half_y, height = half_extents
+        yaw = math.radians(yaw_degrees)
+        cos_yaw = abs(math.cos(yaw))
+        sin_yaw = abs(math.sin(yaw))
+        world_hx = half_x * cos_yaw + half_y * sin_yaw
+        world_hy = half_x * sin_yaw + half_y * cos_yaw
+        mins = origin + Vector3(-world_hx, -world_hy, 0)
+        maxs = origin + Vector3(world_hx, world_hy, height)
+        return mins, maxs
+
+    def _parse_static_props(self) -> None:
+        """Parse solid static props from the sprp game lump."""
+        for prop in getattr(self._bsp, "static_props", []):
+            if not prop.is_solid:
+                continue
+
+            exact_bounds = self._exact_prop_bounds(
+                prop.model_name, prop.origin, prop.angles
+            )
+            if exact_bounds is not None:
+                mins, maxs = exact_bounds
+            else:
+                half_extents = self._estimate_prop_half_extents(prop.model_name)
+                mins, maxs = self._prop_world_bounds(
+                    prop.origin, half_extents, prop.angles.y
+                )
+
+            self._data.prop_obstacles.append(
+                PropObstacle(
+                    origin=prop.origin,
+                    mins=mins,
+                    maxs=maxs,
+                    model_name=prop.model_name,
+                    classname="prop_static",
+                    movable=False,
+                    exact=exact_bounds is not None,
+                )
+            )
+
+    def _parse_prop_entities(self) -> None:
+        """Parse physics and dynamic prop point entities."""
+        for entity in self._bsp.entities:
+            if entity.classname in PHYSICS_PROP_ENTITIES:
+                movable = True
+            elif entity.classname in DYNAMIC_PROP_ENTITIES:
+                # Skip explicitly non-solid dynamic props
+                if entity.get_int("solid", 6) == 0:
+                    continue
+                movable = False
+            else:
+                continue
+
+            origin = entity.get_vector("origin")
+            if not origin:
+                continue
+
+            model_name = entity.get("model", "").lower()
+            angles = entity.get_vector("angles") or Vector3.zero()
+
+            exact_bounds = self._exact_prop_bounds(model_name, origin, angles)
+            if exact_bounds is not None:
+                mins, maxs = exact_bounds
+            else:
+                half_extents = self._estimate_prop_half_extents(model_name)
+                mins, maxs = self._prop_world_bounds(origin, half_extents, angles.y)
+
+            self._data.prop_obstacles.append(
+                PropObstacle(
+                    origin=origin,
+                    mins=mins,
+                    maxs=maxs,
+                    model_name=model_name,
+                    classname=entity.classname,
+                    movable=movable,
+                    exact=exact_bounds is not None,
+                )
+            )
+
+    def _parse_push_volumes(self) -> None:
+        """Parse trigger_push volumes."""
+        for entity in self._bsp.entities:
+            if entity.classname in PUSH_ENTITIES:
+                origin, mins, maxs = self._resolve_brush_bounds(
+                    entity, Vector3(-16, -16, 0), Vector3(16, 16, 72)
+                )
+
+                pushdir = entity.get_vector("pushdir")
+                if pushdir is not None:
+                    direction = self._angles_to_forward(pushdir)
+                else:
+                    direction = Vector3(0, 0, 1)
+
+                speed = entity.get_float("speed", 100.0)
+
+                self._data.push_volumes.append(
+                    PushVolume(
+                        origin=origin,
+                        mins=mins,
+                        maxs=maxs,
+                        direction=direction,
+                        speed=speed,
+                    )
+                )
+
+    def _parse_hurt_volumes(self) -> None:
+        """Parse trigger_hurt volumes."""
+        for entity in self._bsp.entities:
+            if entity.classname in HURT_ENTITIES:
+                origin, mins, maxs = self._resolve_brush_bounds(
+                    entity, Vector3(-16, -16, 0), Vector3(16, 16, 72)
+                )
+
+                damage = entity.get_float("damage", 10.0)
+                if damage <= 0:
+                    continue  # Negative damage heals
+
+                self._data.hurt_volumes.append(
+                    HurtVolume(
+                        origin=origin,
+                        mins=mins,
+                        maxs=maxs,
+                        damage=damage,
+                        start_disabled=entity.get_int("startdisabled", 0) == 1,
+                    )
+                )
+
+    def _parse_useable_ladders(self) -> None:
+        """Parse HL2-style useable ladders and dismount points."""
+        for entity in self._bsp.entities:
+            if entity.classname in USEABLE_LADDER_ENTITIES:
+                point0 = entity.get_vector("point0")
+                point1 = entity.get_vector("point1")
+                if point0 is None or point1 is None:
+                    continue
+
+                if point0.z <= point1.z:
+                    bottom, top = point0, point1
+                else:
+                    bottom, top = point1, point0
+
+                angles = entity.get_vector("angles") or Vector3.zero()
+                normal = self._angles_to_forward(angles)
+
+                self._data.useable_ladders.append(
+                    UseableLadder(bottom=bottom, top=top, normal=normal)
+                )
+            elif entity.classname in LADDER_DISMOUNT_ENTITIES:
+                origin = entity.get_vector("origin")
+                if origin:
+                    self._data.ladder_dismounts.append(
+                        LadderDismount(origin=origin)
+                    )
+
+    def _parse_lifts(self) -> None:
+        """Parse vertical movers (platforms, movelinears, vertical doors)."""
+        for entity in self._bsp.entities:
+            if entity.classname in LIFT_ENTITIES:
+                origin, mins, maxs = self._resolve_brush_bounds(
+                    entity, Vector3(-32, -32, 0), Vector3(32, 32, 16)
+                )
+
+                if entity.classname == "func_movelinear":
+                    movedir = entity.get_vector("movedir") or Vector3.zero()
+                    direction = self._angles_to_forward(movedir)
+                    distance = entity.get_float("movedistance", 0.0)
+                    if direction.z <= 0.7 or distance <= 0:
+                        continue  # Not a vertical mover
+                    top_z = maxs.z + direction.z * distance
+                else:  # func_plat / func_platrot
+                    height = entity.get_float("height", 0.0)
+                    if height <= 0:
+                        height = maxs.z - mins.z
+                    top_z = maxs.z + height
+
+                self._data.lifts.append(
+                    Lift(
+                        origin=origin,
+                        mins=mins,
+                        maxs=maxs,
+                        classname=entity.classname,
+                        bottom_z=maxs.z,
+                        top_z=top_z,
+                    )
+                )
+            elif entity.classname in DOOR_ENTITIES:
+                # Vertically-moving doors with a large platform area act
+                # as lifts. (They stay in .doors too; the converter
+                # dedupes by proximity.)
+                movedir = entity.get_vector("movedir")
+                if movedir is None:
+                    continue
+                direction = self._angles_to_forward(movedir)
+                if abs(direction.z) <= 0.7:
+                    continue
+
+                origin, mins, maxs = self._resolve_brush_bounds(
+                    entity, Vector3(-32, -32, 0), Vector3(32, 32, 16)
+                )
+                size = maxs - mins
+                if size.x * size.y < 64 * 64:
+                    continue  # Too small to stand on
+
+                travel = (maxs.z - mins.z) - entity.get_float("lip", 0.0)
+                if travel <= 0:
+                    continue
+
+                self._data.lifts.append(
+                    Lift(
+                        origin=origin,
+                        mins=mins,
+                        maxs=maxs,
+                        classname=entity.classname,
+                        bottom_z=maxs.z,
+                        top_z=maxs.z + travel,
                     )
                 )
 
@@ -547,6 +947,30 @@ class HL2DMEntityAnalyzer:
     def find_doors(self) -> List[Door]:
         """Get all doors."""
         return self._data.doors
+
+    def find_prop_obstacles(self) -> List[PropObstacle]:
+        """Get all prop obstacles."""
+        return self._data.prop_obstacles
+
+    def find_push_volumes(self) -> List[PushVolume]:
+        """Get all push volumes."""
+        return self._data.push_volumes
+
+    def find_hurt_volumes(self) -> List[HurtVolume]:
+        """Get all hurt volumes."""
+        return self._data.hurt_volumes
+
+    def find_useable_ladders(self) -> List[UseableLadder]:
+        """Get all useable ladders."""
+        return self._data.useable_ladders
+
+    def find_ladder_dismounts(self) -> List[LadderDismount]:
+        """Get all ladder dismount points."""
+        return self._data.ladder_dismounts
+
+    def find_lifts(self) -> List[Lift]:
+        """Get all lifts."""
+        return self._data.lifts
 
 
 def analyze_hl2dm_entities(bsp: BSPFile) -> HL2DMEntityData:

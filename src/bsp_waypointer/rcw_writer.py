@@ -1,7 +1,7 @@
 """
 RCW Writer Module for BSP Waypoint Generator.
 
-Writes waypoints to RCBot2's .rcw waypoint file format.
+Writes waypoints to RCBot3's .rcw waypoint file format.
 """
 
 from __future__ import annotations
@@ -15,35 +15,55 @@ from .constants import HL2DMWaypointSubType, WaypointFlag
 from .waypoint_converter import Waypoint
 
 
-# RCW file format constants
-RCW_MAGIC = b"RCW\x00"  # File signature
-RCW_VERSION = 4  # RCBot2 waypoint version
+# RCW file format constants (RCBot3)
+RCW_MAGIC = b"RCBot3\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"  # 16 bytes, null-padded
+RCW_VERSION = 5  # RCBot3 waypoint version
 MAX_WAYPOINT_CONNECTIONS = 8  # Maximum connections per waypoint in file format
+HEADER_SIZE = 92  # Total header size in bytes
+MAP_NAME_SIZE = 64  # Map name field size
+AUTHOR_SIZE = 32  # Author/ModifiedBy field size
 
 
 @dataclass
 class RCWHeader:
-    """RCW file header structure."""
-    magic: bytes = RCW_MAGIC
-    version: int = RCW_VERSION
-    num_waypoints: int = 0
-    map_name: str = ""
-    author: str = ""
+    """RCW file header structure (92 bytes)."""
+    magic: bytes = RCW_MAGIC  # 16 bytes
+    map_name: str = ""  # 64 bytes, null-padded
+    version: int = RCW_VERSION  # 4 bytes (int32 LE)
+    num_waypoints: int = 0  # 4 bytes (int32 LE)
+    flags: int = 0  # 4 bytes (int32 LE)
+
+
+@dataclass
+class RCWAuthorInfo:
+    """RCW author info structure (64 bytes)."""
+    author: str = "BSP-Waypointer"  # 32 bytes, null-padded
+    modified_by: str = ""  # 32 bytes, null-padded
 
 
 class RCWWriter:
     """
-    Writes waypoints to RCBot2 .rcw format.
+    Writes waypoints to RCBot3 .rcw format.
 
     File format:
-    - Header: magic (4 bytes) + version (4 bytes) + count (4 bytes)
-    - For each waypoint:
-      - Position: x, y, z (3 floats, 12 bytes)
-      - Flags: (4 bytes int)
-      - Radius: (4 bytes float)
-      - Area: (4 bytes int) - for team/area restrictions
-      - Number of connections: (4 bytes int)
-      - Connections: up to 8 (variable, 4 bytes each)
+    - Header (92 bytes):
+      - szFileType: "RCBot3" + padding (16 bytes)
+      - szMapName: map name + padding (64 bytes)
+      - iVersion: 5 (4 bytes int32 LE)
+      - iNumWaypoints: count (4 bytes int32 LE)
+      - iFlags: flags (4 bytes int32 LE)
+    - Author Info (64 bytes, required for version >= 4):
+      - szAuthor: author name + padding (32 bytes)
+      - szModifiedBy: modifier name + padding (32 bytes)
+    - For each waypoint (variable length):
+      - origin: x, y, z (3 floats, 12 bytes)
+      - iAimYaw: aim direction (4 bytes int32)
+      - iFlags: waypoint flags (4 bytes int32)
+      - bUsed: must be TRUE (1 byte)
+      - path count: number of connections (4 bytes int32)
+      - paths: only valid path indices (variable, 4 bytes each)
+      - iArea: area/team restriction (4 bytes int32)
+      - fRadius: waypoint radius (4 bytes float)
     """
 
     def __init__(self):
@@ -55,6 +75,8 @@ class RCWWriter:
         waypoints: List[Waypoint],
         map_name: str = "",
         author: str = "BSP-Waypoint-Generator-HL2DM",
+        has_visibility: bool = False,
+        validate: bool = True,
     ) -> None:
         """
         Write waypoints to .rcw file.
@@ -64,6 +86,11 @@ class RCWWriter:
             waypoints: List of waypoints to write
             map_name: Map name (optional, for metadata)
             author: Author name (optional, for metadata)
+            has_visibility: Set the header bit indicating an
+                accompanying .rcv visibility file
+            validate: Re-parse and validate the written file against the
+                RCBot3 connectivity contract (raises ValidationError and
+                removes the file on failure)
         """
         filepath = Path(filepath)
 
@@ -71,53 +98,113 @@ class RCWWriter:
         if filepath.suffix.lower() != ".rcw":
             filepath = filepath.with_suffix(".rcw")
 
-        with open(filepath, "wb") as f:
-            self._file = f
+        # Write to a temp file first: the existing waypoint file must
+        # survive untouched if generation or validation fails
+        import os
+        tmp_path = filepath.with_suffix(".rcw.tmp")
+        try:
+            with open(tmp_path, "wb") as f:
+                self._file = f
 
-            # Write header
-            self._write_header(len(waypoints))
+                # Write header (92 bytes)
+                self._write_header(len(waypoints), map_name, has_visibility)
 
-            # Write each waypoint
-            for wp in waypoints:
-                self._write_waypoint(wp)
+                # Write author info (64 bytes)
+                self._write_author_info(author)
 
-    def _write_header(self, num_waypoints: int) -> None:
-        """Write file header."""
-        # Magic number
+                # Write each waypoint
+                for wp in waypoints:
+                    self._write_waypoint(wp)
+
+            if validate:
+                # Stage D self-validation: a hard error beats a silently
+                # broken file
+                from .rcw_validator import validate as validate_rcw
+                validate_rcw(tmp_path)
+
+            os.replace(tmp_path, filepath)
+        except Exception:
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+            raise
+
+    def _write_header(
+        self, num_waypoints: int, map_name: str = "", has_visibility: bool = False
+    ) -> None:
+        """Write file header (92 bytes)."""
+        # szFileType: "RCBot3" + padding (16 bytes)
         self._file.write(RCW_MAGIC)
 
-        # Version
+        # szMapName: map name + padding (64 bytes)
+        map_name_bytes = map_name.encode("utf-8")[:MAP_NAME_SIZE - 1]
+        map_name_padded = map_name_bytes.ljust(MAP_NAME_SIZE, b"\x00")
+        self._file.write(map_name_padded)
+
+        # iVersion (4 bytes int32 LE)
         self._file.write(struct.pack("<I", RCW_VERSION))
 
-        # Number of waypoints
+        # iNumWaypoints (4 bytes int32 LE)
         self._file.write(struct.pack("<I", num_waypoints))
 
+        # iFlags (4 bytes int32 LE): bit 0 = visibility file accompanies
+        self._file.write(struct.pack("<I", 1 if has_visibility else 0))
+
+    def _write_author_info(self, author: str = "BSP-Waypointer") -> None:
+        """Write author info (64 bytes)."""
+        # szAuthor (32 bytes, null-padded)
+        author_bytes = author.encode("utf-8")[:AUTHOR_SIZE - 1]
+        author_padded = author_bytes.ljust(AUTHOR_SIZE, b"\x00")
+        self._file.write(author_padded)
+
+        # szModifiedBy (32 bytes, null-padded)
+        modified_by_padded = b"\x00" * AUTHOR_SIZE
+        self._file.write(modified_by_padded)
+
     def _write_waypoint(self, wp: Waypoint) -> None:
-        """Write a single waypoint."""
-        # Position (x, y, z)
+        """
+        Write a single waypoint in RCBot3 format.
+
+        RCBot3 waypoint record format (variable length):
+        - origin: 3 floats (12 bytes) - x, y, z position
+        - iAimYaw: int32 (4 bytes) - aim direction
+        - iFlags: int32 (4 bytes) - waypoint flags
+        - bUsed: byte (1 byte) - must be TRUE (1)
+        - path count: int32 (4 bytes) - number of valid connections
+        - paths: int32[] (variable) - only valid path indices
+        - iArea: int32 (4 bytes) - area/team restriction
+        - fRadius: float (4 bytes) - waypoint radius
+        """
+        # Position (origin: x, y, z)
         self._file.write(struct.pack("<fff", wp.origin.x, wp.origin.y, wp.origin.z))
 
-        # Flags
-        self._file.write(struct.pack("<I", int(wp.flags)))
+        # iAimYaw (aim direction, default 0)
+        aim_yaw = getattr(wp, 'aim_yaw', 0)
+        self._file.write(struct.pack("<i", aim_yaw))
 
-        # Radius (default 0 for automatic)
-        self._file.write(struct.pack("<f", wp.radius))
+        # iFlags
+        self._file.write(struct.pack("<i", int(wp.flags)))
 
-        # Area (0 for no restriction)
-        area = 0
+        # bUsed (must be TRUE for valid waypoint)
+        self._file.write(struct.pack("<B", 1))
+
+        # Filter to only valid path indices (>= 0)
+        valid_paths = [p for p in wp.connections if p >= 0]
+
+        # Path count (number of valid connections)
+        self._file.write(struct.pack("<i", len(valid_paths)))
+
+        # Write only valid path indices (variable length)
+        for path_idx in valid_paths:
+            self._file.write(struct.pack("<i", path_idx))
+
+        # iArea (0 for no restriction)
+        area = getattr(wp, 'area', 0)
         self._file.write(struct.pack("<i", area))
 
-        # Number of connections (capped at MAX_WAYPOINT_CONNECTIONS)
-        num_connections = min(len(wp.connections), MAX_WAYPOINT_CONNECTIONS)
-        self._file.write(struct.pack("<I", num_connections))
-
-        # Connection indices
-        for i in range(num_connections):
-            self._file.write(struct.pack("<i", wp.connections[i]))
-
-        # Pad remaining connections with -1
-        for _ in range(MAX_WAYPOINT_CONNECTIONS - num_connections):
-            self._file.write(struct.pack("<i", -1))
+        # fRadius
+        self._file.write(struct.pack("<f", wp.radius))
 
 
 class RCWExtendedWriter(RCWWriter):
@@ -133,10 +220,15 @@ class RCWExtendedWriter(RCWWriter):
         waypoints: List[Waypoint],
         map_name: str = "",
         author: str = "BSP-Waypoint-Generator-HL2DM",
+        has_visibility: bool = False,
+        validate: bool = True,
     ) -> None:
         """Write waypoints and metadata."""
         # Write main waypoint file
-        super().write(filepath, waypoints, map_name, author)
+        super().write(
+            filepath, waypoints, map_name, author,
+            has_visibility=has_visibility, validate=validate,
+        )
 
         # Write metadata file
         self._write_metadata(filepath, waypoints, map_name, author)
@@ -154,7 +246,7 @@ class RCWExtendedWriter(RCWWriter):
 
         with open(meta_path, "w") as f:
             # Header
-            f.write(f"// RCBot2 Waypoint Metadata\n")
+            f.write(f"// RCBot3 Waypoint Metadata\n")
             f.write(f"// Generated by BSP Waypoint Generator for HL2DM\n")
             f.write(f"// Map: {map_name}\n")
             f.write(f"// Author: {author}\n")
@@ -199,7 +291,7 @@ class TextWaypointWriter:
         filepath = Path(filepath)
 
         with open(filepath, "w") as f:
-            f.write(f"# RCBot2 Waypoints (Text Format)\n")
+            f.write(f"# RCBot3 Waypoints (Text Format)\n")
             f.write(f"# Map: {map_name}\n")
             f.write(f"# Author: {author}\n")
             f.write(f"# Total Waypoints: {len(waypoints)}\n")
@@ -365,7 +457,10 @@ def write_waypoints(
     else:
         writer = RCWWriter()
 
-    writer.write(filepath, waypoints, map_name, author)
+    writer.write(
+        filepath, waypoints, map_name, author,
+        has_visibility=include_visibility,
+    )
 
     # Write visibility table
     if include_visibility:

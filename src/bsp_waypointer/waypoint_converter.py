@@ -13,12 +13,20 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
 import numpy as np
 
 from .constants import (
+    CONNECTION_RANGE_LOCAL,
+    CROUCH_JUMP_RISE,
     DEFAULT_PLAYER_DIMS,
     DEFAULT_WAYPOINT_SPACING,
+    DEGREE_REPAIR_RANGES,
+    HAZARD_DAMAGE_THRESHOLD,
     HL2DMWaypointSubType,
+    LADDER_RUNG_SPACING,
     MAX_CONNECTION_DISTANCE,
+    MAX_DROP_CONNECTION,
+    MAX_PUSH_CONNECTION_DISTANCE,
     MAX_WAYPOINTS,
     MIN_WAYPOINT_DISTANCE,
+    SPAWN_REACH_COVERAGE,
     WaypointFlag,
 )
 from .entity_analyzer import (
@@ -37,7 +45,7 @@ from .entity_analyzer import (
 )
 from .geometry_extractor import LadderSurface
 from .navmesh_generator import NavigationMesh
-from .vector import Vector3
+from .vector import Vector3, segment_intersects_aabb
 
 if TYPE_CHECKING:
     from .ray_tracer import BSPRayTracer
@@ -113,6 +121,9 @@ class HL2DMWaypointConverter:
         self._waypoints: List[Waypoint] = []
         self._spatial_hash: Dict[Tuple[int, int, int], List[int]] = {}
         self._cell_size = 128.0
+        self.connectivity_report: Dict[str, float] = {
+            "bridges": 0, "return_edges": 0, "spawn_coverage": 1.0,
+        }
 
     def convert(
         self,
@@ -134,8 +145,26 @@ class HL2DMWaypointConverter:
         self._waypoints = []
         self._spatial_hash = {}
 
+        # Snapshot navigation-affecting volumes for placement and
+        # connection filtering (defensive getattr keeps compatibility
+        # with older HL2DMEntityData instances)
+        self._solid_obstacles = [
+            o for o in getattr(entities, "prop_obstacles", []) if not o.movable
+        ]
+        self._hazards = [
+            h
+            for h in getattr(entities, "hurt_volumes", [])
+            if h.damage >= HAZARD_DAMAGE_THRESHOLD
+            and not getattr(h, "start_disabled", False)
+        ]
+        self._push_waypoint_links: List[Tuple[int, object]] = []
+
         # Place waypoints on navigation mesh
         self._place_navmesh_waypoints(navmesh)
+
+        # Drop plain samples blocked by solid props or hazard volumes
+        # (must run while samples are still unconnected)
+        self._cull_blocked_samples()
 
         # Place waypoints for entities (weapons, items, etc.)
         self._place_weapon_waypoints(entities.weapons)
@@ -146,25 +175,44 @@ class HL2DMWaypointConverter:
         self._place_spawn_waypoints(entities.spawn_points)
         self._place_teleporter_waypoints(entities.teleporters)
         self._place_ladder_waypoints(entities.ladders, ladders or [])
+        self._place_useable_ladder_waypoints(
+            getattr(entities, "useable_ladders", []),
+            getattr(entities, "ladder_dismounts", []),
+        )
         self._place_button_waypoints(entities.buttons)
         self._place_breakable_waypoints(entities.breakables)
+        self._place_door_waypoints(entities.doors)
+        self._place_lift_waypoints(getattr(entities, "lifts", []))
+        self._place_push_waypoints(getattr(entities, "push_volumes", []))
 
-        # Compute waypoint connections
+        # Stage A: directed local candidate edges
         self._compute_connections()
 
-        # Assign additional flags based on geometry
-        self._assign_geometry_flags(navmesh)
+        # One-way connections out of push volumes (jump pads)
+        self._add_push_connections()
 
-        # Detect sniper positions
-        self._detect_sniper_positions()
-
-        # Optimize waypoint count if needed
+        # Optimize waypoint count if needed (BEFORE connectivity
+        # finalization — culling can re-fragment the graph, so degree
+        # repair and the connectivity guarantee must run on the final set)
         if len(self._waypoints) > self.max_waypoints:
             self._optimize_waypoint_count()
 
         # Reassign indices
         for i, wp in enumerate(self._waypoints):
             wp.index = i
+
+        # Stage B: repair zero-degree waypoints with relaxed ranges
+        self._repair_degrees()
+
+        # Stage C: guarantee a single connected, spawn-reachable graph
+        # (raises rather than allowing a fragmented file to be written)
+        self._ensure_connectivity()
+
+        # Assign additional flags based on geometry
+        self._assign_geometry_flags(navmesh)
+
+        # Detect sniper positions
+        self._detect_sniper_positions()
 
         return self._waypoints
 
@@ -372,15 +420,12 @@ class HL2DMWaypointConverter:
     def _place_ladder_waypoints(
         self, entity_ladders: List[Ladder], surface_ladders: List[LadderSurface]
     ) -> None:
-        """Place waypoints at ladder locations."""
+        """Place rung chains at ladder locations."""
         # From entities
         for ladder in entity_ladders:
-            # Place waypoints at bottom and top of ladder
             bottom = Vector3(ladder.origin.x, ladder.origin.y, ladder.mins.z)
             top = Vector3(ladder.origin.x, ladder.origin.y, ladder.maxs.z)
-
-            self._add_waypoint(bottom, WaypointFlag.W_FL_LADDER)
-            self._add_waypoint(top, WaypointFlag.W_FL_LADDER)
+            self._place_ladder_chain(bottom, top)
 
         # From detected surfaces
         for surface in surface_ladders:
@@ -394,9 +439,7 @@ class HL2DMWaypointConverter:
                 (surface.mins.y + surface.maxs.y) / 2,
                 surface.maxs.z,
             )
-
-            self._add_waypoint(bottom, WaypointFlag.W_FL_LADDER)
-            self._add_waypoint(top, WaypointFlag.W_FL_LADDER)
+            self._place_ladder_chain(bottom, top)
 
     def _place_button_waypoints(self, buttons: List[Button]) -> None:
         """Place waypoints at button locations."""
@@ -417,59 +460,567 @@ class HL2DMWaypointConverter:
             )
             self._add_waypoint(breakable.origin, WaypointFlag.W_FL_BREAKABLE, metadata)
 
+    def _cull_blocked_samples(self) -> None:
+        """
+        Remove plain navmesh samples inside solid props or hazard volumes.
+
+        Runs before entity placement while no connections exist, so the
+        waypoint list can be rebuilt without index fixups.
+        """
+        tracer = self.ray_tracer if self.use_ray_tracing else None
+        if not self._solid_obstacles and not self._hazards and tracer is None:
+            return
+
+        radius = DEFAULT_PLAYER_DIMS.radius
+
+        def in_world_solid(origin: Vector3) -> bool:
+            # Samples without even crouch clearance are never valid
+            # standing spots (inside walls, or gaps too low to enter)
+            if tracer is None:
+                return False
+            return tracer.point_in_solid(
+                Vector3(origin.x, origin.y, origin.z + 2)
+            ) or tracer.point_in_solid(
+                Vector3(origin.x, origin.y, origin.z + 20)
+            )
+
+        def blocked(origin: Vector3) -> bool:
+            if in_world_solid(origin):
+                return True
+            for obs in self._solid_obstacles:
+                if (
+                    obs.mins.x - radius <= origin.x <= obs.maxs.x + radius
+                    and obs.mins.y - radius <= origin.y <= obs.maxs.y + radius
+                    and obs.mins.z <= origin.z <= obs.maxs.z
+                ):
+                    return True
+            for hz in self._hazards:
+                if (
+                    hz.mins.x <= origin.x <= hz.maxs.x
+                    and hz.mins.y <= origin.y <= hz.maxs.y
+                    and hz.mins.z <= origin.z <= hz.maxs.z
+                ):
+                    return True
+            return False
+
+        kept = [wp for wp in self._waypoints if not blocked(wp.origin)]
+
+        # Crouch-height clearance (open at +20, solid at head height):
+        # keep the spot but mark it so bots duck through vents/gaps
+        if tracer is not None:
+            for wp in kept:
+                o = wp.origin
+                if tracer.point_in_solid(Vector3(o.x, o.y, o.z + 54)):
+                    wp.add_flag(WaypointFlag.W_FL_CROUCH)
+
+        if len(kept) == len(self._waypoints):
+            return
+
+        self._waypoints = kept
+        self._spatial_hash = {}
+        for i, wp in enumerate(self._waypoints):
+            wp.index = i
+            self._add_to_spatial_hash(wp.origin, i)
+
+    def _place_door_waypoints(self, doors: List[Door]) -> None:
+        """
+        Place waypoints on both sides of each door.
+
+        The pair is explicitly interconnected so the path through the
+        doorway exists even when the closed door brush blocks LOS.
+        """
+        for door in doors:
+            size = door.maxs - door.mins
+            # Pass-through direction is along the door's thin horizontal axis
+            if size.x <= size.y:
+                normal = Vector3(1, 0, 0)
+                thickness = size.x
+            else:
+                normal = Vector3(0, 1, 0)
+                thickness = size.y
+
+            floor_z = door.mins.z
+            center = Vector3(door.origin.x, door.origin.y, floor_z)
+            offset = normal * (thickness / 2 + 40.0)
+
+            flags = (
+                WaypointFlag.W_FL_USE if door.requires_use else WaypointFlag.W_FL_NONE
+            )
+            side_indices = []
+            for side_origin in (center + offset, center - offset):
+                metadata = WaypointMetadata(
+                    subtype=HL2DMWaypointSubType.DOOR,
+                    entity_origin=door.origin,
+                    requires_use=door.requires_use,
+                )
+                side_indices.append(
+                    self._add_waypoint(side_origin, flags, metadata)
+                )
+
+            if side_indices[0] != side_indices[1]:
+                self._waypoints[side_indices[0]].add_connection(side_indices[1])
+                self._waypoints[side_indices[1]].add_connection(side_indices[0])
+
+    def _place_lift_waypoints(self, lifts) -> None:
+        """Place connected waypoints at the bottom and top of each lift."""
+        for lift in lifts:
+            cx = (lift.mins.x + lift.maxs.x) / 2
+            cy = (lift.mins.y + lift.maxs.y) / 2
+
+            bottom_idx = self._add_waypoint(
+                Vector3(cx, cy, lift.bottom_z),
+                WaypointFlag.W_FL_LIFT | WaypointFlag.W_FL_WAIT_GROUND,
+            )
+            top_idx = self._add_waypoint(
+                Vector3(cx, cy, lift.top_z),
+                WaypointFlag.W_FL_LIFT,
+            )
+
+            if bottom_idx != top_idx:
+                self._waypoints[bottom_idx].add_connection(top_idx)
+                self._waypoints[top_idx].add_connection(bottom_idx)
+
+    def _place_push_waypoints(self, push_volumes) -> None:
+        """Place a launch waypoint inside each trigger_push volume."""
+        for volume in push_volumes:
+            cx = (volume.mins.x + volume.maxs.x) / 2
+            cy = (volume.mins.y + volume.maxs.y) / 2
+            idx = self._add_waypoint(
+                Vector3(cx, cy, volume.mins.z), WaypointFlag.W_FL_JUMP
+            )
+            self._push_waypoint_links.append((idx, volume))
+
+    def _place_ladder_chain(self, bottom: Vector3, top: Vector3) -> List[int]:
+        """
+        Place a chain of connected W_FL_LADDER waypoints from bottom to top.
+
+        Intermediate rungs are spaced LADDER_RUNG_SPACING apart; bottom and
+        top are always included. Returns chain indices in bottom-to-top order.
+        """
+        span = top - bottom
+        length = span.length()
+        steps = max(1, int(length / LADDER_RUNG_SPACING))
+
+        chain: List[int] = []
+        for i in range(steps + 1):
+            t = i / steps
+            point = bottom.lerp(top, t)
+            idx = self._add_waypoint(
+                point, WaypointFlag.W_FL_LADDER, merge_distance=24.0
+            )
+            if chain and chain[-1] != idx:
+                self._waypoints[chain[-1]].add_connection(idx)
+                self._waypoints[idx].add_connection(chain[-1])
+            chain.append(idx)
+
+        return chain
+
+    def _place_useable_ladder_waypoints(
+        self, useable_ladders, dismounts
+    ) -> None:
+        """Place rung chains for func_useableladder plus dismount links."""
+        ladder_tops: List[Tuple[Vector3, int]] = []
+
+        for ladder in useable_ladders:
+            chain = self._place_ladder_chain(ladder.bottom, ladder.top)
+            if chain:
+                ladder_tops.append((ladder.top, chain[-1]))
+
+        for dismount in dismounts:
+            # Tight merge radius keeps the dismount distinct from the
+            # adjacent top rung so bots have a step-off target
+            idx = self._add_waypoint(
+                dismount.origin, WaypointFlag.W_FL_NONE, merge_distance=24.0
+            )
+            for top_pos, top_idx in ladder_tops:
+                if dismount.origin.distance_to(top_pos) <= 160.0 and idx != top_idx:
+                    self._waypoints[idx].add_connection(top_idx)
+                    self._waypoints[top_idx].add_connection(idx)
+
+    def _add_push_connections(self) -> None:
+        """
+        Add one-way connections from push waypoints toward the landing zone.
+
+        Push connections intentionally bypass _can_connect: the player is
+        airborne, so LOS/walkability/obstacle rules don't apply.
+        """
+        for wp_index, volume in self._push_waypoint_links:
+            if wp_index >= len(self._waypoints):
+                continue
+            wp = self._waypoints[wp_index]
+            reach = min(volume.speed, MAX_PUSH_CONNECTION_DISTANCE)
+            launch_target = wp.origin + volume.direction * reach
+
+            candidates = [
+                c for c in self._find_nearby_waypoints(launch_target, 256.0)
+                if c != wp_index
+            ]
+            if not candidates:
+                continue
+
+            # Prefer a landing waypoint not already reachable by normal
+            # movement — that's the traversal the push link adds
+            target = next(
+                (c for c in candidates if c not in wp.connections),
+                candidates[0],
+            )
+            wp.add_connection(target)
+
+    def _repair_degrees(self) -> None:
+        """
+        Stage B: repair zero-degree waypoints.
+
+        Retries connection candidates with stepwise-relaxed distance
+        bounds, preferring edges that pass the full walkability check;
+        falls back to the nearest neighbor unconditionally so no live
+        waypoint is left with a missing direction.
+        """
+        n = len(self._waypoints)
+        if n < 2:
+            return
+
+        def in_degrees() -> List[int]:
+            degrees = [0] * n
+            for wp in self._waypoints:
+                for c in wp.connections:
+                    if 0 <= c < n:
+                        degrees[c] += 1
+            return degrees
+
+        # Outgoing repair
+        for i, wp in enumerate(self._waypoints):
+            if any(0 <= c < n for c in wp.connections):
+                continue
+            repaired = False
+            for range_ in DEGREE_REPAIR_RANGES:
+                for j in self._find_nearby_waypoints(wp.origin, range_):
+                    if j == i:
+                        continue
+                    if self._can_connect(wp, self._waypoints[j], max_range=range_):
+                        wp.add_connection(j)
+                        repaired = True
+                        break
+                if repaired:
+                    break
+            if not repaired:
+                # Unconditional nearest-neighbor fallback
+                nearest = self._nearest_waypoint(i)
+                if nearest is not None:
+                    wp.add_connection(nearest)
+
+        # Incoming repair
+        degrees = in_degrees()
+        for i, wp in enumerate(self._waypoints):
+            if degrees[i] > 0:
+                continue
+            repaired = False
+            for range_ in DEGREE_REPAIR_RANGES:
+                for j in self._find_nearby_waypoints(wp.origin, range_):
+                    if j == i:
+                        continue
+                    src = self._waypoints[j]
+                    if self._can_connect(src, wp, max_range=range_):
+                        src.add_connection(i)
+                        repaired = True
+                        break
+                if repaired:
+                    break
+            if not repaired:
+                nearest = self._nearest_waypoint(i)
+                if nearest is not None:
+                    self._waypoints[nearest].add_connection(i)
+
+    def _nearest_waypoint(self, index: int) -> Optional[int]:
+        """Index of the nearest other waypoint (brute force fallback)."""
+        wp = self._waypoints[index]
+        best = None
+        best_dist = float("inf")
+        for j, other in enumerate(self._waypoints):
+            if j == index:
+                continue
+            d = wp.origin.distance_to(other.origin)
+            if d < best_dist:
+                best_dist = d
+                best = j
+        return best
+
+    def _ensure_connectivity(self) -> None:
+        """
+        Stage C: guarantee one connected, spawn-reachable graph.
+
+        Bridges weakly-connected components pairwise at their closest
+        waypoints, then verifies strong (directed) reachability from
+        every spawn waypoint, adding return edges along one-way
+        bottlenecks until coverage reaches SPAWN_REACH_COVERAGE.
+        Raises RuntimeError rather than allowing a fragmented graph to
+        reach the writer. Populates self.connectivity_report.
+        """
+        n = len(self._waypoints)
+        self.connectivity_report = {"bridges": 0, "return_edges": 0, "spawn_coverage": 1.0}
+        if n < 2:
+            return
+
+        def weak_components() -> List[List[int]]:
+            comp_of = [-1] * n
+            comps: List[List[int]] = []
+            undirected: List[Set[int]] = [set() for _ in range(n)]
+            for i, wp in enumerate(self._waypoints):
+                for c in wp.connections:
+                    if 0 <= c < n:
+                        undirected[i].add(c)
+                        undirected[c].add(i)
+            for start in range(n):
+                if comp_of[start] != -1:
+                    continue
+                members = [start]
+                comp_of[start] = len(comps)
+                queue = [start]
+                while queue:
+                    node = queue.pop()
+                    for m in undirected[node]:
+                        if comp_of[m] == -1:
+                            comp_of[m] = len(comps)
+                            members.append(m)
+                            queue.append(m)
+                comps.append(members)
+            return comps
+
+        # Bridge components at their closest cross-pair, smallest first
+        comps = weak_components()
+        while len(comps) > 1:
+            comps.sort(key=len)
+            small = comps[0]
+            rest = [i for comp in comps[1:] for i in comp]
+
+            best_pair = None
+            best_dist = float("inf")
+            for u in small:
+                ou = self._waypoints[u].origin
+                for v in rest:
+                    d = ou.distance_to(self._waypoints[v].origin)
+                    if d < best_dist:
+                        best_dist = d
+                        best_pair = (u, v)
+
+            u, v = best_pair
+            self._waypoints[u].add_connection(v)
+            self._waypoints[v].add_connection(u)
+            self.connectivity_report["bridges"] += 1
+            # Merge the two components
+            target = next(
+                idx for idx, comp in enumerate(comps[1:], start=1) if v in set(comp)
+            )
+            comps[target] = comps[target] + small
+            comps.pop(0)
+
+        # Collapse to a single strongly-connected component: bots spawn
+        # anywhere and the RCBot3 validator probes from an arbitrary
+        # waypoint, so spawn-outward coverage alone is not enough (a
+        # sloped map full of one-way drop edges degenerates into a
+        # downhill DAG otherwise). Each round reverses one cross-SCC
+        # bottleneck edge per component pair, merging SCCs until one
+        # remains.
+        for _ in range(n):
+            sccs = self._strongly_connected_components()
+            if len(sccs) <= 1:
+                break
+            comp_of = [0] * n
+            for ci, comp in enumerate(sccs):
+                for node in comp:
+                    comp_of[node] = ci
+            reversed_pairs: Set[Tuple[int, int]] = set()
+            added = False
+            for u in range(n):
+                cu = comp_of[u]
+                for v in self._waypoints[u].connections:
+                    if not (0 <= v < n):
+                        continue
+                    cv = comp_of[v]
+                    if cu != cv and (cu, cv) not in reversed_pairs:
+                        self._waypoints[v].add_connection(u)
+                        self.connectivity_report["return_edges"] += 1
+                        reversed_pairs.add((cu, cv))
+                        added = True
+            if not added:
+                break
+
+        # Report strong coverage from every spawn waypoint (fall back to
+        # waypoint 0 when the map defines no spawns)
+        spawn_indices = [
+            wp.index
+            for wp in self._waypoints
+            if wp.metadata.subtype == HL2DMWaypointSubType.SPAWN_POINT
+        ] or [0]
+
+        def directed_reach(start: int) -> Set[int]:
+            reach = {start}
+            queue = [start]
+            while queue:
+                node = queue.pop()
+                for c in self._waypoints[node].connections:
+                    if 0 <= c < n and c not in reach:
+                        reach.add(c)
+                        queue.append(c)
+            return reach
+
+        min_coverage = min(
+            len(directed_reach(spawn)) / n for spawn in spawn_indices
+        )
+        self.connectivity_report["spawn_coverage"] = min_coverage
+
+        # Hard guarantee: refuse to hand a fragmented graph to the writer
+        final_comps = weak_components()
+        if len(final_comps) > 1:
+            sizes = sorted((len(c) for c in final_comps), reverse=True)
+            raise RuntimeError(
+                f"waypoint graph still fragmented after connectivity repair: "
+                f"{len(final_comps)} components (sizes {sizes[:10]})"
+            )
+        if min_coverage < SPAWN_REACH_COVERAGE:
+            raise RuntimeError(
+                f"spawn strong-reachability {min_coverage:.0%} below required "
+                f"{SPAWN_REACH_COVERAGE:.0%} after repair"
+            )
+
+    def _strongly_connected_components(self) -> List[List[int]]:
+        """Kosaraju SCC over the current directed connection graph."""
+        n = len(self._waypoints)
+        adj = [
+            [c for c in self._waypoints[i].connections if 0 <= c < n]
+            for i in range(n)
+        ]
+        radj: List[List[int]] = [[] for _ in range(n)]
+        for u in range(n):
+            for v in adj[u]:
+                radj[v].append(u)
+
+        # Pass 1: post-order over the forward graph (iterative DFS)
+        visited = [False] * n
+        order: List[int] = []
+        for start in range(n):
+            if visited[start]:
+                continue
+            visited[start] = True
+            stack = [(start, iter(adj[start]))]
+            while stack:
+                node, it = stack[-1]
+                advanced = False
+                for nxt in it:
+                    if not visited[nxt]:
+                        visited[nxt] = True
+                        stack.append((nxt, iter(adj[nxt])))
+                        advanced = True
+                        break
+                if not advanced:
+                    order.append(node)
+                    stack.pop()
+
+        # Pass 2: reverse graph in reverse post-order
+        comp = [-1] * n
+        sccs: List[List[int]] = []
+        for start in reversed(order):
+            if comp[start] != -1:
+                continue
+            members = [start]
+            comp[start] = len(sccs)
+            queue = [start]
+            while queue:
+                u = queue.pop()
+                for v in radj[u]:
+                    if comp[v] == -1:
+                        comp[v] = len(sccs)
+                        members.append(v)
+                        queue.append(v)
+            sccs.append(members)
+        return sccs
+
     def _compute_connections(self) -> None:
-        """Compute connections between waypoints."""
+        """
+        Stage A: directed local candidate edges.
+
+        Each ordered pair (A, B) within CONNECTION_RANGE_LOCAL is
+        evaluated independently, so survivable drops become legitimate
+        one-way A -> B connections while the climb back is refused.
+        """
         for i, wp_a in enumerate(self._waypoints):
-            # Find potential connections
-            nearby = self._find_nearby_waypoints(wp_a.origin, MAX_CONNECTION_DISTANCE)
+            nearby = self._find_nearby_waypoints(
+                wp_a.origin, CONNECTION_RANGE_LOCAL
+            )
 
             for j in nearby:
-                if j == i:
+                if j == i or j in wp_a.connections:
                     continue
 
-                wp_b = self._waypoints[j]
-
-                # Skip if already connected
-                if j in wp_a.connections:
-                    continue
-
-                # Check connection validity
-                if self._can_connect(wp_a, wp_b):
+                if self._can_connect(wp_a, self._waypoints[j]):
                     wp_a.add_connection(j)
-                    wp_b.add_connection(i)
 
-    def _can_connect(self, wp_a: Waypoint, wp_b: Waypoint) -> bool:
+    def _can_connect(
+        self,
+        wp_a: Waypoint,
+        wp_b: Waypoint,
+        max_range: float = CONNECTION_RANGE_LOCAL,
+    ) -> bool:
         """
-        Check if two waypoints can be connected.
+        Check whether a DIRECTED connection A -> B is traversable.
 
-        Uses ray tracing for accurate line-of-sight checks when available.
+        Vertical rules: rises above crouch-jump height are refused
+        (ladders/lifts provide explicit edges); drops are allowed one-way
+        down to MAX_DROP_CONNECTION.
         """
         distance = wp_a.origin.distance_to(wp_b.origin)
 
         # Too far
-        if distance > MAX_CONNECTION_DISTANCE:
+        if distance > max_range:
             return False
 
-        # Height difference check (can't connect through floors/ceilings)
-        height_diff = abs(wp_a.origin.z - wp_b.origin.z)
         horizontal_dist = wp_a.origin.distance_to_2d(wp_b.origin)
+        rise = wp_b.origin.z - wp_a.origin.z
 
-        # Maximum slope check (roughly 60 degrees)
-        if horizontal_dist > 0 and height_diff / horizontal_dist > 1.73:
-            return False
-
-        # Special connections always allowed (teleporters, ladders)
+        # Special connections always allowed (teleporters)
         if (
             wp_a.has_flag(WaypointFlag.W_FL_TELE_ENTRANCE)
             and wp_b.has_flag(WaypointFlag.W_FL_TELE_EXIT)
         ):
             return True
 
-        if (
-            wp_a.has_flag(WaypointFlag.W_FL_LADDER)
-            or wp_b.has_flag(WaypointFlag.W_FL_LADDER)
-        ):
-            return True
+        # Ladder rules: rungs of the same column connect freely; a single
+        # ladder endpoint connects within mount/dismount reach. Anything
+        # further falls through to the normal LOS/walkability checks
+        # (the old blanket exemption let ladders connect through walls).
+        a_ladder = wp_a.has_flag(WaypointFlag.W_FL_LADDER)
+        b_ladder = wp_b.has_flag(WaypointFlag.W_FL_LADDER)
+        if a_ladder and b_ladder:
+            if horizontal_dist < 64:
+                return True
+        elif a_ladder or b_ladder:
+            if distance < 200:
+                return True
+
+        # Vertical rules. A rise is traversable when it's either within
+        # crouch-jump height (a discrete ledge) OR a walkable gradient
+        # (slope <= ~45 deg: stairs and ramps rise continuously, so the
+        # absolute rise over a long horizontal run can far exceed a
+        # jumpable ledge). Steeper climbs need ladders/lifts.
+        if rise > CROUCH_JUMP_RISE and rise > horizontal_dist:
+            return False
+        if rise < -MAX_DROP_CONNECTION:
+            # Drop too deep to survive
+            return False
+
+        # Cheap AABB blocking against hazards and solid props before the
+        # more expensive ray tracing
+        body_lift = Vector3(0, 0, DEFAULT_PLAYER_DIMS.step_height)
+        seg_a = wp_a.origin + body_lift
+        seg_b = wp_b.origin + body_lift
+        for hz in getattr(self, "_hazards", []):
+            if segment_intersects_aabb(seg_a, seg_b, hz.mins, hz.maxs):
+                return False
+        for obs in getattr(self, "_solid_obstacles", []):
+            if segment_intersects_aabb(
+                seg_a, seg_b, obs.mins, obs.maxs,
+                expand=DEFAULT_PLAYER_DIMS.radius,
+            ):
+                return False
 
         # Use ray tracing for accurate line-of-sight check
         if self.ray_tracer and self.use_ray_tracing:
@@ -481,8 +1032,10 @@ class HL2DMWaypointConverter:
             ):
                 return False
 
-            # For longer distances, also check if player can walk the path
-            if distance > 256:
+            # For longer flat stretches, also check if a player hull can
+            # walk the path (skipped for drops: falling needs no walk
+            # clearance)
+            if distance > 256 and rise >= -CROUCH_JUMP_RISE:
                 if not self.ray_tracer.can_walk_between(
                     wp_a.origin,
                     wp_b.origin,
@@ -539,45 +1092,110 @@ class HL2DMWaypointConverter:
             if long_connections >= 2:
                 wp.add_flag(WaypointFlag.W_FL_SNIPER)
 
+    def _calculate_waypoint_priority(self, wp: Waypoint) -> int:
+        """Calculate priority score for a waypoint."""
+        priority = 0
+
+        # Entity waypoints are high priority
+        if wp.metadata.subtype != HL2DMWaypointSubType.SUBTYPE_NONE:
+            priority += 1000
+            priority += wp.metadata.weapon_priority
+
+        # Flags add priority
+        if wp.has_flag(WaypointFlag.W_FL_HEALTH):
+            priority += 500
+        if wp.has_flag(WaypointFlag.W_FL_AMMO):
+            priority += 300
+        if wp.has_flag(WaypointFlag.W_FL_LADDER):
+            priority += 800
+        if wp.has_flag(WaypointFlag.W_FL_TELE_ENTRANCE):
+            priority += 700
+        if wp.has_flag(WaypointFlag.W_FL_LIFT):
+            priority += 600
+        if wp.has_flag(WaypointFlag.W_FL_SNIPER):
+            priority += 200
+        if wp.has_flag(WaypointFlag.W_FL_JUMP):
+            priority += 100
+
+        # Connectivity adds priority
+        priority += len(wp.connections) * 10
+
+        return priority
+
     def _optimize_waypoint_count(self) -> None:
-        """Reduce waypoint count if over maximum."""
+        """
+        Reduce waypoint count if over maximum while ensuring spatial coverage.
+
+        Uses a grid-based approach to guarantee all areas of the map have
+        representation, preventing large gaps in waypoint coverage.
+        """
         if len(self._waypoints) <= self.max_waypoints:
             return
 
-        # Calculate priority for each waypoint
-        priorities = []
+        # Calculate map bounds
+        if not self._waypoints:
+            return
+
+        min_x = min(wp.origin.x for wp in self._waypoints)
+        max_x = max(wp.origin.x for wp in self._waypoints)
+        min_y = min(wp.origin.y for wp in self._waypoints)
+        max_y = max(wp.origin.y for wp in self._waypoints)
+
+        # Determine grid cell size based on map size and target waypoint count
+        # We want roughly sqrt(max_waypoints) cells per axis for good distribution
+        map_width = max(max_x - min_x, 1.0)
+        map_height = max(max_y - min_y, 1.0)
+        target_cells_per_axis = max(4, int(np.sqrt(self.max_waypoints / 4)))
+        grid_cell_size = max(map_width, map_height) / target_cells_per_axis
+
+        # Build grid: assign each waypoint to a 2D grid cell (XY plane)
+        grid_cells: Dict[Tuple[int, int], List[Tuple[int, int]]] = {}
         for i, wp in enumerate(self._waypoints):
-            priority = 0
+            cell_x = int((wp.origin.x - min_x) / grid_cell_size)
+            cell_y = int((wp.origin.y - min_y) / grid_cell_size)
+            cell_key = (cell_x, cell_y)
 
-            # Entity waypoints are high priority
-            if wp.metadata.subtype != HL2DMWaypointSubType.SUBTYPE_NONE:
-                priority += 1000
-                priority += wp.metadata.weapon_priority
+            priority = self._calculate_waypoint_priority(wp)
 
-            # Flags add priority
-            if wp.has_flag(WaypointFlag.W_FL_HEALTH):
-                priority += 500
-            if wp.has_flag(WaypointFlag.W_FL_AMMO):
-                priority += 300
-            if wp.has_flag(WaypointFlag.W_FL_LADDER):
-                priority += 800
-            if wp.has_flag(WaypointFlag.W_FL_TELE_ENTRANCE):
-                priority += 700
-            if wp.has_flag(WaypointFlag.W_FL_SNIPER):
-                priority += 200
+            if cell_key not in grid_cells:
+                grid_cells[cell_key] = []
+            grid_cells[cell_key].append((i, priority))
 
-            # Connectivity adds priority
-            priority += len(wp.connections) * 10
+        # Sort waypoints within each cell by priority (descending)
+        for cell_key in grid_cells:
+            grid_cells[cell_key].sort(key=lambda x: x[1], reverse=True)
 
-            priorities.append((i, priority))
+        # Phase 1: Ensure each cell has at least one waypoint (spatial coverage)
+        keep_indices: Set[int] = set()
+        num_cells = len(grid_cells)
 
-        # Sort by priority (descending)
-        priorities.sort(key=lambda x: x[1], reverse=True)
+        # Calculate minimum waypoints per cell to guarantee coverage
+        # Reserve at least 1 waypoint per cell, but cap at available budget
+        min_per_cell = max(1, self.max_waypoints // (num_cells * 2)) if num_cells > 0 else 1
 
-        # Keep top waypoints
-        keep_indices = set(idx for idx, _ in priorities[: self.max_waypoints])
+        for cell_key, cell_waypoints in grid_cells.items():
+            # Keep top waypoints from each cell up to min_per_cell
+            for i, (wp_idx, _) in enumerate(cell_waypoints):
+                if i >= min_per_cell:
+                    break
+                keep_indices.add(wp_idx)
 
-        # Filter waypoints
+        # Phase 2: Fill remaining slots with highest priority waypoints globally
+        remaining_slots = self.max_waypoints - len(keep_indices)
+        if remaining_slots > 0:
+            # Collect all remaining waypoints with priorities
+            remaining_waypoints = []
+            for cell_waypoints in grid_cells.values():
+                for wp_idx, priority in cell_waypoints:
+                    if wp_idx not in keep_indices:
+                        remaining_waypoints.append((wp_idx, priority))
+
+            # Sort by priority and add top remaining
+            remaining_waypoints.sort(key=lambda x: x[1], reverse=True)
+            for wp_idx, _ in remaining_waypoints[:remaining_slots]:
+                keep_indices.add(wp_idx)
+
+        # Filter waypoints and build index mapping
         new_waypoints = []
         index_map = {}
 
@@ -586,13 +1204,15 @@ class HL2DMWaypointConverter:
                 index_map[i] = len(new_waypoints)
                 new_waypoints.append(wp)
 
-        # Update connections
+        # Update connections to use new indices
         for wp in new_waypoints:
             wp.connections = [
                 index_map[c] for c in wp.connections if c in index_map
             ]
             if wp.metadata.target_waypoint in index_map:
                 wp.metadata.target_waypoint = index_map[wp.metadata.target_waypoint]
+            else:
+                wp.metadata.target_waypoint = -1
 
         self._waypoints = new_waypoints
 

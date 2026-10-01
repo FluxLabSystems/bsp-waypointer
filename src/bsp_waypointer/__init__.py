@@ -2,10 +2,10 @@
 BSP Waypoint Generator for Half-Life 2: Deathmatch
 
 A standalone tool that parses Source Engine .bsp map files and automatically
-generates RCBot2 waypoints for HL2DM without requiring the game engine.
+generates RCBot3 v5 waypoints for HL2DM without requiring the game engine.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __author__ = "BSP Waypoint Generator Team"
 
 from .bsp_parser import BSPParser, BSPFile
