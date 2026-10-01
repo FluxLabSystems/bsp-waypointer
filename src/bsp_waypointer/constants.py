@@ -27,43 +27,61 @@ DEFAULT_PLAYER_DIMS = PlayerDimensions()
 
 
 # =============================================================================
-# Waypoint Flags (from RCBot2 bot_waypoint.h)
+# Waypoint Flags: a mirror of RCBot3's CWaypointTypes
+# (rcbot3 utils/RCBot3_meta/bot_waypoint.h). Names AND values are RCBot3's,
+# per-mod aliases included (RCBot3 reuses bits across mods). Never edit a
+# value here without the header: tests/test_rcbot3_flags.py pins this table
+# to tests/data/rcbot3_waypoint_flags.json and, when an RCBot3 checkout is
+# reachable, to the live header.
 # =============================================================================
 
 class WaypointFlag(IntFlag):
-    """RCBot2 waypoint flags."""
+    """RCBot3 waypoint flags (CWaypointTypes::W_FL_*)."""
     W_FL_NONE = 0
-    W_FL_JUMP = 1 << 0           # Jump required to traverse
-    W_FL_CROUCH = 1 << 1         # Crouch required (low ceiling)
-    W_FL_UNREACHABLE = 1 << 2    # Pathfinding skip
-    W_FL_LADDER = 1 << 3         # Ladder climbing point
-    W_FL_AIMING = 1 << 4         # Aiming waypoint
-    W_FL_FLAG = 1 << 5           # Flag/objective location
-    W_FL_CAP_POINT = 1 << 6      # Capture point
-    W_FL_NO_FLAG = 1 << 7        # Not a flag location
-    W_FL_HEALTH = 1 << 8         # Health item/charger location
-    W_FL_OPENS_LATER = 1 << 9    # Opens later in game
-    W_FL_ROCKET_JUMP = 1 << 10   # Rocket jump location
-    W_FL_SNIPER = 1 << 11        # Good sniping position
-    W_FL_AMMO = 1 << 12          # Ammo pickup location
-    W_FL_RESUPPLY = 1 << 13      # Resupply station
-    W_FL_SENTRY = 1 << 14        # Good sentry position
-    W_FL_MACHINEGUN = 1 << 15    # Machine gun position
-    W_FL_TELE_ENTRANCE = 1 << 16 # Teleporter entrance
-    W_FL_TELE_EXIT = 1 << 17     # Teleporter exit
-    W_FL_DEFEND = 1 << 18        # Defend position
-    W_FL_ATTACK_POINT = 1 << 19  # Attack point
-    W_FL_WAIT_GROUND = 1 << 20   # Wait on ground
-    W_FL_NO_ENEMY_SPAWN = 1 << 21  # No enemy spawn
-    W_FL_OWNER_ONLY = 1 << 22    # Owner only access
-    W_FL_LIFT = 1 << 23          # Elevator/lift platform
-    W_FL_FLAGONLY = 1 << 24      # Flag only waypoint
-    W_FL_FALL = 1 << 25          # Falling hazard ahead
-    W_FL_BREAKABLE = 1 << 26     # Breakable object blocking path
-    W_FL_SPRINT = 1 << 27        # Good area for sprinting
-    W_FL_TELEPORT_CHEAT = 1 << 28  # Teleport cheat
-    W_FL_WAIT_CROUCH = 1 << 29   # Wait crouched
-    W_FL_USE = 1 << 30           # Requires USE key
+    W_FL_JUMP = 1 << 0
+    W_FL_CROUCH = 1 << 1
+    W_FL_UNREACHABLE = 1 << 2      # never routed through; goal/nearest searches skip it
+    W_FL_LADDER = 1 << 3
+    W_FL_FLAG = 1 << 4
+    W_FL_RESCUEZONE = 1 << 4       # CSS alias
+    W_FL_CAPPOINT = 1 << 5
+    W_FL_GOAL = 1 << 5             # Synergy/CSS alias
+    W_FL_NOBLU = 1 << 6
+    W_FL_NOAXIS = 1 << 6
+    W_FL_NOTERRORIST = 1 << 6
+    W_FL_NORED = 1 << 7
+    W_FL_NOALLIES = 1 << 7
+    W_FL_NOCOUNTERTR = 1 << 7
+    W_FL_HEALTH = 1 << 8
+    W_FL_OPENS_LATER = 1 << 9
+    W_FL_ROCKET_JUMP = 1 << 10
+    W_FL_BOMB_TO_OPEN = 1 << 10
+    W_FL_DOOR = 1 << 10
+    W_FL_SNIPER = 1 << 11
+    W_FL_AMMO = 1 << 12
+    W_FL_RESUPPLY = 1 << 13
+    W_FL_BOMBS_HERE = 1 << 13
+    W_FL_SENTRY = 1 << 14
+    W_FL_MACHINEGUN = 1 << 14
+    W_FL_DOUBLEJUMP = 1 << 15
+    W_FL_PRONE = 1 << 15
+    W_FL_TELE_ENTRANCE = 1 << 16
+    W_FL_TELE_EXIT = 1 << 17
+    W_FL_DEFEND = 1 << 18
+    W_FL_AREAONLY = 1 << 19
+    W_FL_ROUTE = 1 << 20
+    W_FL_WAIT_GROUND = 1 << 21
+    W_FL_NO_FLAG = 1 << 22
+    W_FL_COVER_RELOAD = 1 << 22
+    W_FL_NO_HOSTAGES = 1 << 22
+    W_FL_LIFT = 1 << 23
+    W_FL_FLAGONLY = 1 << 24
+    W_FL_FALL = 1 << 25
+    W_FL_BREAKABLE = 1 << 26
+    W_FL_SPRINT = 1 << 27
+    W_FL_TELEPORT_CHEAT = 1 << 28
+    W_FL_OWNER_ONLY = 1 << 29
+    W_FL_USE = 1 << 30
 
 
 # =============================================================================
@@ -528,8 +546,10 @@ class ContentFlags(IntFlag):
     CONTENTS_HITBOX = 0x40000000
 
 
-# Maximum waypoints allowed in RCBot2
+# RCBot3 limits (CWaypoints::MAX_WAYPOINTS, CWaypoint::MAX_LOAD_PATHS): the
+# loader rejects a file that exceeds either
 MAX_WAYPOINTS = 2048
+MAX_PATHS_PER_WAYPOINT = 255
 
 # Default waypoint spacing (units)
 DEFAULT_WAYPOINT_SPACING = 150.0
@@ -556,5 +576,25 @@ CROUCH_JUMP_RISE = 45.0
 # Maximum one-way drop connection depth (survivable fall)
 MAX_DROP_CONNECTION = 600.0
 
-# Required strong-reachability coverage from each spawn waypoint
+# The walk-off-and-fall path of a drop. A bot leaves the upper surface at a
+# ledge, falls, then walks on at the lower height, so how far it travels
+# while falling decides how much of the path belongs to each height.
+# HL2DM's normal run speed (hl2_normspeed; sprinting is 320) and the
+# default sv_gravity. The slower speed is the conservative choice: it
+# shortens the fall's horizontal reach, so each leg of the path is swept
+# over more of it.
+PLAYER_RUN_SPEED = 190.0
+WORLD_GRAVITY = 600.0
+
+# Fraction of spawn waypoints expected to reach the traversable component;
+# below it the CLI warns
 SPAWN_REACH_COVERAGE = 0.95
+
+# A spawn in a flagged strongly connected component with more waypoints than
+# this is in a flagged room, not on a ledge: RCBot3 never uses a flagged
+# waypoint's paths, so a bot spawning there cannot follow the room's own way
+# out. The CLI warns (report key largest_flagged_spawn_component)
+FLAGGED_SPAWN_AREA_WARN = 4
+
+# Stage C: widest range at which a cross-component edge may be proven
+BRIDGE_RANGE = DEGREE_REPAIR_RANGES[-1]

@@ -113,6 +113,8 @@ class NavigationMesh:
             List of sample positions
         """
         points = []
+        # Seeded: the same map must convert to the same waypoint file every run
+        rng = np.random.default_rng(0)
 
         for poly in self.polygons:
             # Sample based on polygon area
@@ -125,13 +127,15 @@ class NavigationMesh:
             if num_samples > 1 and len(poly.vertices) >= 3:
                 for _ in range(num_samples - 1):
                     # Random point within polygon using barycentric coordinates
-                    sample = self._sample_polygon_interior(poly)
+                    sample = self._sample_polygon_interior(poly, rng)
                     if sample:
                         points.append(sample)
 
         return points
 
-    def _sample_polygon_interior(self, poly: NavPolygon) -> Optional[Vector3]:
+    def _sample_polygon_interior(
+        self, poly: NavPolygon, rng: Optional[np.random.Generator] = None
+    ) -> Optional[Vector3]:
         """Sample a random point inside a polygon."""
         if len(poly.vertices) < 3:
             return poly.center
@@ -142,8 +146,9 @@ class NavigationMesh:
         v2 = poly.vertices[2]
 
         # Random barycentric coordinates
-        r1 = np.random.random()
-        r2 = np.random.random()
+        rng = rng if rng is not None else np.random.default_rng(0)
+        r1 = rng.random()
+        r2 = rng.random()
         if r1 + r2 > 1:
             r1 = 1 - r1
             r2 = 1 - r2

@@ -5,7 +5,6 @@ Run as a package module::
 
     python -m bsp_waypointer.crosscheck <file.rcw> <file.bsp>
 """
-import struct
 import sys
 from collections import Counter, deque
 from pathlib import Path
@@ -13,7 +12,7 @@ from pathlib import Path
 from .bsp_parser import BSPParser
 from .entity_analyzer import HL2DMEntityAnalyzer
 from .ray_tracer import BSPRayTracer
-from .rcw_validator import validate, ValidationError
+from .rcw_validator import parse, validate, ValidationError
 from .constants import WaypointFlag
 from .vector import Vector3
 
@@ -21,27 +20,25 @@ RCW = Path(sys.argv[1])
 BSP = Path(sys.argv[2])
 
 # ----------------------------------------------------------------------
-# Parse the .rcw
+# Parse the .rcw with the validator's parser, which reads every record
+# layout RCBot3's loader reads and fails where it fails (the map name is
+# checked against the file name in section 1)
 # ----------------------------------------------------------------------
-data = RCW.read_bytes()
-map_name = data[16:80].split(b"\0")[0].decode()
-version, num, hdr_flags = struct.unpack_from("<iii", data, 80)
-off = 92 + 64
-
-origins, flags, radii, edges = [], [], [], []
-for i in range(num):
-    x, y, z = struct.unpack_from("<fff", data, off); off += 12
-    off += 4  # aim yaw
-    (fl,) = struct.unpack_from("<i", data, off); off += 4
-    (used,) = struct.unpack_from("<B", data, off); off += 1
-    (npaths,) = struct.unpack_from("<i", data, off); off += 4
-    paths = list(struct.unpack_from(f"<{npaths}i", data, off)); off += 4 * npaths
-    (area,) = struct.unpack_from("<i", data, off); off += 4
-    (radius,) = struct.unpack_from("<f", data, off); off += 4
-    origins.append(Vector3(x, y, z)); flags.append(fl); radii.append(radius)
-    edges.append(paths)
-
 print(f"=== {RCW.name} ===")
+try:
+    rcw = parse(RCW.read_bytes())
+except ValidationError as e:
+    print(f"[FAIL] RCBot3's loader would reject this file: {e}")
+    sys.exit(1)
+map_name, version, num, hdr_flags = rcw.map_name, rcw.version, rcw.num, rcw.header_flags
+origins = [Vector3(x, y, z) for x, y, z in rcw.origins]
+flags, radii, edges = rcw.flags, rcw.radii, rcw.paths
+
+# RCBot3 never routes through, or starts from, a W_FL_UNREACHABLE waypoint
+live = [i for i in range(num)
+        if rcw.used[i] and not flags[i] & WaypointFlag.W_FL_UNREACHABLE]
+live_set = set(live)
+
 print(f"map={map_name} version={version} waypoints={num} header_flags={hdr_flags}")
 
 # ----------------------------------------------------------------------
@@ -66,24 +63,28 @@ print(f"reciprocity={recip/total_edges:.0%} one_way={one_way} "
 print(f"edge length: median={lengths[len(lengths)//2]:.0f} "
       f"p95={lengths[int(len(lengths)*0.95)]:.0f} max={lengths[-1]:.0f}")
 
-# strong reachability from MANY probes, not just wpt 0
+# strong reachability from MANY probes, not just wpt 0, over the live
+# waypoints (flagged ones are outside the graph bots use)
 def reach_from(s):
     seen = {s}; q = deque([s])
     while q:
         u = q.popleft()
         for v in edges[u]:
-            if v not in seen: seen.add(v); q.append(v)
+            if v in live_set and v not in seen: seen.add(v); q.append(v)
     return len(seen)
 
-probes = list(range(0, num, max(1, num // 25)))
-worst = min(reach_from(p) / num for p in probes)
-print(f"strong reachability across {len(probes)} probes: worst={worst:.0%}")
+probes = live[::max(1, len(live) // 25)]
+worst = min(reach_from(p) / len(live) for p in probes) if probes else 0.0
+print(f"strong reachability across {len(probes)} probes of {len(live)} live waypoints "
+      f"({num - len(live)} flagged unreachable or unused): worst={worst:.0%}")
 
+# Canonical members only: RCBot3 gives several names to one bit
+# (W_FL_FLAG/W_FL_RESCUEZONE, ...); count each bit once, under its first name
 flag_counts = Counter()
 for fl in flags:
-    for name, bit in WaypointFlag.__members__.items():
-        if bit and fl & bit:
-            flag_counts[name] += 1
+    for member in WaypointFlag:
+        if member.value and fl & member.value:
+            flag_counts[member.name] += 1
 print("flags:", dict(flag_counts) or "none")
 
 # ----------------------------------------------------------------------
@@ -178,11 +179,19 @@ for label, positions in (
     print(f"[{status}] {label} near a waypoint: {len(dists)-len(far)}/{len(dists)} "
           f"within 100u (max={max(dists):.0f}u)")
 
-# 3e. Spawn connectivity: waypoint nearest each spawn must reach >=95%
+# 3e. Spawn connectivity: the live waypoint nearest each spawn (RCBot3's
+# nearest-waypoint search skips flagged ones) must reach >=95% of the live graph
+def nearest_live(pos):
+    best, bd = -1, 1e9
+    for i in live:
+        d = pos.distance_to(origins[i])
+        if d < bd: bd, best = d, i
+    return best, bd
+
 worst_spawn = 1.0
 for s in ents.spawn_points:
-    wp, d = nearest_wp(s.origin)
-    worst_spawn = min(worst_spawn, reach_from(wp) / num)
+    wp, d = nearest_live(s.origin)
+    worst_spawn = min(worst_spawn, reach_from(wp) / len(live) if wp >= 0 else 0.0)
 print(f"[{'FAIL' if worst_spawn < 0.95 else 'PASS'}] every spawn's waypoint "
       f"reaches the graph: worst={worst_spawn:.0%}")
 

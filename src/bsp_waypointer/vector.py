@@ -287,6 +287,164 @@ def segment_intersects_aabb(
     return True
 
 
+_Tuple3 = Tuple[float, float, float]
+_WORLD_AXES: Tuple[_Tuple3, ...] = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+
+
+def _unit(v: _Tuple3) -> Optional[_Tuple3]:
+    length = math.sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2])
+    if length < 1e-9:
+        return None
+    return (v[0] / length, v[1] / length, v[2] / length)
+
+
+def _cross(a: _Tuple3, b: _Tuple3) -> _Tuple3:
+    return (
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    )
+
+
+def _direction_key(v: _Tuple3) -> _Tuple3:
+    """A direction and its opposite share one key (both are one SAT axis)."""
+    for c in v:
+        if abs(c) > 1e-6:
+            if c < 0:
+                v = (-v[0], -v[1], -v[2])
+            break
+    return (round(v[0], 5), round(v[1], 5), round(v[2], 5))
+
+
+class ConvexHull:
+    """
+    A convex solid given by its vertices, for separating-axis tests.
+
+    Built from the triangles of one convex collision piece (an IVP ledge
+    of a prop's .phy). The solid tested is the convex hull of the
+    vertices, so a piece that is not quite convex is tested as its hull:
+    never smaller than the piece. Face normals and edge directions only
+    supply candidate axes, and their sign does not matter, so the
+    triangles' winding is irrelevant.
+
+    The candidate axes that do not depend on a swept box's path (the face
+    normals, and the edges crossed with the world axes) are kept with the
+    hull's extent along each, so a test projects only the box on them.
+    """
+
+    __slots__ = ("vertices", "edges", "mins", "maxs", "fixed_axes")
+
+    def __init__(self, vertices: List[_Tuple3], normals: List[_Tuple3], edges: List[_Tuple3]):
+        self.vertices = vertices
+        self.edges = edges
+        self.mins = tuple(min(v[k] for v in vertices) for k in range(3))
+        self.maxs = tuple(max(v[k] for v in vertices) for k in range(3))
+        seen = {_direction_key(w) for w in _WORLD_AXES}
+        fixed: List[Tuple[float, float, float, float, float]] = []
+        candidates = list(normals) + [
+            c for e in edges for c in (_unit(_cross(e, w)) for w in _WORLD_AXES) if c is not None
+        ]
+        for n in candidates:
+            key = _direction_key(n)
+            if key in seen:
+                continue
+            seen.add(key)
+            proj = [v[0] * n[0] + v[1] * n[1] + v[2] * n[2] for v in vertices]
+            fixed.append((n[0], n[1], n[2], min(proj), max(proj)))
+        self.fixed_axes = fixed
+
+    @classmethod
+    def from_triangles(
+        cls, triangles: List[Tuple[Vector3, Vector3, Vector3]]
+    ) -> Optional["ConvexHull"]:
+        """Build from triangles (Vector3 corners); None when empty."""
+        vertices: List[_Tuple3] = []
+        normals: List[_Tuple3] = []
+        edges: List[_Tuple3] = []
+        seen_v, seen_n, seen_e = set(), set(), set()
+        for tri in triangles:
+            pts = [(v.x, v.y, v.z) for v in tri]
+            for q in pts:
+                key = (round(q[0], 3), round(q[1], 3), round(q[2], 3))
+                if key not in seen_v:
+                    seen_v.add(key)
+                    vertices.append(q)
+            a, b, c = pts
+            ab = (b[0] - a[0], b[1] - a[1], b[2] - a[2])
+            ac = (c[0] - a[0], c[1] - a[1], c[2] - a[2])
+            n = _unit(_cross(ab, ac))
+            if n is not None:
+                key = _direction_key(n)
+                if key not in seen_n:
+                    seen_n.add(key)
+                    normals.append(n)
+            for p0, p1 in ((a, b), (b, c), (c, a)):
+                e = _unit((p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]))
+                if e is not None:
+                    key = _direction_key(e)
+                    if key not in seen_e:
+                        seen_e.add(key)
+                        edges.append(e)
+        if not vertices:
+            return None
+        return cls(vertices, normals, edges)
+
+
+def swept_box_intersects_hull(
+    start: Vector3,
+    end: Vector3,
+    half_extents: Vector3,
+    hull: ConvexHull,
+    margin: float = 0.5,
+) -> bool:
+    """
+    Whether an axis-aligned box swept from `start` to `end` (its centres)
+    passes into a convex hull by more than `margin`.
+
+    Exact separating-axis test between the swept box (the Minkowski sum of
+    the segment and the box: the volume a trace of that box covers) and
+    the hull. Candidate axes: the world axes, the hull's face normals and
+    its edges crossed with the world axes (all kept by the hull), then
+    the segment crossed with the world axes and with the hull's edges.
+    """
+    hx, hy, hz = half_extents.x, half_extents.y, half_extents.z
+    ax, ay, az = start.x, start.y, start.z
+    bx, by, bz = end.x, end.y, end.z
+
+    # World axes first: the bounds test rejects most pairs at once
+    for lo_a, lo_b, h, k in ((ax, bx, hx, 0), (ay, by, hy, 1), (az, bz, hz, 2)):
+        if max(lo_a, lo_b) + h <= hull.mins[k] + margin:
+            return False
+        if hull.maxs[k] <= min(lo_a, lo_b) - h + margin:
+            return False
+
+    for nx, ny, nz, v_lo, v_hi in hull.fixed_axes:
+        pa = ax * nx + ay * ny + az * nz
+        pb = bx * nx + by * ny + bz * nz
+        r = hx * abs(nx) + hy * abs(ny) + hz * abs(nz)
+        if max(pa, pb) + r <= v_lo + margin or v_hi <= min(pa, pb) - r + margin:
+            return False
+
+    d = _unit((bx - ax, by - ay, bz - az))
+    if d is None:
+        return True
+    path_axes = [_cross(d, w) for w in _WORLD_AXES] + [_cross(e, d) for e in hull.edges]
+    for n in path_axes:
+        n = _unit(n)
+        if n is None:
+            continue
+        nx, ny, nz = n
+        pa = ax * nx + ay * ny + az * nz
+        pb = bx * nx + by * ny + bz * nz
+        r = hx * abs(nx) + hy * abs(ny) + hz * abs(nz)
+        lo = min(pa, pb) - r
+        hi = max(pa, pb) + r
+        proj = [v[0] * nx + v[1] * ny + v[2] * nz for v in hull.vertices]
+        if hi <= min(proj) + margin or max(proj) <= lo + margin:
+            return False
+    return True
+
+
 def line_segment_intersection_2d(
     p1: Vector3, p2: Vector3, p3: Vector3, p4: Vector3
 ) -> Optional[Vector3]:

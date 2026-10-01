@@ -97,12 +97,13 @@ class TestRCWWriterOutput:
     """Byte-level assertions against a file the writer actually produced."""
 
     def _write(self, tmp_path, waypoints=None, **kw):
-        out = tmp_path / "test_map.rcw"
+        map_name = kw.pop("map_name", "dm_lockdown")
+        out = tmp_path / f"{map_name}.rcw"
         writer = rcw_writer.RCWWriter()
         writer.write(
             out,
             waypoints if waypoints is not None else _ring(),
-            map_name=kw.pop("map_name", "dm_lockdown"),
+            map_name=map_name,
             author=kw.pop("author", "regression-suite"),
             **kw,
         )
@@ -134,10 +135,14 @@ class TestRCWWriterOutput:
             (count,) = struct.unpack("<i", f.read(4))
         assert count == 5
 
-    def test_has_visibility_sets_header_flag_bit_0(self, tmp_path):
-        _, data = self._write(tmp_path, has_visibility=True)
+    def test_visibility_bit_is_never_set(self, tmp_path):
+        """waypointer-rcbot#10: bit 0 makes RCBot3 read aux_data/<mod>/<map>.rcv,
+        which this tool never writes (a stale one would be trusted)."""
+        _, data = self._write(tmp_path)
         _, _, flags = struct.unpack_from("<iii", data, 80)
-        assert flags & 1 == 1
+        assert flags == 0
+        with pytest.raises(TypeError):
+            self._write(tmp_path, has_visibility=True)
 
     def test_author_block_is_64_bytes_after_the_92_byte_header(self, tmp_path):
         _, data = self._write(tmp_path, author="regression-suite")
@@ -214,7 +219,7 @@ class TestRCWValidatorRoundTrip:
 
     def test_round_trip_through_validator(self, tmp_path):
         validator = pytest.importorskip("bsp_waypointer.rcw_validator")
-        out = tmp_path / "rt.rcw"
+        out = tmp_path / "dm_rt.rcw"
         rcw_writer.RCWWriter().write(out, _ring(6), map_name="dm_rt",
                                      author="regression-suite")
         stats = validator.validate(out)
@@ -269,3 +274,50 @@ class TestManagerCallContract:
         )
         assert out.exists()
         assert out.read_bytes()[16:80].split(b"\x00")[0] == b"dm_contract"
+
+
+class TestWriterRefusesWhatRCBot3Rejects:
+    """waypointer-rcbot#9: the writer refuses a file RCBot3's loader would reject."""
+
+    def _w(self, tmp_path, wps, map_name="dm_refuse"):
+        rcw_writer.RCWWriter().write(tmp_path / f"{map_name or 'x'}.rcw", wps, map_name=map_name)
+
+    def test_map_name_is_required(self, tmp_path):
+        with pytest.raises(TypeError):
+            rcw_writer.RCWWriter().write(tmp_path / "x.rcw", _ring(3))
+        for bad in ("", "m" * 64, "dm_\x00x"):
+            with pytest.raises(ValueError):
+                self._w(tmp_path, _ring(3), map_name=bad)
+        self._w(tmp_path, _ring(3), map_name="m" * 63)
+
+    def test_waypoint_and_path_limits(self, tmp_path):
+        with pytest.raises(ValueError, match="2048"):
+            self._w(tmp_path, _ring(2049))
+        wps = _ring(300)
+        wps[0].connections = list(range(1, 257))
+        with pytest.raises(ValueError, match="255"):
+            self._w(tmp_path, wps)
+
+    def test_bad_paths_and_non_finite_values(self, tmp_path):
+        wps = _ring(3)
+        wps[0].connections = [0, 1]
+        with pytest.raises(ValueError, match="self"):
+            self._w(tmp_path, wps)
+        wps = _ring(3)
+        wps[1].radius = float("nan")
+        with pytest.raises(ValueError, match="non-finite"):
+            self._w(tmp_path, wps)
+
+
+class TestSidecars:
+    """waypointer-rcbot#10: no .rcv at all; .rcm only on request."""
+
+    def test_defaults_write_only_the_rcw(self, tmp_path):
+        rcw_writer.write_waypoints(tmp_path / "dm_side.rcw", _ring(3), map_name="dm_side")
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["dm_side.rcw"]
+        assert not hasattr(rcw_writer, "RCVWriter")
+
+    def test_rcm_on_request_says_rcbot3_ignores_it(self, tmp_path):
+        rcw_writer.write_waypoints(tmp_path / "dm_side.rcw", _ring(3), map_name="dm_side",
+                                   include_metadata=True)
+        assert "not read by RCBot3" in (tmp_path / "dm_side.rcm").read_text()

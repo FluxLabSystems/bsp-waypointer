@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from .bsp_parser import BSPFile
-from .vector import Vector3
+from .vector import ConvexHull, Vector3
 
 # Studio model magic ("IDST") and supported versions (HL2-era 44-49)
 MDL_MAGIC = 0x54534449
@@ -69,6 +69,10 @@ class ModelGeometry:
     triangles: List[Tuple[Vector3, Vector3, Vector3]] = field(default_factory=list)
     exact: bool = True  # False only for heuristic callers, never set here
     source: str = ""  # "pakfile" | "loose" | "vpk"
+    # The same collision as convex pieces (one triangle list per IVP
+    # ledge), only when the whole .phy parsed: empty whenever any solid
+    # or ledge was skipped, so a path test never sees part of a prop
+    pieces: List[List[Tuple[Vector3, Vector3, Vector3]]] = field(default_factory=list)
 
     @property
     def has_collision_mesh(self) -> bool:
@@ -104,6 +108,31 @@ def rotate_point(m: Tuple[Tuple[float, float, float], ...], v: Vector3) -> Vecto
         m[1][0] * v.x + m[1][1] * v.y + m[1][2] * v.z,
         m[2][0] * v.x + m[2][1] * v.y + m[2][2] * v.z,
     )
+
+
+def world_collision_hulls(
+    geo: "ModelGeometry", angles: Vector3, origin: Vector3
+) -> List[ConvexHull]:
+    """
+    The prop's collision as world-space convex hulls, one per piece.
+
+    Empty when the model has no complete convex collision (the caller then
+    keeps the prop's box). Each piece is tested as the convex hull of its
+    vertices, never smaller than the piece.
+    """
+    if not geo.pieces:
+        return []
+    m = angle_matrix(angles)
+    hulls: List[ConvexHull] = []
+    for piece in geo.pieces:
+        world = [
+            tuple(rotate_point(m, v) + origin for v in tri) for tri in piece
+        ]
+        hull = ConvexHull.from_triangles(world)
+        if hull is None:
+            return []
+        hulls.append(hull)
+    return hulls
 
 
 def transform_bounds(
@@ -263,9 +292,15 @@ def _ivp_point_to_hl(kx: float, ky: float, kz: float) -> Vector3:
 
 
 def _parse_compact_ledge(
-    data: bytes, ledge_start: int
+    data: bytes, ledge_start: int, strict: bool = False
 ) -> List[Tuple[Vector3, Vector3, Vector3]]:
-    """Parse one IVP compact ledge (a convex piece) into HL-space triangles."""
+    """
+    Parse one IVP compact ledge (a convex piece) into HL-space triangles.
+
+    With strict, a ledge that does not parse whole (a truncated triangle
+    table or a point out of range) gives an empty list instead of the
+    triangles that did parse.
+    """
     if ledge_start + 16 > len(data):
         return []
 
@@ -289,6 +324,8 @@ def _parse_compact_ledge(
     for t in range(n_triangles):
         off = tri_base + t * 16
         if off + 16 > len(data):
+            if strict:
+                return []
             break
         # uint header, then 3 edges; each edge's low 16 bits are the
         # start point index
@@ -297,6 +334,8 @@ def _parse_compact_ledge(
         p1 = read_point(e1 & 0xFFFF)
         p2 = read_point(e2 & 0xFFFF)
         if p0 is None or p1 is None or p2 is None:
+            if strict:
+                return []
             continue
         triangles.append((p0, p1, p2))
 
@@ -308,29 +347,34 @@ def _walk_ledge_tree(
     node_start: int,
     ledges_out: List[int],
     depth: int = 0,
-) -> None:
+) -> bool:
     """
     Walk the IVP compact ledge tree collecting leaf ledge offsets.
 
     Node layout (28 bytes): int offset_right_node (0 = leaf),
     int offset_compact_ledge (relative to node), float center[3],
     float radius, byte box_sizes[3], byte free.
+
+    Returns False when part of the tree could not be walked.
     """
     if depth > 64 or node_start < 0 or node_start + 28 > len(data):
-        return
+        return False
 
     offset_right, offset_ledge = struct.unpack_from("<ii", data, node_start)
 
     if offset_right == 0:
         # Leaf: references a compact ledge
         ledge = node_start + offset_ledge
-        if 0 <= ledge < len(data) and ledge not in ledges_out:
+        if not 0 <= ledge < len(data):
+            return False
+        if ledge not in ledges_out:
             ledges_out.append(ledge)
-        return
+        return True
 
     # Interior node: left child follows immediately, right child at offset
-    _walk_ledge_tree(data, node_start + 28, ledges_out, depth + 1)
-    _walk_ledge_tree(data, node_start + offset_right, ledges_out, depth + 1)
+    left = _walk_ledge_tree(data, node_start + 28, ledges_out, depth + 1)
+    right = _walk_ledge_tree(data, node_start + offset_right, ledges_out, depth + 1)
+    return left and right
 
 
 def parse_phy_triangles(data: bytes) -> List[Tuple[Vector3, Vector3, Vector3]]:
@@ -340,6 +384,22 @@ def parse_phy_triangles(data: bytes) -> List[Tuple[Vector3, Vector3, Vector3]]:
     Returns an empty list for mopp (concave static mesh) solids or any
     structural surprise — callers fall back to .mdl hull bounds.
     """
+    return [tri for ledge in parse_phy_ledges(data) for tri in ledge]
+
+
+def parse_phy_ledges(
+    data: bytes,
+    strict: bool = False,
+) -> List[List[Tuple[Vector3, Vector3, Vector3]]]:
+    """
+    Parse a .phy file into its convex pieces (IVP compact ledges), each a
+    list of HL-space triangles. The union of the pieces is the collision
+    the engine gives a solid prop; parse_phy_triangles flattens them.
+
+    With strict, anything skipped (a mopp solid, a truncated solid, ledge
+    tree or ledge) gives an empty list: a caller that tests a path against
+    the pieces must not be handed part of the collision as all of it.
+    """
     if len(data) < 16:
         return []
 
@@ -347,16 +407,20 @@ def parse_phy_triangles(data: bytes) -> List[Tuple[Vector3, Vector3, Vector3]]:
     if header_size < 16 or solid_count <= 0 or solid_count > 64:
         return []
 
-    triangles: List[Tuple[Vector3, Vector3, Vector3]] = []
+    ledges: List[List[Tuple[Vector3, Vector3, Vector3]]] = []
     pos = header_size
 
     for _ in range(solid_count):
         if pos + 4 > len(data):
+            if strict:
+                return []
             break
         (solid_size,) = struct.unpack_from("<i", data, pos)
         solid_start = pos + 4
         pos = solid_start + solid_size
         if solid_size < 76 or solid_start + solid_size > len(data):
+            if strict:
+                return []
             continue
 
         # compactsurfaceheader_t: id, version, modelType, surfaceSize,
@@ -366,10 +430,14 @@ def parse_phy_triangles(data: bytes) -> List[Tuple[Vector3, Vector3, Vector3]]:
         )
         if model_type != 0:
             # Mopp / non-polyhedral solid; no convex ledges to read
+            if strict:
+                return []
             continue
 
         ivp_start = solid_start + 28
         if ivp_start + 48 > len(data):
+            if strict:
+                return []
             continue
 
         # ivpcompactsurface_t: mass_center[3], rotation_inertia[3],
@@ -378,12 +446,18 @@ def parse_phy_triangles(data: bytes) -> List[Tuple[Vector3, Vector3, Vector3]]:
         root = ivp_start + ledgetree_root
 
         ledge_offsets: List[int] = []
-        _walk_ledge_tree(data, root, ledge_offsets)
+        walked = _walk_ledge_tree(data, root, ledge_offsets)
+        if strict and (not walked or not ledge_offsets):
+            return []
 
         for ledge_start in ledge_offsets:
-            triangles.extend(_parse_compact_ledge(data, ledge_start))
+            ledge = _parse_compact_ledge(data, ledge_start, strict)
+            if ledge:
+                ledges.append(ledge)
+            elif strict:
+                return []
 
-    return triangles
+    return ledges
 
 
 class ModelResolver:
@@ -536,12 +610,18 @@ class ModelResolver:
         mins, maxs = bounds
 
         triangles: List[Tuple[Vector3, Vector3, Vector3]] = []
+        pieces: List[List[Tuple[Vector3, Vector3, Vector3]]] = []
         phy_data, _phy_source = self._read_content_file(rel[:-4] + ".phy")
         if phy_data is not None:
             try:
-                triangles = parse_phy_triangles(phy_data)
+                pieces = parse_phy_ledges(phy_data, strict=True)
+                if pieces:
+                    triangles = [tri for piece in pieces for tri in piece]
+                else:
+                    triangles = parse_phy_triangles(phy_data)
             except Exception:
                 triangles = []
+                pieces = []
 
             if triangles:
                 # Cross-check the collision mesh against the hull bounds;
@@ -573,6 +653,7 @@ class ModelResolver:
                     or t_maxs.z > maxs.z + slack.z
                 ):
                     triangles = []
+                    pieces = []
                 else:
                     # Physics mesh is authoritative for bounds when sane
                     mins, maxs = t_mins, t_maxs
@@ -583,6 +664,7 @@ class ModelResolver:
             maxs=maxs,
             triangles=triangles,
             source=source,
+            pieces=pieces,
         )
 
     def stats(self) -> Tuple[int, int]:

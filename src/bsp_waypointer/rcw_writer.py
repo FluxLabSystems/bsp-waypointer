@@ -6,22 +6,59 @@ Writes waypoints to RCBot3's .rcw waypoint file format.
 
 from __future__ import annotations
 
+import logging
+import math
+import os
 import struct
 from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, List, Optional
 
-from .constants import HL2DMWaypointSubType, WaypointFlag
+from .constants import (
+    MAX_PATHS_PER_WAYPOINT,
+    MAX_WAYPOINTS,
+    HL2DMWaypointSubType,
+    WaypointFlag,
+)
 from .waypoint_converter import Waypoint
+
+logger = logging.getLogger(__name__)
 
 
 # RCW file format constants (RCBot3)
 RCW_MAGIC = b"RCBot3\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"  # 16 bytes, null-padded
 RCW_VERSION = 5  # RCBot3 waypoint version
-MAX_WAYPOINT_CONNECTIONS = 8  # Maximum connections per waypoint in file format
+MAX_WAYPOINT_CONNECTIONS = MAX_PATHS_PER_WAYPOINT  # RCBot3 CWaypoint::MAX_LOAD_PATHS
 HEADER_SIZE = 92  # Total header size in bytes
 MAP_NAME_SIZE = 64  # Map name field size
 AUTHOR_SIZE = 32  # Author/ModifiedBy field size
+
+
+def check_writable(waypoints: List[Waypoint], map_name: str) -> None:
+    """Refuse, before a byte is written, anything RCBot3's loader rejects.
+
+    Raises ValueError. RCBot3 compares the header map name with the map it
+    loads (case-insensitively), keeps 63 bytes of it, accepts at most
+    MAX_WAYPOINTS waypoints and MAX_PATHS_PER_WAYPOINT paths per waypoint,
+    and refuses non-finite origins and radii.
+    """
+    if not isinstance(map_name, str) or not map_name:
+        raise ValueError("map_name is required: RCBot3 refuses a .rcw whose map name does not match")
+    raw = map_name.encode("utf-8")
+    if len(raw) > MAP_NAME_SIZE - 1 or b"\x00" in raw:
+        raise ValueError(f"map_name {map_name!r} must be 1..{MAP_NAME_SIZE - 1} bytes with no NUL")
+    n = len(waypoints)
+    if n > MAX_WAYPOINTS:
+        raise ValueError(f"{n} waypoints; RCBot3 loads at most {MAX_WAYPOINTS}")
+    for i, wp in enumerate(waypoints):
+        paths = [p for p in wp.connections if p >= 0]
+        if len(paths) > MAX_PATHS_PER_WAYPOINT:
+            raise ValueError(f"wpt {i}: {len(paths)} paths; RCBot3 loads at most {MAX_PATHS_PER_WAYPOINT}")
+        if any(p >= n or p == i for p in paths) or len(set(paths)) != len(paths):
+            raise ValueError(f"wpt {i}: path list {paths} has an out-of-range, self or duplicate entry")
+        o = wp.origin
+        if not all(math.isfinite(v) for v in (o.x, o.y, o.z, wp.radius)):
+            raise ValueError(f"wpt {i}: non-finite origin or radius")
 
 
 @dataclass
@@ -73,9 +110,8 @@ class RCWWriter:
         self,
         filepath: str | Path,
         waypoints: List[Waypoint],
-        map_name: str = "",
+        map_name: str,
         author: str = "BSP-Waypoint-Generator-HL2DM",
-        has_visibility: bool = False,
         validate: bool = True,
     ) -> None:
         """
@@ -84,13 +120,15 @@ class RCWWriter:
         Args:
             filepath: Output file path
             waypoints: List of waypoints to write
-            map_name: Map name (optional, for metadata)
-            author: Author name (optional, for metadata)
-            has_visibility: Set the header bit indicating an
-                accompanying .rcv visibility file
-            validate: Re-parse and validate the written file against the
-                RCBot3 connectivity contract (raises ValidationError and
-                removes the file on failure)
+            map_name: The map RCBot3 will load the file for (required;
+                the loader refuses a header naming another map)
+            author: Author name (truncated to 31 bytes)
+            validate: Re-parse the staged file with rcw_validator (loader
+                checks, load-time repair, graph contract); on failure raise
+                ValidationError and leave any existing file untouched
+
+        The header's visibility bit is never set, so RCBot3 computes its own
+        visibility table instead of reading a .rcv.
         """
         filepath = Path(filepath)
 
@@ -98,16 +136,23 @@ class RCWWriter:
         if filepath.suffix.lower() != ".rcw":
             filepath = filepath.with_suffix(".rcw")
 
+        check_writable(waypoints, map_name)
+        if filepath.stem.lower() != map_name.lower():
+            logger.warning(
+                "%s is named for map %r but its header says %r; RCBot3 opens "
+                "<map>.rcw, so it will not load this file until renamed",
+                filepath.name, filepath.stem, map_name,
+            )
+
         # Write to a temp file first: the existing waypoint file must
         # survive untouched if generation or validation fails
-        import os
         tmp_path = filepath.with_suffix(".rcw.tmp")
         try:
             with open(tmp_path, "wb") as f:
                 self._file = f
 
                 # Write header (92 bytes)
-                self._write_header(len(waypoints), map_name, has_visibility)
+                self._write_header(len(waypoints), map_name)
 
                 # Write author info (64 bytes)
                 self._write_author_info(author)
@@ -119,8 +164,8 @@ class RCWWriter:
             if validate:
                 # Stage D self-validation: a hard error beats a silently
                 # broken file
-                from .rcw_validator import validate as validate_rcw
-                validate_rcw(tmp_path)
+                from .rcw_validator import validate_bytes
+                validate_bytes(tmp_path.read_bytes(), expected_map=map_name)
 
             os.replace(tmp_path, filepath)
         except Exception:
@@ -130,9 +175,7 @@ class RCWWriter:
                 pass
             raise
 
-    def _write_header(
-        self, num_waypoints: int, map_name: str = "", has_visibility: bool = False
-    ) -> None:
+    def _write_header(self, num_waypoints: int, map_name: str) -> None:
         """Write file header (92 bytes)."""
         # szFileType: "RCBot3" + padding (16 bytes)
         self._file.write(RCW_MAGIC)
@@ -148,8 +191,10 @@ class RCWWriter:
         # iNumWaypoints (4 bytes int32 LE)
         self._file.write(struct.pack("<I", num_waypoints))
 
-        # iFlags (4 bytes int32 LE): bit 0 = visibility file accompanies
-        self._file.write(struct.pack("<I", 1 if has_visibility else 0))
+        # iFlags (4 bytes int32 LE): always 0. Bit 0 (W_FILE_FL_VISIBILITY)
+        # makes RCBot3 read <rcbot>/aux_data/<mod>/<map>.rcv instead of
+        # computing visibility; this tool never produces that file.
+        self._file.write(struct.pack("<I", 0))
 
     def _write_author_info(self, author: str = "BSP-Waypointer") -> None:
         """Write author info (64 bytes)."""
@@ -218,17 +263,12 @@ class RCWExtendedWriter(RCWWriter):
         self,
         filepath: str | Path,
         waypoints: List[Waypoint],
-        map_name: str = "",
+        map_name: str,
         author: str = "BSP-Waypoint-Generator-HL2DM",
-        has_visibility: bool = False,
         validate: bool = True,
     ) -> None:
-        """Write waypoints and metadata."""
-        # Write main waypoint file
-        super().write(
-            filepath, waypoints, map_name, author,
-            has_visibility=has_visibility, validate=validate,
-        )
+        """Write waypoints and the .rcm sidecar (for people and tools; RCBot3 never reads it)."""
+        super().write(filepath, waypoints, map_name, author, validate=validate)
 
         # Write metadata file
         self._write_metadata(filepath, waypoints, map_name, author)
@@ -246,7 +286,7 @@ class RCWExtendedWriter(RCWWriter):
 
         with open(meta_path, "w") as f:
             # Header
-            f.write(f"// RCBot3 Waypoint Metadata\n")
+            f.write(f"// bsp-waypointer sidecar metadata (not read by RCBot3)\n")
             f.write(f"// Generated by BSP Waypoint Generator for HL2DM\n")
             f.write(f"// Map: {map_name}\n")
             f.write(f"// Author: {author}\n")
@@ -349,92 +389,12 @@ class TextWaypointWriter:
         return "|".join(names)
 
 
-class RCVWriter:
-    """
-    Writes visibility table (.rcv) for waypoint line-of-sight.
-
-    The visibility table pre-computes which waypoints can see each other,
-    improving bot targeting performance.
-    """
-
-    def write(
-        self,
-        filepath: str | Path,
-        waypoints: List[Waypoint],
-    ) -> None:
-        """
-        Write visibility table.
-
-        For now, this generates a simple table based on connections
-        and distance. Full implementation would use ray tracing.
-        """
-        filepath = Path(filepath)
-
-        # Ensure .rcv extension
-        if filepath.suffix.lower() != ".rcv":
-            filepath = filepath.with_suffix(".rcv")
-
-        num_waypoints = len(waypoints)
-
-        # Create visibility matrix (1 bit per pair)
-        # For simplicity, mark connected and nearby waypoints as visible
-        visibility = self._compute_visibility(waypoints)
-
-        with open(filepath, "wb") as f:
-            # Header: number of waypoints
-            f.write(struct.pack("<I", num_waypoints))
-
-            # Write visibility bits (packed)
-            for i in range(num_waypoints):
-                # Pack visibility for waypoint i
-                bits = 0
-                byte_count = (num_waypoints + 7) // 8
-
-                bytes_data = bytearray(byte_count)
-                for j in range(num_waypoints):
-                    if visibility[i][j]:
-                        bytes_data[j // 8] |= 1 << (j % 8)
-
-                f.write(bytes_data)
-
-    def _compute_visibility(self, waypoints: List[Waypoint]) -> List[List[bool]]:
-        """Compute visibility matrix."""
-        n = len(waypoints)
-        visibility = [[False] * n for _ in range(n)]
-
-        for i, wp_a in enumerate(waypoints):
-            # Self is always visible
-            visibility[i][i] = True
-
-            # Connected waypoints are visible
-            for j in wp_a.connections:
-                if j < n:
-                    visibility[i][j] = True
-                    visibility[j][i] = True
-
-            # Nearby waypoints within line of sight range
-            for j, wp_b in enumerate(waypoints):
-                if i == j:
-                    continue
-
-                dist = wp_a.origin.distance_to(wp_b.origin)
-                height_diff = abs(wp_a.origin.z - wp_b.origin.z)
-
-                # Simple visibility: within 1024 units and similar height
-                if dist < 1024 and height_diff < 128:
-                    visibility[i][j] = True
-                    visibility[j][i] = True
-
-        return visibility
-
-
 def write_waypoints(
     filepath: str | Path,
     waypoints: List[Waypoint],
-    map_name: str = "",
+    map_name: str,
     author: str = "BSP-Waypoint-Generator-HL2DM",
-    include_metadata: bool = True,
-    include_visibility: bool = False,
+    include_metadata: bool = False,
     debug_text: bool = False,
 ) -> None:
     """
@@ -443,10 +403,9 @@ def write_waypoints(
     Args:
         filepath: Output file path (without extension)
         waypoints: List of waypoints
-        map_name: Map name for metadata
+        map_name: The map RCBot3 will load the file for (required)
         author: Author name for metadata
-        include_metadata: Write .rcm metadata file
-        include_visibility: Write .rcv visibility file
+        include_metadata: Also write the .rcm sidecar (RCBot3 does not read it)
         debug_text: Write .txt debug file
     """
     filepath = Path(filepath)
@@ -457,15 +416,7 @@ def write_waypoints(
     else:
         writer = RCWWriter()
 
-    writer.write(
-        filepath, waypoints, map_name, author,
-        has_visibility=include_visibility,
-    )
-
-    # Write visibility table
-    if include_visibility:
-        vis_writer = RCVWriter()
-        vis_writer.write(filepath, waypoints)
+    writer.write(filepath, waypoints, map_name, author)
 
     # Write debug text
     if debug_text:
