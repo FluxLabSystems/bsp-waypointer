@@ -1255,6 +1255,19 @@ class HL2DMWaypointConverter:
         """Calculate priority score for a waypoint."""
         priority = 0
 
+        # A player spawn, first: is_spawn is the only mark a spawn is
+        # guaranteed to keep. _place_spawn_waypoints merges onto an existing
+        # waypoint when one is within MIN_WAYPOINT_DISTANCE, and _add_waypoint
+        # only takes the incoming metadata when its weapon_priority is
+        # strictly higher -- SPAWN_POINT carries 0, so a spawn merged into a
+        # plain navmesh sample keeps is_spawn and loses the subtype. Scoring
+        # only the subtype let this pass cull such a spawn, while the
+        # connectivity pass (which reads "is_spawn or subtype == SPAWN_POINT")
+        # still needs every spawn to choose the main component. The two passes
+        # now mean the same thing by "a spawn".
+        if wp.is_spawn:
+            priority += 2000
+
         # Entity waypoints are high priority
         if wp.metadata.subtype != HL2DMWaypointSubType.SUBTYPE_NONE:
             priority += 1000
