@@ -227,7 +227,19 @@ W_FL_LIFT = 1 << 23
 W_FL_FALL = 1 << 25         # Fall hazard
 W_FL_BREAKABLE = 1 << 26
 W_FL_USE = 1 << 30          # Requires +USE
+# MC2 ADR-0232 (CTF):
+W_FL_NOBLU = 1 << 6         # inside a trigger_hurt that hurts team 3 only: team 3 barred
+W_FL_NORED = 1 << 7         # inside a trigger_hurt that hurts team 2 only: team 2 barred
+W_FL_FLAG = 1 << 4          # --ctf-layout: a flag stand
+W_FL_CAPPOINT = 1 << 5      # --ctf-layout: a scoring zone or a control point (area = index + 1)
+W_FL_DEFEND = 1 << 18       # --ctf-layout: ground around a team's own stand
 ```
+
+A `trigger_hurt` whose `filtername` is a `filter_activator_team` hurts one team only (a CTF map's
+spawn-room guard). It is not a hazard to the graph: the waypoints inside it get the team bar
+(`W_FL_NORED` bars team 2, `W_FL_NOBLU` team 3, by engine team number as RCBot3 and TF2 read them)
+and the other team routes through. `--ctf-layout FILE|DIR` reads MC2's `<map>.ctf.txt` and flags
+the objectives on waypoints already in the graph; it adds none (`ctf_layout.py`).
 
 ### The RCBot3 Output Contract
 - **Edges are proven.** Apart from the explicit entity edges (teleporter, ladder rungs and

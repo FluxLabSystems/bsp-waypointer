@@ -144,6 +144,16 @@ Examples:
         action="store_true",
         help="Skip entity parsing (geometry only)",
     )
+    entities.add_argument(
+        "--ctf-layout",
+        type=Path,
+        default=None,
+        help=(
+            "An MC2 CTF layout (<map>.ctf.txt), or a directory of them: flag the "
+            "flag stands W_FL_FLAG, the scoring zones and control points "
+            "W_FL_CAPPOINT, and the ground around each stand W_FL_DEFEND"
+        ),
+    )
 
     # Agent parameters
     agent = parser.add_argument_group("Agent Parameters")
@@ -320,6 +330,7 @@ def generate_waypoints(
     metadata: bool = False,
     verbose: bool = False,
     game_dirs: Optional[List[Path]] = None,
+    ctf_layout: Optional[Path] = None,
 ) -> int:
     """
     Generate waypoints from a BSP file.
@@ -461,6 +472,23 @@ def generate_waypoints(
         )
         waypoints = converter.convert(navmesh, entities, ladders)
         logger.info(f"  Total waypoints: {len(waypoints)}")
+        team_hz = getattr(converter, "team_hazard_waypoints", 0)
+        if team_hz:
+            logger.info(f"  Team-only hazards: {team_hz} waypoint(s) barred to one team")
+
+        if ctf_layout is not None:
+            from .ctf_layout import apply_ctf_layout, load_layout, resolve_layout_path
+
+            layout_path = resolve_layout_path(Path(ctf_layout), map_name)
+            if layout_path is None:
+                logger.info(f"  CTF layout: none for {map_name}")
+            else:
+                counts = apply_ctf_layout(waypoints, load_layout(layout_path))
+                logger.info(
+                    f"  CTF layout {layout_path.name}: {counts['flag']} flag, "
+                    f"{counts['cappoint']} capture, {counts['defend']} defend waypoint(s)"
+                    + (f"; {counts['unplaced']} objective(s) with no waypoint near" if counts["unplaced"] else "")
+                )
         report = getattr(converter, "connectivity_report", None)
         if report:
             log_connectivity_report(report, len(waypoints))
@@ -548,6 +576,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         metadata=args.metadata,
         verbose=args.verbose,
         game_dirs=args.game_dir,
+        ctf_layout=args.ctf_layout,
     )
 
 

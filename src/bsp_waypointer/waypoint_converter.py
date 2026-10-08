@@ -115,6 +115,9 @@ class Waypoint:
     # higher-priority entity replaces (and which a spawn merged into a plain
     # navmesh sample never receives): the main-component choice needs every spawn.
     is_spawn: bool = False
+    # RCBot3's per-waypoint area id (iArea); 0 = none. Set by --ctf-layout on
+    # control points (index + 1).
+    area: int = 0
 
     def has_flag(self, flag: WaypointFlag) -> bool:
         """Check if waypoint has a specific flag."""
@@ -220,6 +223,16 @@ class HL2DMWaypointConverter:
             for h in getattr(entities, "hurt_volumes", [])
             if h.damage >= HAZARD_DAMAGE_THRESHOLD
             and not getattr(h, "start_disabled", False)
+            and not getattr(h, "team", 0)
+        ]
+        # A hazard to one team only (a CTF spawn-room guard) is no obstacle to
+        # the other: it restricts that team's waypoints at the end instead.
+        self._team_hazards = [
+            h
+            for h in getattr(entities, "hurt_volumes", [])
+            if h.damage >= HAZARD_DAMAGE_THRESHOLD
+            and not getattr(h, "start_disabled", False)
+            and getattr(h, "team", 0)
         ]
         self._push_waypoint_links: List[Tuple[int, object]] = []
 
@@ -279,7 +292,33 @@ class HL2DMWaypointConverter:
         # Detect sniper positions
         self._detect_sniper_positions()
 
+        # Team-only hazards: bar the team they hurt from routing through them
+        self._flag_team_hazards()
+
         return self._waypoints
+
+    def _flag_team_hazards(self) -> None:
+        """
+        Mark waypoints inside a one-team hurt volume as barred to that team.
+
+        RCBot3 reads W_FL_NORED and W_FL_NOBLU by engine team number, as TF2
+        does: W_FL_NORED bars team 2 (HL2MP's Combine), W_FL_NOBLU bars team 3
+        (the Rebels). The other team routes through them as normal.
+        """
+        count = 0
+        for hz in getattr(self, "_team_hazards", []):
+            flag = WaypointFlag.W_FL_NORED if hz.team == 2 else WaypointFlag.W_FL_NOBLU
+            for wp in self._waypoints:
+                o = wp.origin
+                if (
+                    hz.mins.x <= o.x <= hz.maxs.x
+                    and hz.mins.y <= o.y <= hz.maxs.y
+                    and hz.mins.z - 8 <= o.z <= hz.maxs.z
+                ):
+                    if not wp.has_flag(flag):
+                        wp.add_flag(flag)
+                        count += 1
+        self.team_hazard_waypoints = count
 
     def _add_waypoint(
         self,
