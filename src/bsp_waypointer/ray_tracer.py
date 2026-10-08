@@ -692,6 +692,98 @@ class BSPRayTracer:
                 result.brush_index = brush_index
 
 
+    # ------------------------------------------------------------------
+    # Brush traces for map analysis
+    # ------------------------------------------------------------------
+
+    def trace_brushes(
+        self,
+        start: Vector3,
+        end: Vector3,
+        mins: Optional[Vector3] = None,
+        maxs: Optional[Vector3] = None,
+        contents_mask: int = int(ContentFlags.CONTENTS_SOLID),
+    ) -> TraceResult:
+        """Sweep a box (a ray when mins/maxs are omitted) against the world brushes.
+
+        Unlike ``trace_hull``, every brush is clipped against the WHOLE
+        segment, so ``fraction`` is along start -> end and ``start_solid``
+        means the start itself is inside a brush; and a box that straddles a
+        node plane visits both sides. ``brush_index`` names the brush hit.
+        Map analysis (``geometry_probe``) uses this; the converter's
+        ``trace_hull`` is left as it is so generated waypoints do not change.
+        Only brushes whose contents meet ``contents_mask`` count.
+        """
+        lo = mins if mins is not None else Vector3(0.0, 0.0, 0.0)
+        hi = maxs if maxs is not None else Vector3(0.0, 0.0, 0.0)
+        result = TraceResult(hit=False, fraction=1.0, end_pos=end)
+        if not self.bsp.nodes:
+            return result
+        centre = Vector3((lo.x + hi.x) * 0.5, (lo.y + hi.y) * 0.5, (lo.z + hi.z) * 0.5)
+        ext = ((hi.x - lo.x) * 0.5, (hi.y - lo.y) * 0.5, (hi.z - lo.z) * 0.5)
+        leaves: List[int] = []
+        self._collect_leaves(0, start + centre, end + centre, ext, leaves)
+        seen = set()
+        for leaf_index in leaves:
+            leaf = self.bsp.leafs[leaf_index]
+            for k in range(leaf.num_leaf_brushes):
+                lb = leaf.first_leaf_brush + k
+                if lb >= len(self.bsp.leaf_brushes):
+                    continue
+                bi = self.bsp.leaf_brushes[lb]
+                if bi in seen or bi >= len(self.bsp.brushes):
+                    continue
+                seen.add(bi)
+                brush = self.bsp.brushes[bi]
+                if not (brush.contents & contents_mask):
+                    continue
+                self._clip_to_brush(brush, bi, start, end, lo, hi, result)
+        if result.start_solid:
+            result.hit = True
+            result.fraction = 0.0
+        if result.fraction < 1.0:
+            result.hit = True
+            result.end_pos = start + (end - start) * result.fraction
+        return result
+
+    def _collect_leaves(
+        self, root: int, start: Vector3, end: Vector3,
+        ext: Tuple[float, float, float], out: List[int],
+    ) -> None:
+        """Leaves a centred box with half-extents ``ext`` touches along start -> end."""
+        stack = [(root, start, end)]
+        while stack:
+            node_index, a, b = stack.pop()
+            if node_index < 0:
+                leaf_index = -1 - node_index
+                if leaf_index < len(self.bsp.leafs):
+                    out.append(leaf_index)
+                continue
+            if node_index >= len(self.bsp.nodes):
+                continue
+            node = self.bsp.nodes[node_index]
+            if node.plane_index >= len(self.bsp.planes):
+                continue
+            plane = self.bsp.planes[node.plane_index]
+            n = plane.normal
+            off = abs(n.x) * ext[0] + abs(n.y) * ext[1] + abs(n.z) * ext[2]
+            d1 = plane.distance_to_point(a)
+            d2 = plane.distance_to_point(b)
+            if d1 >= off + DIST_EPSILON and d2 >= off + DIST_EPSILON:
+                stack.append((node.children[0], a, b))
+            elif d1 < -off - DIST_EPSILON and d2 < -off - DIST_EPSILON:
+                stack.append((node.children[1], a, b))
+            elif off > 0.0 or abs(d1 - d2) < 1e-9:
+                stack.append((node.children[0], a, b))
+                stack.append((node.children[1], a, b))
+            else:
+                frac = max(0.0, min(1.0, d1 / (d1 - d2)))
+                mid = a.lerp(b, frac)
+                near, far = (0, 1) if d1 >= 0 else (1, 0)
+                stack.append((node.children[far], mid, b))
+                stack.append((node.children[near], a, mid))
+
+
 def create_ray_tracer(bsp: BSPFile) -> BSPRayTracer:
     """
     Create a ray tracer for a BSP file.
