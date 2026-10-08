@@ -127,8 +127,8 @@ class TestRayMetrics:
 
 class TestScale:
     @pytest.mark.parametrize("area,name", [
-        (0, "tiny"), (399_999, "tiny"), (400_000, "small"), (3_999_999, "medium"),
-        (9_999_999, "large"), (10_000_000, "huge"),
+        (0, "tiny"), (999_999, "tiny"), (1_000_000, "small"), (2_500_000, "medium"),
+        (6_999_999, "medium"), (14_999_999, "large"), (15_000_000, "huge"),
     ])
     def test_buckets(self, area, name):
         assert scale_bucket(area) == name
@@ -145,3 +145,32 @@ class TestScale:
         ctx = build_context(g, entities(spawns=[spawn(0, 0), spawn(0, 0, 256)]), None)
         assert len(ctx.main) == n  # the upper storey is another component
         assert floor_area_estimate(ctx) == pytest.approx(n * 64.0 * 64.0)
+
+
+class TestSpawnRooms:
+    def test_a_spawn_room_players_drop_out_of_still_counts(self):
+        """A spawn on a one-way entry into main (a flagged source room) reaches main:
+        distances from it run through the entry, and it can found a team base."""
+        from bsp_waypointer.constants import WaypointFlag
+
+        from .analysis_scenes import SceneBuilder
+
+        sb = SceneBuilder()
+        room = sb.add_grid(5, 5)
+        ledge = [sb.add((-200.0 - 64 * k, 128.0, 128.0)) for k in range(3)]
+        sb.chain(ledge)
+        sb.link(ledge[0], room[10], both=False)    # drop down into the room, no way back
+        g = sb.graph()
+        for i in ledge:
+            g.flags[i] = int(WaypointFlag.W_FL_UNREACHABLE)
+        ents = entities(spawns=[spawn(-328.0, 128.0, 128.0, team="combine"),
+                                spawn(256.0, 128.0, team="rebel")])
+        ctx = build_context(g, ents, None)
+        assert ledge[2] in ctx.play and ledge[2] not in ctx.main
+        assert ctx.spawn_nodes() == sorted([ledge[2], room[14]])
+        d = ctx.dist_from([ledge[2]])
+        assert d[room[10]] == pytest.approx(128.0 + (200.0 ** 2 + 128.0 ** 2) ** 0.5, abs=0.1)
+        m = compute_metrics(ctx)
+        assert m["player_spawns"]["in_main"] == 1
+        assert m["spawn_separation"]["min_path"] is not None
+

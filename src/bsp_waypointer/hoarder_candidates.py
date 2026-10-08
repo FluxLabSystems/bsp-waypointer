@@ -89,17 +89,19 @@ def two_means(points: Sequence[Point], iterations: int = 20) -> List[int]:
 def team_bases(ctx: AnalysisContext) -> Tuple[Dict[int, List[int]], str, Dict[int, List[Point]]]:
     """Spawn waypoints per team (2, 3), how they were found, and the spawn origins.
 
-    In order: ``team_spawns`` when both teams have a spawn in the main
-    component; then each ``ctx.base_hints`` label that gives both teams
+    A spawn counts when its waypoint reaches the main component (is in it,
+    or on a one-way entry into it). In order: ``team_spawns`` when both
+    teams have such a spawn; then each ``ctx.base_hints`` label that gives both teams
     (``ctf_spawn_entities``: a CTF mod's spawn entities, which MC2 does not
     spawn players at; ``ctf_layout``: the layout's flag stands);
-    ``split_deathmatch`` when the deathmatch spawns were split in two;
+    ``split_deathmatch`` when the reachable spawns (whatever their team) were
+    split in two;
     ``none`` when no two bases can be formed.
     """
 
     def both(refs: Sequence[Any], label: str):
-        combine = [s for s in refs if s.team == "combine" and s.node in ctx.main]
-        rebel = [s for s in refs if s.team == "rebel" and s.node in ctx.main]
+        combine = [s for s in refs if s.team == "combine" and s.node in ctx.play]
+        rebel = [s for s in refs if s.team == "rebel" and s.node in ctx.play]
         if combine and rebel:
             return ({TEAM_COMBINE: sorted({s.node for s in combine}),
                      TEAM_REBEL: sorted({s.node for s in rebel})},
@@ -119,7 +121,7 @@ def team_bases(ctx: AnalysisContext) -> Tuple[Dict[int, List[int]], str, Dict[in
         found = both([ref for lab, ref in ctx.base_hints if lab == label], label)
         if found:
             return found
-    dm = [s for s in ctx.spawns if s.node in ctx.main]
+    dm = [s for s in ctx.spawns if s.node in ctx.play]
     if len(dm) >= 2:
         labels = two_means([s.origin for s in dm])
         a = [s for s, lab in zip(dm, labels) if lab == 0]
@@ -172,8 +174,8 @@ def hoarder_candidates(
     if base_source in ("ctf_spawn_entities", "ctf_layout"):
         warn.append(f"hoarder: no team spawns MC2 uses; bases from {base_source}")
     if base_source == "split_deathmatch":
-        warn.append("hoarder: no team spawns in the main component; bases split from the "
-                    "deathmatch spawns (a proxy: teams spawn anywhere there)")
+        warn.append("hoarder: no reachable spawns of both teams; bases split from the "
+                    "reachable spawns (a proxy: teams spawn anywhere there)")
     if not bases:
         warn.append("hoarder: fewer than two reachable player spawns; no team bases, no candidates")
         return result

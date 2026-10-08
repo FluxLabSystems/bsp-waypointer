@@ -50,11 +50,14 @@ SPAWN_SNAP = 256.0        # a spawn or pickup belongs to the nearest waypoint th
 FLOOR_LAYER = 96.0        # floor-area grid: vertical cell (one storey)
 
 # map_scale vocabulary (hl2dm_manager MAP_SCALE_VALUES) by floor area, square units.
+# Calibrated on MC2's 681-map corpus (quantiles 10/25/50/75/90 of floor_area:
+# 0.9M / 2.5M / 4.2M / 6.8M / 10.2M): stock dm_lockdown, dm_steamlab and
+# dm_overwatch are medium, dm_runoff huge.
 SCALE_BUCKETS: Tuple[Tuple[str, float], ...] = (
-    ("tiny", 400_000.0),
-    ("small", 1_500_000.0),
-    ("medium", 4_000_000.0),
-    ("large", 10_000_000.0),
+    ("tiny", 1_000_000.0),
+    ("small", 2_500_000.0),
+    ("medium", 7_000_000.0),
+    ("large", 15_000_000.0),
 )
 SCALE_TOP = "huge"
 
@@ -116,6 +119,11 @@ class AnalysisContext:
     rays: Dict[int, List[float]] = field(default_factory=dict)        # 8 clearances
     sky: Dict[int, Optional[bool]] = field(default_factory=dict)
     main_index: Optional[SpatialIndex] = None
+    # main plus the one-way entries into it (sources: a spawn room players drop
+    # out of). Spawn-based distances start here; paths never leave main again.
+    play: Set[int] = field(default_factory=set)
+    adj_play: List[List[int]] = field(default_factory=list)
+    w_play: List[List[float]] = field(default_factory=list)
     # Places that stand for a team's base when the map has no team spawns MC2
     # spawns players at: (label, SpawnRef), e.g. "ctf_spawn_entities", "ctf_layout".
     base_hints: List[Tuple[str, SpawnRef]] = field(default_factory=list)
@@ -124,20 +132,24 @@ class AnalysisContext:
         return len(self.und_main[i])
 
     def spawn_nodes(self, teams: Optional[Sequence[str]] = None) -> List[int]:
-        """Snapped main-component waypoints of the spawns (of ``teams``), sorted, unique."""
+        """Snapped waypoints of the spawns (of ``teams``) that reach main, sorted, unique."""
         return sorted({s.node for s in self.spawns
-                       if s.node in self.main and (teams is None or s.team in teams)})
+                       if s.node in self.play and (teams is None or s.team in teams)})
 
     def in_hazard(self, p: Point, pad: float = 0.0) -> bool:
         return any(in_box(p, h, pad) for h in self.hazards)
 
     def dist_from(self, sources: Sequence[int]) -> List[float]:
-        """Path length from the nearest of ``sources`` to every node, inside main."""
-        return dijkstra(self.adj_main, self.w_main, sources)
+        """Path length from the nearest of ``sources`` to every node.
+
+        Paths run inside ``play``: a source may start on a one-way entry into
+        main; once in main a path stays there.
+        """
+        return dijkstra(self.adj_play, self.w_play, sources)
 
     def dist_to(self, targets: Sequence[int]) -> List[float]:
-        """Path length from every node to the nearest of ``targets``, inside main."""
-        radj, rw = reverse_weighted(self.adj_main, self.w_main)
+        """Path length from every node (of ``play``) to the nearest of ``targets``."""
+        radj, rw = reverse_weighted(self.adj_play, self.w_play)
         return dijkstra(radj, rw, targets)
 
     def snap_main(self, p: Point, max_dist: float = SPAWN_SNAP) -> Optional[int]:
@@ -186,8 +198,22 @@ def build_context(
         teleport_exits=exits,
         spacing=estimate_spacing(graph.origins, main_list),
     )
+    sources = set(comp.classification.sources)
+    ctx.play = main | sources
+    for u in range(graph.n):
+        row: List[int] = []
+        wrow: List[float] = []
+        if u in ctx.play:
+            allowed = main if u in main else ctx.play
+            for v, w in zip(graph.adj[u], graph.weights[u]):
+                if v in allowed:
+                    row.append(v)
+                    wrow.append(w)
+        ctx.adj_play.append(row)
+        ctx.w_play.append(wrow)
+    play_index = SpatialIndex(graph.origins, ctx.play)
     for origin, team, label in base_hints:
-        node = ctx.snap_main(origin)
+        node = play_index.nearest(origin, SPAWN_SNAP)
         ctx.base_hints.append((label, SpawnRef(origin, team, -1 if node is None else node)))
     if probe is not None:
         for i in main_list:
@@ -254,7 +280,7 @@ def chokepoints(ctx: AnalysisContext) -> Tuple[List[Dict[str, Any]], int, int]:
 
 
 def _spawn_separation(ctx: AnalysisContext) -> Dict[str, Optional[float]]:
-    nodes = [s.node for s in ctx.spawns if s.node in ctx.main]
+    nodes = [s.node for s in ctx.spawns if s.node in ctx.play]
     unique = sorted(set(nodes))
     if len(nodes) < 2:
         return {"mean_path": None, "min_path": None}
@@ -294,7 +320,7 @@ def _resources(ctx: AnalysisContext) -> Dict[str, Any]:
 
     mean_path: Optional[float] = None
     weapon_nodes = sorted({n for n in (ctx.snap_main(w) for w in weapons) if n is not None})
-    spawn_nodes = [s.node for s in ctx.spawns if s.node in ctx.main]
+    spawn_nodes = [s.node for s in ctx.spawns if s.node in ctx.play]
     if weapon_nodes and spawn_nodes:
         to_weapon = ctx.dist_to(weapon_nodes)
         vals = [to_weapon[s] for s in spawn_nodes if to_weapon[s] < INF]
