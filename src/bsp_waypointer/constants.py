@@ -440,6 +440,25 @@ SPAWN_ENTITIES = frozenset({
     "info_player_rebel",
 })
 
+# Source's coordinate limit (MAX_COORD_INTEGER): the engine cannot place an
+# entity beyond it on any axis
+MAX_COORD = 16384.0
+
+# A spawn this far outside the world model's bounds is in the void: no player
+# can stand there (js_coop_basemission_beta parks its one info_player_start at
+# 9999999 99999999 999999999999), so it is no spawn for the waypoint graph
+SPAWN_OUTSIDE_WORLD_MARGIN = 64.0
+
+
+# =============================================================================
+# Trigger touch rules (triggers.h, CBaseTrigger::PassesTriggerFilters)
+# =============================================================================
+
+SF_TRIGGER_ALLOW_CLIENTS = 0x01
+SF_TRIGGER_ONLY_CLIENTS_IN_VEHICLES = 0x20
+SF_TRIGGER_ALLOW_ALL = 0x40
+SF_TRIGGER_DISALLOW_BOTS = 0x1000
+
 
 # =============================================================================
 # BSP Lump Indices (Source Engine BSP v19-21)

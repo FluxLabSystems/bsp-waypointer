@@ -28,9 +28,15 @@ from .constants import (
     LADDER_DISMOUNT_ENTITIES,
     LADDER_ENTITIES,
     LIFT_ENTITIES,
+    MAX_COORD,
     PHYSICS_PROP_ENTITIES,
     PUSH_ENTITIES,
+    SF_TRIGGER_ALLOW_ALL,
+    SF_TRIGGER_ALLOW_CLIENTS,
+    SF_TRIGGER_DISALLOW_BOTS,
+    SF_TRIGGER_ONLY_CLIENTS_IN_VEHICLES,
     SPAWN_ENTITIES,
+    SPAWN_OUTSIDE_WORLD_MARGIN,
     STATIC_PROP_SIZE_HINTS,
     TELEPORT_DESTINATION,
     TELEPORT_ENTRANCE,
@@ -39,6 +45,17 @@ from .constants import (
     WaypointFlag,
 )
 from .vector import BoundingBox, ConvexHull, Vector3
+
+
+def _names_match(query: str, name: str) -> bool:
+    """The engine's NamesMatch (CBaseEntity::ClassMatches): ASCII case-insensitive,
+    and a '*' where the two first differ matches the rest ("npc_*", "*")."""
+    i = 0
+    while i < len(query) and i < len(name) and query[i].lower() == name[i].lower():
+        i += 1
+    if i == len(query) and i == len(name):
+        return True
+    return i < len(query) and query[i] == "*"
 
 
 @dataclass
@@ -234,6 +251,9 @@ class Lift:
 class HL2DMEntityData:
     """Container for all parsed HL2DM entities."""
     spawn_points: List[SpawnPoint] = field(default_factory=list)
+    # Spawn entities no player can use: outside the world (in the void or past
+    # the engine's coordinate limit). Kept for reporting, never seeded from.
+    invalid_spawn_points: List[SpawnPoint] = field(default_factory=list)
     weapons: List[WeaponSpawn] = field(default_factory=list)
     health_items: List[HealthItem] = field(default_factory=list)
     armor_items: List[ArmorItem] = field(default_factory=list)
@@ -400,9 +420,32 @@ class HL2DMEntityAnalyzer:
                 else:
                     team = "deathmatch"
 
-                self._data.spawn_points.append(
-                    SpawnPoint(origin=origin, angles=angles, team=team)
-                )
+                spawn = SpawnPoint(origin=origin, angles=angles, team=team)
+                if self._spawn_in_world(origin):
+                    self._data.spawn_points.append(spawn)
+                else:
+                    self._data.invalid_spawn_points.append(spawn)
+
+    def _spawn_in_world(self, origin: Vector3) -> bool:
+        """
+        Whether a player could spawn at origin: finite, inside the engine's
+        coordinate range, and within the world model's bounds (plus
+        SPAWN_OUTSIDE_WORLD_MARGIN). A spawn in the void is no seed for the
+        waypoint graph -- its waypoint could join nothing, and as the only
+        spawn it would make that lone waypoint the main component.
+        """
+        coords = (origin.x, origin.y, origin.z)
+        if not all(math.isfinite(c) and abs(c) <= MAX_COORD for c in coords):
+            return False
+        bounds = getattr(self._bsp, "world_bounds", None)
+        if bounds is None:
+            return True
+        m = SPAWN_OUTSIDE_WORLD_MARGIN
+        return (
+            bounds.mins.x - m <= origin.x <= bounds.maxs.x + m
+            and bounds.mins.y - m <= origin.y <= bounds.maxs.y + m
+            and bounds.mins.z - m <= origin.z <= bounds.maxs.z + m
+        )
 
     def _parse_weapons(self) -> None:
         """Parse weapon spawn entities."""
@@ -822,6 +865,8 @@ class HL2DMEntityAnalyzer:
                 damage = entity.get_float("damage", 10.0)
                 if damage <= 0:
                     continue  # Negative damage heals
+                if not self._touches_bot_players(entity):
+                    continue  # an NPC trap, a vehicle trigger: no hazard to a bot
 
                 self._data.hurt_volumes.append(
                     HurtVolume(
@@ -833,6 +878,44 @@ class HL2DMEntityAnalyzer:
                         team=self._filter_team(entity.get("filtername", "")),
                     )
                 )
+
+    @staticmethod
+    def _negated(filter_entity: Entity) -> bool:
+        """A filter's Negated key: '1' (or Hammer's text form) filters matches out."""
+        return filter_entity.get("negated", "0") not in (
+            "0", "", "Allow entities that match criteria"
+        )
+
+    def _touches_bot_players(self, trigger: Entity) -> bool:
+        """
+        Whether a trigger can touch a bot standing on foot, as
+        CBaseTrigger::PassesTriggerFilters decides: its spawnflags must allow
+        clients (or everything) and not only clients in vehicles nor bar bots,
+        and a filter_activator_class filter must pass the class "player".
+        A trigger without a readable spawnflags key is kept (assumed to touch
+        players).
+        Other filter kinds (name, multi, ...) are not modelled: kept.
+        """
+        try:
+            flags: Optional[int] = int(trigger.get("spawnflags", "").strip())
+        except ValueError:
+            flags = None  # absent or unreadable
+        if flags is not None:
+            if not flags & (SF_TRIGGER_ALLOW_CLIENTS | SF_TRIGGER_ALLOW_ALL):
+                return False
+            if flags & (SF_TRIGGER_ONLY_CLIENTS_IN_VEHICLES | SF_TRIGGER_DISALLOW_BOTS):
+                return False
+        filtername = trigger.get("filtername", "").lower()
+        if not filtername:
+            return True
+        for entity in self._bsp.entities:
+            if entity.classname != "filter_activator_class":
+                continue
+            if entity.get("targetname", "").lower() != filtername:
+                continue
+            is_player = _names_match(entity.get("filterclass", ""), "player")
+            return is_player != self._negated(entity)
+        return True
 
     def _filter_team(self, filtername: str) -> int:
         """The one team (2 or 3) a filter_activator_team named filtername lets
@@ -848,8 +931,7 @@ class HL2DMEntityAnalyzer:
                 team = int(float(entity.get("filterteam", "0") or 0))
             except ValueError:
                 return 0
-            negated = entity.get("negated", "0")
-            if negated not in ("0", "", "Allow entities that match criteria"):
+            if self._negated(entity):
                 team = {2: 3, 3: 2}.get(team, 0)
             return team if team in (2, 3) else 0
         return 0

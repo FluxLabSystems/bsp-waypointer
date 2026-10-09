@@ -90,6 +90,16 @@ def _build_obstacle_grid(obstacles) -> Tuple[Dict[Tuple[int, int], List[int]], L
     return cells, everywhere
 
 
+def _inside_volume(origin: Vector3, volume) -> bool:
+    """origin within a mins/maxs volume, reaching 8 units below its floor (a
+    standing spot just under a trigger's bottom face)."""
+    return (
+        volume.mins.x <= origin.x <= volume.maxs.x
+        and volume.mins.y <= origin.y <= volume.maxs.y
+        and volume.mins.z - 8 <= origin.z <= volume.maxs.z
+    )
+
+
 @dataclass
 class WaypointMetadata:
     """HL2DM-specific waypoint metadata."""
@@ -913,15 +923,24 @@ class HL2DMWaypointConverter:
             ),
         )
 
+        if len(main) < 2:
+            # Say why: a spawn sealed off by a hazard volume reads very
+            # differently from a map with no walkable floor at all
+            in_hazard = sum(
+                1 for s in spawns
+                if any(_inside_volume(self._waypoints[s].origin, hz)
+                       for hz in getattr(self, "_hazards", []))
+            )
+            raise RuntimeError(
+                "no usable waypoint graph: the largest traversable component "
+                f"has {len(main)} waypoint(s) ({len(spawns)} spawn waypoint(s), "
+                f"{in_hazard} inside an active hurt volume; the largest component "
+                f"anywhere has {max(len(c) for c in sccs)})"
+            )
+
         # C3: RCBot3's audit walks from the first used waypoint
         if 0 not in main:
             self._apply_permutation(permutation_to_front(n, min(main)))
-
-        if len(main) < 2:
-            raise RuntimeError(
-                "no usable waypoint graph: the largest traversable component "
-                f"has {len(main)} waypoint(s)"
-            )
 
     def _apply_permutation(self, perm: List[int]) -> None:
         """Renumber waypoints: perm[old] = new. Remaps connections and teleporter targets."""

@@ -492,6 +492,16 @@ def generate_waypoints(
             analyzer = HL2DMEntityAnalyzer()
             entities = analyzer.analyze(bsp)
             logger.info(f"  Spawn points: {len(entities.spawn_points)}")
+            for bad in getattr(entities, "invalid_spawn_points", []):
+                o = bad.origin
+                logger.warning(
+                    f"  ignored a spawn outside the world at ({o.x:g} {o.y:g} {o.z:g}): "
+                    f"no player can spawn there"
+                )
+            if not entities.spawn_points:
+                logger.warning(
+                    "  no usable player spawn: the main component is the largest one"
+                )
             logger.info(f"  Weapons: {len(entities.weapons)}")
             logger.info(f"  Health items: {len(entities.health_items)}")
             logger.info(f"  Armor items: {len(entities.armor_items)}")
