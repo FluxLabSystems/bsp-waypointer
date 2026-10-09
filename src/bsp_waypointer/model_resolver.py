@@ -577,6 +577,8 @@ class ModelResolver:
             return None
 
         rel = model_name.lower().replace("\\", "/").lstrip("/")
+        while rel.startswith("./"):  # "./models/x.mdl": the engine's filesystem ignores it
+            rel = rel[2:].lstrip("/")
         if not rel.startswith("models/"):
             rel = "models/" + rel
         if not rel.endswith(".mdl"):

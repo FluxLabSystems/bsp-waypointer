@@ -246,8 +246,20 @@ W_FL_DEFEND = 1 << 18       # --ctf-layout: ground around a team's own stand
 A `trigger_hurt` whose `filtername` is a `filter_activator_team` hurts one team only (a CTF map's
 spawn-room guard). It is not a hazard to the graph: the waypoints inside it get the team bar
 (`W_FL_NORED` bars team 2, `W_FL_NOBLU` team 3, by engine team number as RCBot3 and TF2 read them)
-and the other team routes through. `--ctf-layout FILE|DIR` reads MC2's `<map>.ctf.txt` and flags
+and the other team routes through. MC2 coop maps use the same guard round their spawn room
+(bm_coop_00, mm_coop_*: every spawn inside a lethal hurt filtered to team 2); read as a hazard to
+everyone it cut each spawn off and the map got no waypoints. A `trigger_hurt` that cannot touch a
+bot on foot is no hazard at all (`_touches_bot_players`, the engine's `PassesTriggerFilters`):
+spawnflags without Clients (1) or Everything (64), or with Only-clients-in-vehicles (32) or
+Disallow-bots (4096), or a `filter_activator_class` that does not pass `player` (`NamesMatch`:
+case-insensitive, a `*` matches the rest). Other filter kinds are not modelled and stay hazards.
+`--ctf-layout FILE|DIR` reads MC2's `<map>.ctf.txt` and flags
 the objectives on waypoints already in the graph; it adds none (`ctf_layout.py`).
+
+A spawn entity outside the world (past `MAX_COORD`, or more than `SPAWN_OUTSIDE_WORLD_MARGIN`
+outside the world model's bounds) is no spawn: it goes to `invalid_spawn_points` and the CLI
+warns. js_coop_basemission_beta's stripped entity lump has only such a spawn; with no spawn left
+the main component is the largest one.
 
 ### The RCBot3 Output Contract
 - **Edges are proven.** Apart from the explicit entity edges (teleporter, ladder rungs and
@@ -261,7 +273,8 @@ the objectives on waypoints already in the graph; it adds none (`ctf_layout.py`)
   connected component a spawn can reach. Every waypoint outside it is flagged
   `W_FL_UNREACHABLE`, and a main waypoint is index 0. The converter raises only when the
   main component has fewer than two waypoints (main is chosen among the components a
-  spawn can reach, so some spawn always reaches it). `connectivity_report` keeps
+  spawn can reach, so some spawn always reaches it); the error says how many spawn
+  waypoints sit inside an active hurt volume. `connectivity_report` keeps
   `bridges`, `return_edges` and `spawn_coverage`, which hl2dm_manager reads by name, and
   `largest_flagged_spawn_component` says whether a spawn sits in a flagged room rather
   than on a ledge (the CLI warns above `FLAGGED_SPAWN_AREA_WARN`). `W_FL_SNIPER` never
@@ -423,6 +436,8 @@ mypy src                    # Type check
 - `test_rcbot3_flags.py`: The flag table against RCBot3's
 - `test_rcw_writer.py`, `test_rcw_validator.py`: The file format, RCBot3's loader checks and load audit
 - `test_waypoint_connectivity.py`: The converter's proven-edge and flagging rules on synthetic scenes
+- `test_coop_spawns.py`: Coop spawn rooms (recorded entity lumps of the five maps that once got
+  no waypoints), spawns outside the world, the trigger touch rules, `./models/` paths
 - `test_navmesh_sampling.py`: Seeded sampling
 - `test_analysis_graph.py`, `test_tactical_metrics.py`, `test_pvm_candidates.py`,
   `test_hoarder_candidates.py`, `test_mode_scores.py`: map analysis on synthetic graphs
