@@ -136,6 +136,8 @@ for f in maps/dm_*.bsp; do hl2dm-waypoint-gen "$f"; done
 - `.rcw` - RCBot3 waypoint file (binary format, version 5)
 - `.rcm` - Waypoint metadata sidecar (text format, only with `--metadata`; RCBot3 does not read it)
 - `.txt` - Human-readable waypoint list (debug, optional)
+- `.analysis.json` - Static map analysis (only with `--analysis`, or from `hl2dm-map-analyze`)
+- `.hoarder.txt` - MC2 Hoarder candidates (only with `--hoarder-out`)
 
 No `.rcv` visibility file is written, and the `.rcw` header never announces one: RCBot3
 computes its own visibility table with engine traces when it loads the map.
@@ -153,6 +155,47 @@ python -m bsp_waypointer.rcw_validator dm_lockdown.rcw [map_name]
 
 # The same, plus checks against the map's geometry and entities
 python -m bsp_waypointer.crosscheck dm_lockdown.rcw dm_lockdown.bsp
+```
+
+## Map Analysis
+
+`hl2dm-map-analyze` (and `hl2dm-waypoint-gen --analysis`) writes a static analysis of a map
+for Modular Combat 2: bot-graph connectivity, tactical metrics (floor area, verticality,
+interior/exterior, open space, corridors, chokepoints, cover, spawns, entities, resources),
+PvM monster spawn candidates, Hoarder candidates and advisory scores for the dm, tdm, pvm,
+pvpvm, hoarder and ctf modes. The output is a checksummed JSON artifact,
+`bsp_waypointer_map_analysis` 1.0.0, which hl2dm_manager imports; `--hoarder-out` also
+writes MC2's `maps/graphs/<map>.hoarder.txt`. The schema is in
+[docs/map_analysis.md](docs/map_analysis.md). Every number is a heuristic: the game
+still validates every spawn, and a human override in the manager wins.
+
+```bash
+# From existing waypoints (a few seconds a map)
+hl2dm-map-analyze maps/dm_lockdown.bsp --rcw waypoints/ -o out/
+
+# A batch, with MC2's spawn nodes and CTF layouts, writing the Hoarder candidate files
+hl2dm-map-analyze maps/*.bsp --rcw waypoints/ --pvm-nodes mc2/maps/graphs/ \
+    --ctf-layout mc2/maps/graphs/ -o out/ --hoarder-out out/graphs/
+
+# Generate and analyse in one go
+hl2dm-waypoint-gen maps/dm_lockdown.bsp --analysis out/ --hoarder-out out/graphs/
+```
+
+```
+hl2dm-map-analyze <map.bsp> [<map.bsp> ...]
+  --rcw FILE|DIR          Analyse this .rcw (or DIR/<map>.rcw); without it, generate first
+  -o, --output FILE|DIR   Analysis JSON (default ./<map>.analysis.json)
+  --pvm-nodes FILE|DIR    MC2 spawn nodes (maps/graphs/<map>.txt): the Hoarder candidate pool
+  --hoarder-out FILE|DIR  Also write <map>.hoarder.txt
+  --ctf-layout FILE|DIR   MC2 <map>.ctf.txt, for the ctf score
+  --seed N                Betweenness sampling seed (default 0)
+  --no-raytracing         Graph-only metrics; PvM candidates not hull-tested
+  --hull-human W,D,H      Human NPC hull (default 26,26,72)
+  --hull-large W,H        Large NPC hull (default 80,100)
+  --max-npc N / --max-large N / --max-hoarder N   (144 / 32 / 24)
+
+hl2dm-waypoint-gen ... --analysis FILE|DIR [--pvm-nodes FILE|DIR] [--hoarder-out FILE|DIR]
+                       [--hull-large W,H] [--analysis-seed N]
 ```
 
 ## Waypoint Flags
@@ -293,7 +336,16 @@ bsp-waypointer/
 │   ├── graph_contract.py     # Components, classification, RCBot3 load-audit model
 │   ├── rcw_writer.py         # RCW file writer
 │   ├── rcw_validator.py      # RCBot3 loader and load-audit checks
-│   └── crosscheck.py         # Check a .rcw against its BSP
+│   ├── crosscheck.py         # Check a .rcw against its BSP
+│   ├── analysis_graph.py     # Map analysis: the waypoint graph, paths, chokepoints
+│   ├── geometry_probe.py     # Map analysis: ray questions (clearance, headroom, sky, hulls)
+│   ├── tactical_metrics.py   # Map analysis: the metrics block
+│   ├── pvm_candidates.py     # Map analysis: PvM spawn candidates, MC2 MapData files
+│   ├── hoarder_candidates.py # Map analysis: Hoarder candidates, <map>.hoarder.txt
+│   ├── mode_scores.py        # Map analysis: advisory per-mode scores
+│   ├── analysis.py           # Map analysis: the JSON artifact, checksum, analyze_map
+│   └── map_analyze_cli.py    # hl2dm-map-analyze
+├── docs/map_analysis.md      # The analysis JSON schema
 ├── tests/                    # Unit tests
 ├── pyproject.toml            # Project configuration
 └── README.md                 # This file

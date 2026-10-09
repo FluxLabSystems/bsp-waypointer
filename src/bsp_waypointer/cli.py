@@ -10,7 +10,7 @@ import argparse
 import logging
 import sys
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from . import __version__
 from .bsp_parser import BSPParser
@@ -45,6 +45,17 @@ def _waypoint_budget(text: str) -> int:
     if not 2 <= value <= MAX_WAYPOINTS:
         raise argparse.ArgumentTypeError(f"must be 2..{MAX_WAYPOINTS}")
     return value
+
+
+def _hull_pair(text: str) -> Tuple[float, float]:
+    """argparse type: W,H of a hull, both positive."""
+    try:
+        w, h = (float(p) for p in text.split(","))
+    except ValueError:
+        raise argparse.ArgumentTypeError("expected W,H (e.g. 80,100)") from None
+    if w <= 0 or h <= 0:
+        raise argparse.ArgumentTypeError("W and H must be positive")
+    return w, h
 
 
 def create_parser() -> argparse.ArgumentParser:
@@ -143,6 +154,58 @@ Examples:
         "--no-entities",
         action="store_true",
         help="Skip entity parsing (geometry only)",
+    )
+    entities.add_argument(
+        "--ctf-layout",
+        type=Path,
+        default=None,
+        help=(
+            "An MC2 CTF layout (<map>.ctf.txt), or a directory of them: flag the "
+            "flag stands W_FL_FLAG, the scoring zones and control points "
+            "W_FL_CAPPOINT, and the ground around each stand W_FL_DEFEND"
+        ),
+    )
+
+    # Map analysis
+    analysis = parser.add_argument_group("Map Analysis (docs/map_analysis.md)")
+    analysis.add_argument(
+        "--analysis",
+        type=Path,
+        default=None,
+        metavar="FILE|DIR",
+        help=(
+            "After generating, also write the static map analysis (tactical metrics, PvM "
+            "and Hoarder candidates, advisory mode scores) as JSON: FILE, or "
+            "DIR/<map>.analysis.json"
+        ),
+    )
+    analysis.add_argument(
+        "--pvm-nodes",
+        type=Path,
+        default=None,
+        metavar="FILE|DIR",
+        help="MC2 spawn nodes, maps/graphs/<map>.txt (or its DIR), for the Hoarder candidates",
+    )
+    analysis.add_argument(
+        "--hoarder-out",
+        type=Path,
+        default=None,
+        metavar="FILE|DIR",
+        help="With --analysis: also write MC2's <map>.hoarder.txt (FILE, or DIR/<map>.hoarder.txt)",
+    )
+    analysis.add_argument(
+        "--hull-large",
+        type=_hull_pair,
+        default=(80.0, 100.0),
+        metavar="W,H",
+        help="Large NPC hull width,height for the PvM candidates (default 80,100: HULL_LARGE)",
+    )
+    analysis.add_argument(
+        "--analysis-seed",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Betweenness sampling seed for the analysis (default 0)",
     )
 
     # Agent parameters
@@ -320,6 +383,12 @@ def generate_waypoints(
     metadata: bool = False,
     verbose: bool = False,
     game_dirs: Optional[List[Path]] = None,
+    ctf_layout: Optional[Path] = None,
+    analysis: Optional[Path] = None,
+    pvm_nodes: Optional[Path] = None,
+    hoarder_out: Optional[Path] = None,
+    hull_large: Tuple[float, float] = (80.0, 100.0),
+    analysis_seed: int = 0,
 ) -> int:
     """
     Generate waypoints from a BSP file.
@@ -461,6 +530,25 @@ def generate_waypoints(
         )
         waypoints = converter.convert(navmesh, entities, ladders)
         logger.info(f"  Total waypoints: {len(waypoints)}")
+        team_hz = getattr(converter, "team_hazard_waypoints", 0)
+        if team_hz:
+            logger.info(f"  Team-only hazards: {team_hz} waypoint(s) barred to one team")
+
+        layout = None
+        if ctf_layout is not None:
+            from .ctf_layout import apply_ctf_layout, load_layout, resolve_layout_path
+
+            layout_path = resolve_layout_path(Path(ctf_layout), map_name)
+            if layout_path is None:
+                logger.info(f"  CTF layout: none for {map_name}")
+            else:
+                layout = load_layout(layout_path)
+                counts = apply_ctf_layout(waypoints, layout)
+                logger.info(
+                    f"  CTF layout {layout_path.name}: {counts['flag']} flag, "
+                    f"{counts['cappoint']} capture, {counts['defend']} defend waypoint(s)"
+                    + (f"; {counts['unplaced']} objective(s) with no waypoint near" if counts["unplaced"] else "")
+                )
         report = getattr(converter, "connectivity_report", None)
         if report:
             log_connectivity_report(report, len(waypoints))
@@ -489,6 +577,13 @@ def generate_waypoints(
             debug_text=debug_text,
         )
 
+        if analysis is not None:
+            run_analysis(
+                bsp_path, bsp, map_name, waypoints, entities, ray_tracer, navmesh,
+                analysis, pvm_nodes, hoarder_out, layout, density, navmesh_generator,
+                hull_large, analysis_seed,
+            )
+
         logger.info("Done!")
         return 0
 
@@ -504,6 +599,65 @@ def generate_waypoints(
             import traceback
             traceback.print_exc()
         return 1
+
+
+def run_analysis(
+    bsp_path: Path,
+    bsp,
+    map_name: str,
+    waypoints,
+    entities,
+    ray_tracer,
+    navmesh,
+    output: Path,
+    pvm_nodes: Optional[Path],
+    hoarder_out: Optional[Path],
+    layout,
+    density: float,
+    navmesh_generator: str,
+    hull_large: Tuple[float, float],
+    seed: int,
+) -> None:
+    """``--analysis``: analyse the graph just written (same indices as the .rcw)."""
+    from .analysis import (
+        AnalysisParams, analyze_graph, bsp_identity, team_base_hints, write_analysis,
+        write_hoarder,
+    )
+    from .analysis_graph import build_graph
+    from .geometry_probe import TracerProbe
+    from .pvm_candidates import load_pvm_nodes, resolve_pvm_nodes_path
+
+    logger.info("Analysing the map...")
+    pvm_file = None
+    if pvm_nodes is not None:
+        pvm_path = resolve_pvm_nodes_path(Path(pvm_nodes), map_name)
+        if pvm_path is None:
+            logger.info(f"  PvM nodes: none for {map_name}")
+        else:
+            pvm_file = load_pvm_nodes(pvm_path)
+    params = AnalysisParams(
+        density=density, navmesh=navmesh_generator, seed=seed,
+        hull_large=(hull_large[0], hull_large[0], hull_large[1]),
+        ray_tracing=ray_tracer is not None,
+    )
+    probe = TracerProbe(ray_tracer) if ray_tracer is not None else None
+    doc = analyze_graph(
+        map_name, build_graph(waypoints), entities, probe, navmesh, params,
+        bsp_identity(bsp_path, bsp.version), pvm_file, layout,
+        base_hints=team_base_hints(bsp),
+    )
+    written = write_analysis(Path(output), doc)
+    logger.info(
+        f"  Analysis: {written} (scale {doc['metrics']['scale']}, "
+        f"{len(doc['candidates']['pvm']['npc'])} PvM npc candidates, "
+        f"{len(doc['candidates']['hoarder']['candidates'])} Hoarder candidates)"
+    )
+    if hoarder_out is not None:
+        hw = write_hoarder(Path(hoarder_out), doc)
+        if hw is None:
+            logger.warning("  Hoarder: no candidates, no .hoarder.txt written")
+        else:
+            logger.info(f"  Hoarder candidates: {hw}")
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -548,6 +702,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         metadata=args.metadata,
         verbose=args.verbose,
         game_dirs=args.game_dir,
+        ctf_layout=args.ctf_layout,
+        analysis=args.analysis,
+        pvm_nodes=args.pvm_nodes,
+        hoarder_out=args.hoarder_out,
+        hull_large=args.hull_large,
+        analysis_seed=args.analysis_seed,
     )
 
 

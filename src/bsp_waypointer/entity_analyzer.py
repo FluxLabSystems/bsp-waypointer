@@ -197,6 +197,12 @@ class HurtVolume:
     # dm_runoff's button-timer kill zones) — such volumes must not
     # influence waypoint placement or connections
     start_disabled: bool = False
+    # The ONE team (2 or 3) it hurts, when its filtername names a
+    # filter_activator_team: a CTF map's spawn-room guard kills the enemy
+    # and lets its own team through. 0: it hurts everyone. A team hazard
+    # restricts that team's waypoints (W_FL_NORED / W_FL_NOBLU) instead of
+    # cutting the volume out of the graph for both.
+    team: int = 0
 
 
 @dataclass
@@ -824,8 +830,29 @@ class HL2DMEntityAnalyzer:
                         maxs=maxs,
                         damage=damage,
                         start_disabled=entity.get_int("startdisabled", 0) == 1,
+                        team=self._filter_team(entity.get("filtername", "")),
                     )
                 )
+
+    def _filter_team(self, filtername: str) -> int:
+        """The one team (2 or 3) a filter_activator_team named filtername lets
+        through -- honouring its negation -- or 0 when it is not one."""
+        if not filtername:
+            return 0
+        for entity in self._bsp.entities:
+            if entity.classname != "filter_activator_team":
+                continue
+            if entity.get("targetname", "").lower() != filtername.lower():
+                continue
+            try:
+                team = int(float(entity.get("filterteam", "0") or 0))
+            except ValueError:
+                return 0
+            negated = entity.get("negated", "0")
+            if negated not in ("0", "", "Allow entities that match criteria"):
+                team = {2: 3, 3: 2}.get(team, 0)
+            return team if team in (2, 3) else 0
+        return 0
 
     def _parse_useable_ladders(self) -> None:
         """Parse HL2-style useable ladders and dismount points."""

@@ -75,7 +75,15 @@ This document provides comprehensive context for AI assistants working on the BS
 | RCW Writer | `rcw_writer.py` | Waypoints → .rcw binary file |
 | RCW Validator | `rcw_validator.py` | RCBot3's loader checks, its load-time audit, the graph contract |
 | Crosscheck | `crosscheck.py` | A .rcw checked against its BSP |
-| CLI | `cli.py` | Command-line interface |
+| CLI | `cli.py` | Command-line interface (`hl2dm-waypoint-gen`, `--analysis`) |
+| Analysis Graph | `analysis_graph.py` | Map analysis: the waypoint graph (generated or `.rcw`), Dijkstra, articulation points, betweenness, main component |
+| Geometry Probe | `geometry_probe.py` | Map analysis: clearance, headroom, sky, NPC hull fit, sight (`TracerProbe`, synthetic `BoxWorldProbe`) |
+| Tactical Metrics | `tactical_metrics.py` | Map analysis: shared `AnalysisContext` and the `metrics` block |
+| PvM Candidates | `pvm_candidates.py` | Map analysis: PvM spawn candidates, MC2 `maps/graphs/<map>.txt` reader |
+| Hoarder Candidates | `hoarder_candidates.py` | Map analysis: team bases, fair candidates, `<map>.hoarder.txt` |
+| Mode Scores | `mode_scores.py` | Map analysis: advisory dm/tdm/pvm/pvpvm/hoarder/ctf scores |
+| Analysis | `analysis.py` | Map analysis: `analyze_map`, the JSON artifact and its checksum |
+| Map Analyze CLI | `map_analyze_cli.py` | `hl2dm-map-analyze` |
 
 ## Code Conventions
 
@@ -227,7 +235,19 @@ W_FL_LIFT = 1 << 23
 W_FL_FALL = 1 << 25         # Fall hazard
 W_FL_BREAKABLE = 1 << 26
 W_FL_USE = 1 << 30          # Requires +USE
+# MC2 ADR-0232 (CTF):
+W_FL_NOBLU = 1 << 6         # inside a trigger_hurt that hurts team 3 only: team 3 barred
+W_FL_NORED = 1 << 7         # inside a trigger_hurt that hurts team 2 only: team 2 barred
+W_FL_FLAG = 1 << 4          # --ctf-layout: a flag stand
+W_FL_CAPPOINT = 1 << 5      # --ctf-layout: a scoring zone or a control point (area = index + 1)
+W_FL_DEFEND = 1 << 18       # --ctf-layout: ground around a team's own stand
 ```
+
+A `trigger_hurt` whose `filtername` is a `filter_activator_team` hurts one team only (a CTF map's
+spawn-room guard). It is not a hazard to the graph: the waypoints inside it get the team bar
+(`W_FL_NORED` bars team 2, `W_FL_NOBLU` team 3, by engine team number as RCBot3 and TF2 read them)
+and the other team routes through. `--ctf-layout FILE|DIR` reads MC2's `<map>.ctf.txt` and flags
+the objectives on waypoints already in the graph; it adds none (`ctf_layout.py`).
 
 ### The RCBot3 Output Contract
 - **Edges are proven.** Apart from the explicit entity edges (teleporter, ladder rungs and
@@ -255,6 +275,27 @@ W_FL_USE = 1 << 30          # Requires +USE
 - **No `.rcv`.** The header flag word is 0, so RCBot3 computes its own visibility. `.rcm`
   is written only on request (`--metadata`); RCBot3 does not read it.
 - **Reproducible.** Navmesh sampling is seeded, so a map converts the same way every run.
+
+### Map Analysis (MC2 Phase 8)
+`hl2dm-map-analyze` and `hl2dm-waypoint-gen --analysis` write the
+`bsp_waypointer_map_analysis` JSON artifact (v1.0.0), schema in `docs/map_analysis.md`.
+hl2dm_manager imports it, so:
+- **Never rename or remove a field** within MAJOR 1; add fields freely (consumers ignore
+  unknown keys) and bump the MINOR. `tests/test_analysis_schema.py` pins the required keys.
+- **The checksum** is SHA-256 over canonical JSON (`sort_keys=True`, `separators=(',',':')`,
+  `ensure_ascii=False`, UTF-8) of the document without its `checksum` key -- the manager
+  catalog's rule. `analysis.load_analysis` verifies id, MAJOR and checksum.
+- **Deterministic**: no timestamps, seeded betweenness, sorted iteration, rounded floats.
+  Two runs on the same inputs are byte-identical; keep it that way.
+- **Advisory**: scores are candidate scores, never suitability (MC2 ADR-0174).
+- `--hoarder-out` writes MC2's `maps/graphs/<map>.hoarder.txt` (KeyValues, CRLF; keys
+  `version`, `source`, then `Candidate` blocks `origin score fairness dist2 dist3 waypoint
+  pvmnode`), the format MC2's game reads. Not written when there is no candidate.
+- Ray questions go through `geometry_probe.GeometryProbe`; `TracerProbe` uses
+  `BSPRayTracer.trace_brushes`, which clips every brush against the whole segment.
+  `trace_hull` is left unchanged (the converter uses it): it clips per BSP sub-segment, so
+  its `fraction`/`start_solid` are relative to the sub-segment (a mid-ray hit reads as
+  `start_solid` with fraction 1.0), and a box straddling a node plane descends one side only.
 
 ## BSP File Format
 
@@ -290,6 +331,9 @@ hl2dm-waypoint-gen dm_lockdown.bsp
 
 # With debug output
 hl2dm-waypoint-gen --debug-obj geo.obj --debug-text dm_lockdown.bsp
+
+# Map analysis from existing waypoints (docs/map_analysis.md)
+hl2dm-map-analyze dm_lockdown.bsp --rcw waypoints/ -o out/ --hoarder-out out/graphs/
 ```
 
 ### Running Tests
@@ -380,6 +424,14 @@ mypy src                    # Type check
 - `test_rcw_writer.py`, `test_rcw_validator.py`: The file format, RCBot3's loader checks and load audit
 - `test_waypoint_connectivity.py`: The converter's proven-edge and flagging rules on synthetic scenes
 - `test_navmesh_sampling.py`: Seeded sampling
+- `test_analysis_graph.py`, `test_tactical_metrics.py`, `test_pvm_candidates.py`,
+  `test_hoarder_candidates.py`, `test_mode_scores.py`: map analysis on synthetic graphs
+  (`tests/analysis_scenes.py`) and synthetic geometry (`BoxWorldProbe`, a one-brush BSP)
+- `test_analysis_schema.py`: the JSON's required keys, checksum, byte-identical output
+- `test_cli_analysis.py`: `hl2dm-map-analyze` and `--analysis`; opt-in real map with
+  `HL2DM_BSP_DIR` + `HL2DM_RCW_DIR` (+ `MC2_GRAPHS_DIR`, `HL2DM_ANALYSIS_MAP`).
+  `test_pvm_candidates.py` checks parity with MC2's `gen_map_spawns.py` when an MC2
+  checkout is reachable (`MC2_REPO`)
 
 ### Integration Tests (to add)
 - BSP parsing with sample files
@@ -415,6 +467,8 @@ mypy src                    # Type check
 - `.rcm` - Text metadata sidecar (only with `--metadata`; RCBot3 does not read it)
 - `.txt` - Debug text output (optional)
 - `.obj` - Debug geometry mesh (optional)
+- `.analysis.json` - Map analysis (`--analysis`, `hl2dm-map-analyze`)
+- `.hoarder.txt` - MC2 Hoarder candidates (`--hoarder-out`)
 
 ## Debugging Tips
 
