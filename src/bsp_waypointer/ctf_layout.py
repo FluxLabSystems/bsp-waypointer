@@ -142,6 +142,18 @@ def _centre(box: Tuple[Vector3, Vector3]) -> Vector3:
     return Vector3((a.x + b.x) * 0.5, (a.y + b.y) * 0.5, min(a.z, b.z) + 8.0)
 
 
+def objective_positions(layout: CTFLayout) -> List[Vector3]:
+    """Where the converter puts a waypoint ON an objective (MC2 ADR-0264): the
+    flag stands, the neutral flag, the scoring zones' and goals' centres and the
+    control points. The waypoints this module flags are then the ones on them."""
+    out: List[Vector3] = list(layout.stands.values())
+    if layout.neutral is not None:
+        out.append(layout.neutral)
+    out += [_centre(box) for box in list(layout.zones.values()) + list(layout.goals.values())]
+    out += list(layout.points)
+    return out
+
+
 def apply_ctf_layout(waypoints: Sequence, layout: CTFLayout) -> Dict[str, int]:
     """Flag the objectives on ``waypoints`` (in place). Returns counts for the log."""
     live = [wp for wp in waypoints if not wp.has_flag(WaypointFlag.W_FL_UNREACHABLE)]
