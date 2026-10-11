@@ -538,21 +538,31 @@ def generate_waypoints(
             ray_tracer=ray_tracer,
             use_ray_tracing=use_ray_tracing,
         )
-        waypoints = converter.convert(navmesh, entities, ladders)
+        # MC2 ADR-0264: the layout first, so each objective gets a waypoint on it.
+        layout = None
+        layout_path = None
+        objectives = []
+        if ctf_layout is not None:
+            from .ctf_layout import load_layout, objective_positions, resolve_layout_path
+
+            layout_path = resolve_layout_path(Path(ctf_layout), map_name)
+            if layout_path is not None:
+                layout = load_layout(layout_path)
+                objectives = objective_positions(layout)
+        waypoints = converter.convert(navmesh, entities, ladders, objectives=objectives)
         logger.info(f"  Total waypoints: {len(waypoints)}")
+        if objectives:
+            logger.info(f"  CTF objectives: {len(objectives)} waypoint(s) placed on them")
         team_hz = getattr(converter, "team_hazard_waypoints", 0)
         if team_hz:
             logger.info(f"  Team-only hazards: {team_hz} waypoint(s) barred to one team")
 
-        layout = None
         if ctf_layout is not None:
-            from .ctf_layout import apply_ctf_layout, load_layout, resolve_layout_path
+            from .ctf_layout import apply_ctf_layout
 
-            layout_path = resolve_layout_path(Path(ctf_layout), map_name)
-            if layout_path is None:
+            if layout is None:
                 logger.info(f"  CTF layout: none for {map_name}")
             else:
-                layout = load_layout(layout_path)
                 counts = apply_ctf_layout(waypoints, layout)
                 logger.info(
                     f"  CTF layout {layout_path.name}: {counts['flag']} flag, "

@@ -394,13 +394,35 @@ class HL2DMEntityAnalyzer:
         return origin, default_mins + origin, default_maxs + origin
 
     def _collect_teleport_destinations(self) -> None:
-        """Collect all teleport destination entities."""
+        """Collect every entity a trigger_teleport can send a player to.
+
+        The engine resolves a trigger_teleport's target by NAME, whatever the
+        class (CTriggerTeleport::Touch -> gEntList.FindEntityByName): most maps
+        use info_teleport_destination, but ctf_warpath_* and
+        ctf_powerplant_beta6 send their spawn rooms through info_target. Read
+        only as info_teleport_destination, those teleporters had no exit, the
+        spawn rooms were the only component seeded from spawns, and 2024 of
+        ctf_warpath_b4's 2048 waypoints were flagged W_FL_UNREACHABLE -- the
+        bots never left the spawn room (MC2 ADR-0264). An
+        info_teleport_destination still wins a name it shares; otherwise the
+        first named entity with an origin in lump order, as the engine's
+        first-match lookup would find it.
+        """
         for entity in self._bsp.entities:
             if entity.classname == TELEPORT_DESTINATION:
                 name = entity.get("targetname")
                 origin = entity.get_vector("origin")
-                if name and origin:
+                if name and origin and name not in self._teleport_targets:
                     self._teleport_targets[name] = origin
+        for entity in self._bsp.entities:
+            if entity.classname in (TELEPORT_DESTINATION, TELEPORT_ENTRANCE):
+                continue
+            name = entity.get("targetname")
+            if not name or name in self._teleport_targets:
+                continue
+            origin = entity.get_vector("origin")
+            if origin:
+                self._teleport_targets[name] = origin
 
     def _parse_spawn_points(self) -> None:
         """Parse player spawn point entities."""

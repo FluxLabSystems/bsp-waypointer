@@ -209,7 +209,8 @@ Health:       item_healthkit, item_healthvial
 Armor:        item_battery, item_suit
 Chargers:     func_healthcharger, func_recharge
 Ammo:         item_ammo_pistol, item_ammo_smg1, item_rpg_round, etc.
-Teleporters:  trigger_teleport → info_teleport_destination
+Teleporters:  trigger_teleport → its target: any named entity (info_teleport_destination first;
+              ctf_warpath_* uses info_target)
 Ladders:      func_ladder, or texture-based detection
 Spawns:       info_player_deathmatch, info_player_start
 ```
@@ -253,8 +254,12 @@ bot on foot is no hazard at all (`_touches_bot_players`, the engine's `PassesTri
 spawnflags without Clients (1) or Everything (64), or with Only-clients-in-vehicles (32) or
 Disallow-bots (4096), or a `filter_activator_class` that does not pass `player` (`NamesMatch`:
 case-insensitive, a `*` matches the rest). Other filter kinds are not modelled and stay hazards.
-`--ctf-layout FILE|DIR` reads MC2's `<map>.ctf.txt` and flags
-the objectives on waypoints already in the graph; it adds none (`ctf_layout.py`).
+`--ctf-layout FILE|DIR` reads MC2's `<map>.ctf.txt`. Before the conversion, every objective
+(stand, neutral flag, zone centre, control point) gets a waypoint on the floor under it
+(`objective_positions`, `_place_objective_waypoints`), joined to the graph only by proven edges;
+the cap keeps it (priority 1500) and the ground within `OBJECTIVE_APPROACH_RADIUS` (+700), or a
+raised pad is culled into an island (MC2 ADR-0264: ctf_warpath_*'s end points). After it, the
+objectives are flagged on the waypoints nearest them (`ctf_layout.py`).
 
 A spawn entity outside the world (past `MAX_COORD`, or more than `SPAWN_OUTSIDE_WORLD_MARGIN`
 outside the world model's bounds) is no spawn: it goes to `invalid_spawn_points` and the CLI

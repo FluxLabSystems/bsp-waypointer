@@ -100,6 +100,11 @@ def _inside_volume(origin: Vector3, volume) -> bool:
     )
 
 
+# Waypoints this close to a CTF objective outrank plain samples when the cap
+# culls (MC2 ADR-0264): the approach to a pad, not only the pad.
+OBJECTIVE_APPROACH_RADIUS = 384.0
+
+
 @dataclass
 class WaypointMetadata:
     """HL2DM-specific waypoint metadata."""
@@ -125,6 +130,10 @@ class Waypoint:
     # higher-priority entity replaces (and which a spawn merged into a plain
     # navmesh sample never receives): the main-component choice needs every spawn.
     is_spawn: bool = False
+    # A CTF objective is here (a flag stand, a scoring zone, a control point:
+    # --ctf-layout, MC2 ADR-0264). Kept through the waypoint cap like a spawn,
+    # so a bot sent to the objective has a waypoint ON it.
+    is_objective: bool = False
     # RCBot3's per-waypoint area id (iArea); 0 = none. Set by --ctf-layout on
     # control points (index + 1).
     area: int = 0
@@ -207,6 +216,7 @@ class HL2DMWaypointConverter:
         navmesh: NavigationMesh,
         entities: HL2DMEntityData,
         ladders: Optional[List[LadderSurface]] = None,
+        objectives: Optional[List[Vector3]] = None,
     ) -> List[Waypoint]:
         """
         Convert navigation mesh and entities to waypoints.
@@ -215,6 +225,8 @@ class HL2DMWaypointConverter:
             navmesh: Navigation mesh
             entities: Parsed HL2DM entities
             ladders: Detected ladder surfaces
+            objectives: CTF objectives to put a waypoint on (MC2 layout:
+                ctf_layout.objective_positions)
 
         Returns:
             List of waypoints
@@ -260,6 +272,7 @@ class HL2DMWaypointConverter:
         self._place_charger_waypoints(entities.chargers)
         self._place_ammo_waypoints(entities.ammo_pickups)
         self._place_spawn_waypoints(entities.spawn_points)
+        self._place_objective_waypoints(objectives or [])
         self._place_teleporter_waypoints(entities.teleporters)
         self._place_ladder_waypoints(entities.ladders, ladders or [])
         self._place_useable_ladder_waypoints(
@@ -501,6 +514,31 @@ class HL2DMWaypointConverter:
             )
             idx = self._add_waypoint(spawn.origin, WaypointFlag.W_FL_NONE, metadata)
             self._waypoints[idx].is_spawn = True
+
+    def _place_objective_waypoints(self, objectives: List[Vector3]) -> None:
+        """Put a waypoint on every CTF objective, on the floor under it.
+
+        ctf_warpath_*'s command points are pads on raised platforms; the navmesh
+        samples there were culled under the 2048 cap, the nearest waypoint was
+        on the ground 340 units below, and RCBot3 (which takes a goal waypoint
+        within 320 units of a point) had none for three of the five points (MC2
+        ADR-0264). Like an item's, an objective's waypoint goes where it is and
+        joins the graph only by proven edges; it outranks everything but a spawn
+        when the cap culls.
+        """
+        tracer = self.ray_tracer if self.use_ray_tracing else None
+        self.objective_waypoints = 0
+        self._objective_origins = []
+        for at in objectives:
+            origin = at
+            if tracer is not None:
+                tr = tracer.trace_line(Vector3(at.x, at.y, at.z + 32.0), Vector3(at.x, at.y, at.z - 256.0))
+                if tr.hit and not tr.start_solid:
+                    origin = Vector3(at.x, at.y, tr.end_pos.z)
+            idx = self._add_waypoint(origin)
+            self._waypoints[idx].is_objective = True
+            self._objective_origins.append(origin)
+            self.objective_waypoints += 1
 
     def _place_teleporter_waypoints(self, teleporters: List[Teleporter]) -> None:
         """Place waypoints at teleporter entrances and exits."""
@@ -1325,6 +1363,17 @@ class HL2DMWaypointConverter:
         # now mean the same thing by "a spawn".
         if wp.is_spawn:
             priority += 2000
+
+        # A CTF objective (--ctf-layout): the place a bot is sent to -- and
+        # the ground around it, or the cap culls the way onto a raised pad
+        # (ctf_warpath's end points) and leaves the objective an island.
+        if wp.is_objective:
+            priority += 1500
+        elif any(
+            wp.origin.distance_to(o) <= OBJECTIVE_APPROACH_RADIUS
+            for o in getattr(self, "_objective_origins", ())
+        ):
+            priority += 700
 
         # Entity waypoints are high priority
         if wp.metadata.subtype != HL2DMWaypointSubType.SUBTYPE_NONE:
