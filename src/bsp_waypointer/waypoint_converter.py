@@ -540,9 +540,38 @@ class HL2DMWaypointConverter:
             self._objective_origins.append(origin)
             self.objective_waypoints += 1
 
+    def _floor_under(self, at: Vector3, depth: float = 1024.0) -> Vector3:
+        """The world floor under a point (the point itself without a tracer, or
+        with nothing under it within depth)."""
+        tracer = self.ray_tracer if self.use_ray_tracing else None
+        if tracer is None:
+            return at
+        tr = tracer.trace_line(Vector3(at.x, at.y, at.z + 8.0), Vector3(at.x, at.y, at.z - depth))
+        if tr.hit and not tr.start_solid:
+            return Vector3(at.x, at.y, tr.end_pos.z)
+        return at
+
     def _place_teleporter_waypoints(self, teleporters: List[Teleporter]) -> None:
-        """Place waypoints at teleporter entrances and exits."""
+        """Place waypoints at teleporter entrances and exits.
+
+        An exit goes on the FLOOR under the destination: a player is set down at
+        the destination's origin and falls. ctf_warpath_*'s info_target exits
+        are 112 units over the barracks floor; a waypoint left there hung in
+        the air, the floor waypoints were linked up to it, and a bot routed
+        through it stood under it for good (MC2 ADR-0264, in engine). The
+        ground round each exit is also kept through the cap like an
+        objective's approach: it is the way out of a spawn area.
+        """
+        self._approach_origins = getattr(self, "_approach_origins", [])
         for teleporter in teleporters:
+            teleporter = Teleporter(
+                entrance_origin=teleporter.entrance_origin,
+                entrance_mins=teleporter.entrance_mins,
+                entrance_maxs=teleporter.entrance_maxs,
+                exit_origin=self._floor_under(teleporter.exit_origin),
+                target_name=teleporter.target_name,
+            )
+            self._approach_origins.append(teleporter.exit_origin)
             # Entrance waypoint
             entrance_meta = WaypointMetadata(
                 subtype=HL2DMWaypointSubType.TELEPORT_SOURCE,
@@ -1289,6 +1318,27 @@ class HL2DMWaypointConverter:
             for hull in hulls
         )
 
+    def _needs_jump(self, a: Vector3, b: Vector3, rise: float) -> bool:
+        """Whether walking a -> b (rising 18..56) needs a jump.
+
+        Not the rise between the two ends: a ramp or a flight of stairs climbs
+        that far between waypoints 200 units apart without one. With a tracer,
+        a jump is needed where the ground under the path steps up by more than
+        a player's step (18); without one, where the path is steeper than 45
+        degrees.
+
+        This matters beyond the jump itself: RCBot3 never STARTS a route on a
+        W_FL_JUMP waypoint (CWaypointLocations::FindNearestInBucket skips them
+        for bots). ctf_warpath_b4's ramps and stairs had every waypoint
+        flagged, so a bot standing on one started its route from the nearest
+        unflagged waypoint -- a ledge 136 units overhead, or one round a wall
+        corner -- and stood under it for good (MC2 ADR-0264, in engine).
+        """
+        tracer = self.ray_tracer if self.use_ray_tracing else None
+        if tracer is not None:
+            return not tracer.ground_steps_ok(a, b, max_step=DEFAULT_PLAYER_DIMS.step_height)
+        return a.distance_to_2d(b) < rise
+
     def _assign_geometry_flags(self, navmesh: NavigationMesh) -> None:
         """Assign flags based on geometry (jump, crouch, fall)."""
         for wp in self._waypoints:
@@ -1299,8 +1349,10 @@ class HL2DMWaypointConverter:
                 conn_wp = self._waypoints[conn_idx]
                 height_diff = conn_wp.origin.z - wp.origin.z
 
-                # Jump required (going up)
-                if 18 < height_diff <= 56:
+                # Jump required (going up): a step taller than a player's
+                # step under the path, not the rise along a ramp or stairs.
+                if 18 < height_diff <= 56 and not wp.has_flag(WaypointFlag.W_FL_JUMP) \
+                        and self._needs_jump(wp.origin, conn_wp.origin, height_diff):
                     wp.add_flag(WaypointFlag.W_FL_JUMP)
 
                 # Fall warning (going down significantly)
@@ -1371,7 +1423,7 @@ class HL2DMWaypointConverter:
             priority += 1500
         elif any(
             wp.origin.distance_to(o) <= OBJECTIVE_APPROACH_RADIUS
-            for o in getattr(self, "_objective_origins", ())
+            for o in list(getattr(self, "_objective_origins", ())) + list(getattr(self, "_approach_origins", ()))
         ):
             priority += 700
 
