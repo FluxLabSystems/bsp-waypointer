@@ -72,7 +72,7 @@ class TestPorts:
 
     def test_parity_with_gen_map_spawns(self):
         """When MC2's checkout is reachable, the ports match its functions exactly."""
-        root = Path(os.environ.get("MC2_REPO", "C:/repos/mc2-ui-overhaul"))
+        root = Path(os.environ.get("MC2_REPO", "C:/repos/modular-combat-2"))
         script = root / "tools" / "build" / "gen_map_spawns.py"
         if not script.exists():
             pytest.skip("MC2 checkout not found (set MC2_REPO)")
