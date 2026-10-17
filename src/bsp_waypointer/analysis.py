@@ -413,15 +413,20 @@ def generate_graph(bsp: Any, parser: Any, entities: Any, tracer: Any, density: f
     from .recast_navmesh import RecastConfig, RecastNavmeshGenerator
     from .waypoint_converter import HL2DMWaypointConverter
 
+    from .playable_region import build_region, crop_mesh
+
     extractor = GeometryExtractor()
     mesh = extractor.extract(bsp, parser)
     ladders = extractor.get_ladders()
+    # ADR-0318: the 3D skybox is not meshed, as in hl2dm-waypoint-gen
+    region = build_region(bsp, entities)
+    mesh, _ = crop_mesh(mesh, region)
     if navmesh_kind == "recast":
         navmesh = RecastNavmeshGenerator(RecastConfig()).generate(mesh)
     else:
         navmesh = NavmeshGenerator(NavmeshConfig()).generate(mesh)
     converter = HL2DMWaypointConverter(spacing=calculate_spacing(density), ray_tracer=tracer,
-                                       use_ray_tracing=tracer is not None)
+                                       use_ray_tracing=tracer is not None, region=region)
     waypoints = converter.convert(navmesh, entities, ladders)
     return waypoints, navmesh
 

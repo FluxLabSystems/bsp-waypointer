@@ -58,6 +58,7 @@ from .navmesh_generator import NavigationMesh
 from .vector import Vector3, segment_intersects_aabb, swept_box_intersects_hull
 
 if TYPE_CHECKING:
+    from .playable_region import PlayableRegion
     from .ray_tracer import BSPRayTracer
 
 
@@ -192,6 +193,7 @@ class HL2DMWaypointConverter:
         max_waypoints: int = MAX_WAYPOINTS,
         ray_tracer: Optional["BSPRayTracer"] = None,
         use_ray_tracing: bool = True,
+        region: Optional["PlayableRegion"] = None,
     ):
         """
         Initialize the waypoint converter.
@@ -201,11 +203,16 @@ class HL2DMWaypointConverter:
             max_waypoints: Maximum number of waypoints to generate
             ray_tracer: Optional BSP ray tracer for accurate line-of-sight checks
             use_ray_tracing: Whether to use ray tracing for connections (if tracer available)
+            region: Where waypoints may stand (``playable_region.build_region``): navmesh
+                samples in the 3D skybox are refused, and when the waypoint budget is short
+                the waypoints far from every spawn and pickup are culled first (ADR-0318)
         """
         self.spacing = spacing
         self.max_waypoints = max_waypoints
         self.ray_tracer = ray_tracer
         self.use_ray_tracing = use_ray_tracing
+        self.region = region
+        self.region_report: Dict[str, int] = {"samples_dropped": 0, "teleporters_dropped": 0}
         self._waypoints: List[Waypoint] = []
         self._spatial_hash: Dict[Tuple[int, int, int], List[int]] = {}
         self._cell_size = 128.0
@@ -436,6 +443,16 @@ class HL2DMWaypointConverter:
         # Sample points from navmesh
         sample_points = navmesh.sample_points(self.spacing)
 
+        region = self.region
+        if region is not None and region.active and sample_points:
+            # The mesh was cropped already; this is the second line, for samples
+            # the cropped mesh still yields (a polygon spanning the boundary).
+            keep = region.floor_points_playable(
+                np.array([(p.x, p.y, p.z) for p in sample_points], dtype=np.float64)
+            )
+            self.region_report["samples_dropped"] += int((~keep).sum())
+            sample_points = [p for p, k in zip(sample_points, keep) if k]
+
         for point in sample_points:
             self._add_waypoint(point)
 
@@ -563,7 +580,15 @@ class HL2DMWaypointConverter:
         objective's approach: it is the way out of a spawn area.
         """
         self._approach_origins = getattr(self, "_approach_origins", [])
+        region = self.region
         for teleporter in teleporters:
+            if region is not None and region.active and not (
+                region.contains(teleporter.entrance_origin) and region.contains(teleporter.exit_origin)
+            ):
+                # A trigger_teleport in the skybox (dm_stargate_atlantis_b2-2 has one
+                # beside its sky_camera) is no way anybody walks: no waypoints for it.
+                self.region_report["teleporters_dropped"] += 1
+                continue
             teleporter = Teleporter(
                 entrance_origin=teleporter.entrance_origin,
                 entrance_mins=teleporter.entrance_mins,
@@ -1467,10 +1492,25 @@ class HL2DMWaypointConverter:
         if not self._waypoints:
             return
 
-        min_x = min(wp.origin.x for wp in self._waypoints)
-        max_x = max(wp.origin.x for wp in self._waypoints)
-        min_y = min(wp.origin.y for wp in self._waypoints)
-        max_y = max(wp.origin.y for wp in self._waypoints)
+        # ADR-0318: the budget is anchored to the area the match is played in. A
+        # waypoint more than the margin outside the box round every spawn and
+        # pickup is "far": it takes no part in the grid (so it cannot stretch
+        # it) and only gets what the near waypoints leave over.
+        far_set: Set[int] = set()
+        region = self.region
+        if region is not None and region.has_box:
+            inside = region.inside_box(
+                np.array([(w.origin.x, w.origin.y, w.origin.z) for w in self._waypoints])
+            )
+            far_set = {i for i, ok in enumerate(inside) if not ok}
+            if len(far_set) == len(self._waypoints):
+                far_set = set()
+        near = [wp for i, wp in enumerate(self._waypoints) if i not in far_set]
+
+        min_x = min(wp.origin.x for wp in near)
+        max_x = max(wp.origin.x for wp in near)
+        min_y = min(wp.origin.y for wp in near)
+        max_y = max(wp.origin.y for wp in near)
 
         # Determine grid cell size based on map size and target waypoint count
         # We want roughly sqrt(max_waypoints) cells per axis for good distribution
@@ -1481,7 +1521,11 @@ class HL2DMWaypointConverter:
 
         # Build grid: assign each waypoint to a 2D grid cell (XY plane)
         grid_cells: Dict[Tuple[int, int], List[Tuple[int, int]]] = {}
+        far_pool: List[Tuple[int, int]] = []
         for i, wp in enumerate(self._waypoints):
+            if i in far_set:
+                far_pool.append((i, self._calculate_waypoint_priority(wp)))
+                continue
             cell_x = int((wp.origin.x - min_x) / grid_cell_size)
             cell_y = int((wp.origin.y - min_y) / grid_cell_size)
             cell_key = (cell_x, cell_y)
@@ -1524,6 +1568,13 @@ class HL2DMWaypointConverter:
             # Sort by priority and add top remaining
             remaining_waypoints.sort(key=lambda x: x[1], reverse=True)
             for wp_idx, _ in remaining_waypoints[:remaining_slots]:
+                keep_indices.add(wp_idx)
+
+        # Phase 3: whatever is left of the budget goes to the far waypoints
+        remaining_slots = self.max_waypoints - len(keep_indices)
+        if remaining_slots > 0 and far_pool:
+            far_pool.sort(key=lambda x: x[1], reverse=True)
+            for wp_idx, _ in far_pool[:remaining_slots]:
                 keep_indices.add(wp_idx)
 
         # Filter waypoints and build index mapping

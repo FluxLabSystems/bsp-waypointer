@@ -70,6 +70,7 @@ This document provides comprehensive context for AI assistants working on the BS
 | Geometry Extractor | `geometry_extractor.py` | BSP → triangle mesh |
 | Navmesh Generator | `navmesh_generator.py` | Triangle mesh → navigation mesh |
 | Entity Analyzer | `entity_analyzer.py` | Entity lump → game objects |
+| Playable Region | `playable_region.py` | The 3D skybox's BSP area, the spawn/pickup box, mesh crop, waypoint audit (numpy only) |
 | Waypoint Converter | `waypoint_converter.py` | Navmesh + entities → waypoints |
 | Graph Contract | `graph_contract.py` | Components, main-component choice, RCBot3 load-audit model (stdlib only) |
 | RCW Writer | `rcw_writer.py` | Waypoints → .rcw binary file |
@@ -266,6 +267,29 @@ outside the world model's bounds) is no spawn: it goes to `invalid_spawn_points`
 warns. js_coop_basemission_beta's stripped entity lump has only such a spawn; with no spawn left
 the main component is the largest one.
 
+### The 3D Skybox (MC2 ADR-0318)
+`playable_region.build_region(bsp, entities, extra_points=objectives)` finds the area of the
+leaf each `sky_camera` sits in (`find_sky_areas`; probed on the point and six neighbours, the
+first open leaf with area > 0). The CLI builds it right after the entities and the CTF layout
+and **before** the navmesh: `crop_mesh` drops the triangles whose centroid (or either side of
+their surface) lies in open space of a sky area, so Recast never sees the skybox;
+`_place_navmesh_waypoints` refuses any sample still in it and `_place_teleporter_waypoints`
+skips a teleporter with an end in it (dm_stargate_atlantis_b2-2 has a trigger_teleport beside
+its sky_camera). Rules to keep:
+- **An area that holds a spawn or pickup is never sky.** A camera put inside the map, or a leak,
+  must not wipe the map; `ignored_sky_areas` records it.
+- **The distance box (spawns + pickups, +2000 u) is a hard limit only when the map has a
+  `sky_camera` and no sky area could be isolated** (`hard_box`). A survey of 805 maps showed
+  real terrain beyond 2000 u on dm_runoff, the co-op maps and bf_sidewalk, and the area test
+  alone covers all 161 maps with a `sky_camera`. Teleporters are not anchors (a gate trigger
+  sits beside the skybox's camera on b2-2).
+- **The cap is anchored to the match.** `_optimize_waypoint_count` lays its grid over the
+  waypoints inside the box only; waypoints outside it (far) get what is left over (phase 3).
+  With no region, or no waypoint outside the box, it behaves as before.
+- `audit_waypoints` / the CLI warn above `FAR_SHARE_WARN` (25 %) of live waypoints in the sky or far.
+- `--keep-skybox` and `generate_waypoints(keep_skybox=True)` restore the old behaviour;
+  `analysis.generate_graph` uses the region too.
+
 ### The RCBot3 Output Contract
 - **Edges are proven.** Apart from the explicit entity edges (teleporter, ladder rungs and
   dismounts, door sides, lift pairs, jump pads), every connection passes `_can_connect`.
@@ -444,6 +468,9 @@ mypy src                    # Type check
 - `test_coop_spawns.py`: Coop spawn rooms (recorded entity lumps of the five maps that once got
   no waypoints), spawns outside the world, the trigger touch rules, `./models/` paths
 - `test_navmesh_sampling.py`: Seeded sampling
+- `test_playable_region.py`: ADR-0318, on a hand-built two-area BSP tree: point location, the sky
+  area (and the "an area with a spawn is never sky" rule), mesh crop, refused samples and
+  teleporters, the near/far budget, the audit
 - `test_analysis_graph.py`, `test_tactical_metrics.py`, `test_pvm_candidates.py`,
   `test_hoarder_candidates.py`, `test_mode_scores.py`: map analysis on synthetic graphs
   (`tests/analysis_scenes.py`) and synthetic geometry (`BoxWorldProbe`, a one-brush BSP)

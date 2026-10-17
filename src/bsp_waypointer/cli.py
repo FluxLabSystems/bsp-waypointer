@@ -25,6 +25,13 @@ from .constants import (
 from .entity_analyzer import HL2DMEntityAnalyzer
 from .geometry_extractor import GeometryExtractor
 from .navmesh_generator import NavmeshConfig, NavmeshGenerator
+from .playable_region import (
+    FAR_SHARE_WARN,
+    SKYBOX_MARGIN,
+    audit_waypoints,
+    build_region,
+    crop_mesh,
+)
 from .ray_tracer import BSPRayTracer
 from .rcw_writer import write_waypoints
 from .recast_navmesh import RecastConfig, RecastNavmeshGenerator, is_recast_available
@@ -163,6 +170,29 @@ Examples:
             "An MC2 CTF layout (<map>.ctf.txt), or a directory of them: flag the "
             "flag stands W_FL_FLAG, the scoring zones and control points "
             "W_FL_CAPPOINT, and the ground around each stand W_FL_DEFEND"
+        ),
+    )
+
+    skybox = parser.add_argument_group("Skybox (ADR-0318)")
+    skybox.add_argument(
+        "--keep-skybox",
+        action="store_true",
+        help=(
+            "Do not keep the 3D skybox out of the waypoints. By default the "
+            "geometry in the sky_camera's BSP area is not meshed (nor, when that "
+            "area cannot be told apart from the map's, anything farther than "
+            "--playable-margin from every spawn and pickup), so the waypoint "
+            "budget is spent on the playable map"
+        ),
+    )
+    skybox.add_argument(
+        "--playable-margin",
+        type=float,
+        default=SKYBOX_MARGIN,
+        metavar="N",
+        help=(
+            "How far outside the box round every spawn and pickup a waypoint may "
+            "be before it counts as far from the match (default: %(default)s)"
         ),
     )
 
@@ -318,6 +348,46 @@ Examples:
     return parser
 
 
+def _crop_to_region(mesh, region, map_name):
+    """Drop the triangles outside the playable region; say what was found."""
+    if region.sky_cameras:
+        if region.sky_areas:
+            logger.info(
+                f"  3D skybox: sky_camera area {sorted(region.sky_areas)} is kept out of the waypoints"
+            )
+        else:
+            logger.warning(
+                f"  {map_name} has a sky_camera but its area cannot be told apart from the "
+                f"map's: only the distance limit ({region.margin:g} u from every spawn and "
+                f"pickup) applies"
+            )
+    cropped, dropped = crop_mesh(mesh, region)
+    if dropped:
+        logger.info(
+            f"  Skybox/far geometry: {dropped} of {mesh.num_triangles} triangles "
+            f"({dropped / max(mesh.num_triangles, 1):.0%}) are outside the playable map "
+            f"and not meshed"
+        )
+    return cropped
+
+
+def _report_region(region, converter, waypoints) -> None:
+    """After the conversion: how many waypoints sit where nobody plays."""
+    rep = getattr(converter, "region_report", {})
+    if rep.get("samples_dropped") or rep.get("teleporters_dropped"):
+        logger.info(
+            f"  Skybox: {rep.get('samples_dropped', 0)} navmesh sample(s) and "
+            f"{rep.get('teleporters_dropped', 0)} teleporter(s) outside the playable map refused"
+        )
+    audit = audit_waypoints(waypoints, region)
+    if audit["warn"]:
+        logger.warning(
+            f"  {max(audit['sky'], audit['far']):.0%} of the live waypoints are in the skybox "
+            f"or more than {region.margin:g} u from every spawn and pickup "
+            f"(limit {FAR_SHARE_WARN:.0%}): the budget was spent where nobody plays"
+        )
+
+
 def log_connectivity_report(report: dict, total_waypoints: int) -> None:
     """Log the converter's connectivity report and warn about what it flagged."""
     logger.info(
@@ -358,6 +428,50 @@ def calculate_spacing(density: float) -> float:
     return max_spacing - (max_spacing - min_spacing) * density
 
 
+def _analyze_entities(bsp, include_entities, include_chargers, include_ammo, include_teleporters):
+    """Parse the HL2DM entities (and apply the --no-* filters)."""
+    if include_entities:
+        logger.info("Analyzing HL2DM entities...")
+        analyzer = HL2DMEntityAnalyzer()
+        entities = analyzer.analyze(bsp)
+        logger.info(f"  Spawn points: {len(entities.spawn_points)}")
+        for bad in getattr(entities, "invalid_spawn_points", []):
+            o = bad.origin
+            logger.warning(
+                f"  ignored a spawn outside the world at ({o.x:g} {o.y:g} {o.z:g}): "
+                f"no player can spawn there"
+            )
+        if not entities.spawn_points:
+            logger.warning(
+                "  no usable player spawn: the main component is the largest one"
+            )
+        logger.info(f"  Weapons: {len(entities.weapons)}")
+        logger.info(f"  Health items: {len(entities.health_items)}")
+        logger.info(f"  Armor items: {len(entities.armor_items)}")
+        logger.info(f"  Chargers: {len(entities.chargers)}")
+        logger.info(f"  Ammo pickups: {len(entities.ammo_pickups)}")
+        logger.info(f"  Teleporters: {len(entities.teleporters)}")
+        logger.info(f"  Doors: {len(entities.doors)}")
+        logger.info(f"  Prop obstacles: {len(getattr(entities, 'prop_obstacles', []))}")
+        logger.info(f"  Push volumes: {len(getattr(entities, 'push_volumes', []))}")
+        logger.info(f"  Hurt volumes: {len(getattr(entities, 'hurt_volumes', []))}")
+        logger.info(f"  Useable ladders: {len(getattr(entities, 'useable_ladders', []))}")
+        logger.info(f"  Lifts: {len(getattr(entities, 'lifts', []))}")
+
+        # Apply filters
+        if not include_chargers:
+            entities.chargers = []
+        if not include_ammo:
+            entities.ammo_pickups = []
+            entities.ammo_crates = []
+        if not include_teleporters:
+            entities.teleporters = []
+    else:
+        from .entity_analyzer import HL2DMEntityData
+        entities = HL2DMEntityData()
+    return entities
+
+
 def generate_waypoints(
     bsp_path: Path,
     output_path: Optional[Path] = None,
@@ -389,6 +503,8 @@ def generate_waypoints(
     hoarder_out: Optional[Path] = None,
     hull_large: Tuple[float, float] = (80.0, 100.0),
     analysis_seed: int = 0,
+    keep_skybox: bool = False,
+    playable_margin: float = SKYBOX_MARGIN,
 ) -> int:
     """
     Generate waypoints from a BSP file.
@@ -453,6 +569,30 @@ def generate_waypoints(
             logger.info(f"  BSP leafs: {len(bsp.leafs)}")
             logger.info(f"  Brushes: {len(bsp.brushes)}")
 
+        # Entities and the CTF layout come first: the playable region (where
+        # the match is, as opposed to the 3D skybox) is built from them and
+        # crops the mesh before the navmesh is made.
+        entities = _analyze_entities(
+            bsp, include_entities, include_chargers, include_ammo, include_teleporters
+        )
+
+        # MC2 ADR-0264: the layout first, so each objective gets a waypoint on it.
+        layout = None
+        layout_path = None
+        objectives = []
+        if ctf_layout is not None:
+            from .ctf_layout import load_layout, objective_positions, resolve_layout_path
+
+            layout_path = resolve_layout_path(Path(ctf_layout), map_name)
+            if layout_path is not None:
+                layout = load_layout(layout_path)
+                objectives = objective_positions(layout)
+
+        region = None
+        if not keep_skybox:
+            region = build_region(bsp, entities, extra_points=objectives, margin=playable_margin)
+            mesh = _crop_to_region(mesh, region, map_name)
+
         # Generate navigation mesh
         logger.info("Generating navigation mesh...")
 
@@ -486,46 +626,6 @@ def generate_waypoints(
 
         logger.info(f"  Navigation polygons: {navmesh.num_polygons}")
 
-        # Analyze entities
-        if include_entities:
-            logger.info("Analyzing HL2DM entities...")
-            analyzer = HL2DMEntityAnalyzer()
-            entities = analyzer.analyze(bsp)
-            logger.info(f"  Spawn points: {len(entities.spawn_points)}")
-            for bad in getattr(entities, "invalid_spawn_points", []):
-                o = bad.origin
-                logger.warning(
-                    f"  ignored a spawn outside the world at ({o.x:g} {o.y:g} {o.z:g}): "
-                    f"no player can spawn there"
-                )
-            if not entities.spawn_points:
-                logger.warning(
-                    "  no usable player spawn: the main component is the largest one"
-                )
-            logger.info(f"  Weapons: {len(entities.weapons)}")
-            logger.info(f"  Health items: {len(entities.health_items)}")
-            logger.info(f"  Armor items: {len(entities.armor_items)}")
-            logger.info(f"  Chargers: {len(entities.chargers)}")
-            logger.info(f"  Ammo pickups: {len(entities.ammo_pickups)}")
-            logger.info(f"  Teleporters: {len(entities.teleporters)}")
-            logger.info(f"  Doors: {len(entities.doors)}")
-            logger.info(f"  Prop obstacles: {len(getattr(entities, 'prop_obstacles', []))}")
-            logger.info(f"  Push volumes: {len(getattr(entities, 'push_volumes', []))}")
-            logger.info(f"  Hurt volumes: {len(getattr(entities, 'hurt_volumes', []))}")
-            logger.info(f"  Useable ladders: {len(getattr(entities, 'useable_ladders', []))}")
-            logger.info(f"  Lifts: {len(getattr(entities, 'lifts', []))}")
-
-            # Apply filters
-            if not include_chargers:
-                entities.chargers = []
-            if not include_ammo:
-                entities.ammo_pickups = []
-                entities.ammo_crates = []
-            if not include_teleporters:
-                entities.teleporters = []
-        else:
-            from .entity_analyzer import HL2DMEntityData
-            entities = HL2DMEntityData()
 
         # Convert to waypoints
         logger.info("Converting to waypoints...")
@@ -537,22 +637,14 @@ def generate_waypoints(
             max_waypoints=max_waypoints,
             ray_tracer=ray_tracer,
             use_ray_tracing=use_ray_tracing,
+            region=region,
         )
-        # MC2 ADR-0264: the layout first, so each objective gets a waypoint on it.
-        layout = None
-        layout_path = None
-        objectives = []
-        if ctf_layout is not None:
-            from .ctf_layout import load_layout, objective_positions, resolve_layout_path
-
-            layout_path = resolve_layout_path(Path(ctf_layout), map_name)
-            if layout_path is not None:
-                layout = load_layout(layout_path)
-                objectives = objective_positions(layout)
         waypoints = converter.convert(navmesh, entities, ladders, objectives=objectives)
         logger.info(f"  Total waypoints: {len(waypoints)}")
         if objectives:
             logger.info(f"  CTF objectives: {len(objectives)} waypoint(s) placed on them")
+        if region is not None:
+            _report_region(region, converter, waypoints)
         team_hz = getattr(converter, "team_hazard_waypoints", 0)
         if team_hz:
             logger.info(f"  Team-only hazards: {team_hz} waypoint(s) barred to one team")
@@ -728,6 +820,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         hoarder_out=args.hoarder_out,
         hull_large=args.hull_large,
         analysis_seed=args.analysis_seed,
+        keep_skybox=args.keep_skybox,
+        playable_margin=args.playable_margin,
     )
 
 
