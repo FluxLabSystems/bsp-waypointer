@@ -21,7 +21,8 @@ A standalone command-line tool that parses Source Engine `.bsp` map files and au
   - Waypoints no traversable connection joins to the main component are flagged
     `W_FL_UNREACHABLE`, never bridged
   - Sniper position detection
-  - Waypoint count optimization (respects RCBot3's 2048-waypoint and 255-path limits)
+  - Waypoint count optimization (respects RCBot3's 2048-waypoint and 255-path limits);
+    the budget is spent on the playable map, never on the 3D skybox
   - Reproducible: the same map converts to the same file on every run
 - **RCBot3 Output**: Writes `.rcw` v5 files with RCBot3's own flag table, checked against
   RCBot3's loader and its load-time graph audit before an existing file is replaced
@@ -85,6 +86,11 @@ Entity Options:
   --no-ammo               Skip ammo pickup waypoints
   --no-teleporters        Skip teleporter waypoints
   --no-entities           Skip entity parsing (geometry only)
+
+Skybox Options (see "The 3D skybox"):
+  --keep-skybox           Mesh and sample the 3D skybox like the map (the old behaviour)
+  --playable-margin N     Distance from the spawn/pickup box beyond which a waypoint is "far"
+                          (default: 2000)
 
 Agent Parameters:
   --agent-height N        Agent height in units (default: 72)
@@ -197,6 +203,22 @@ hl2dm-map-analyze <map.bsp> [<map.bsp> ...]
 hl2dm-waypoint-gen ... --analysis FILE|DIR [--pvm-nodes FILE|DIR] [--hoarder-out FILE|DIR]
                        [--hull-large W,H] [--analysis-seed N]
 ```
+
+## The 3D skybox
+
+A map's 3D skybox (the miniature world round `sky_camera`) is real geometry in the BSP.
+Left in, it is meshed and sampled like the map and eats the 2048-waypoint budget:
+`dm_stargate_atlantis_b3-2` had 1740 of its 2048 waypoints at z 6759..6836, 7000 units
+above any spawn or pickup, and 308 on the city itself. The generator therefore finds the
+skybox's BSP *area* (the area of the leaf the `sky_camera` sits in; VBSP gives a sealed
+room an area of its own) and does not mesh, sample or place teleporter waypoints in it
+(`playable_region.py`). An area that also holds a player spawn or a pickup is never
+treated as sky. When a map has a `sky_camera` whose area cannot be told apart from the
+map's, anything farther than 2000 units from the box round every spawn and pickup is
+dropped as well (`--playable-margin`). On every map, when the budget has to cull, the
+waypoints far from that box go last and do not stretch the culling grid. A finished graph
+with more than 25 % of its live waypoints in the sky (or far from the match) logs a
+warning. `--keep-skybox` turns all of it off.
 
 ## Waypoint Flags
 
