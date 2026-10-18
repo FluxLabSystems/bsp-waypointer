@@ -49,6 +49,7 @@ all = [
 [project.scripts]
 hl2dm-waypoint-gen = "bsp_waypointer.cli:main"
 hl2dm-map-analyze = "bsp_waypointer.map_analyze_cli:main"
+hl2dm-trail = "bsp_waypointer.trail_cli:main"
 
 [project.urls]
 Homepage = "https://github.com/FluxLabSystems/bsp-waypointer"

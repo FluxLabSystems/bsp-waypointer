@@ -204,6 +204,63 @@ hl2dm-waypoint-gen ... --analysis FILE|DIR [--pvm-nodes FILE|DIR] [--hoarder-out
                        [--hull-large W,H] [--analysis-seed N]
 ```
 
+## Human Trail
+
+`hl2dm-trail` (also `hl2dm-waypoint-gen trail ...`) turns recordings of real play
+(MCREC v1, the `*.mcrec.jsonl` files Modular Combat 2 writes with `mc_record`) into
+(1) a per-map **human traffic file** (`<map>.rch`, RCHT v1) that RCBot3 reads to prefer the
+routes and goals people use, and (2) **waypoint proposals**: the ground, jumps, drops and
+ladders a person used that the generated graph lacks. ADR-0325.
+
+```bash
+# where humans go on the existing graph -> aux_data/<mod>/<map>.rch
+hl2dm-trail traffic --rcw dm_lockdown.rcw --mcrec recordings/ --out dm_lockdown.rch
+
+# where they went that the graph cannot follow -> a JSON list with evidence counts
+hl2dm-trail propose --rcw dm_lockdown.rcw --mcrec recordings/ --out proposals.json
+
+# the proposals seen at least 3 times, as a new valid .rcw (the input is never touched)
+hl2dm-trail apply --rcw dm_lockdown.rcw --proposals proposals.json --min-evidence 3 --out new/dm_lockdown.rcw
+```
+
+`--mcrec` takes files and folders (searched recursively; recordings of other maps are
+skipped). `--who` is `human` (default), one SteamID64, `bot` or `all`.
+
+* **Attribution.** A sample belongs to the nearest waypoint within 128 units (and 72 of
+  height); it stays on that waypoint until another is 16 units closer. A run of samples is a
+  visit; a move between two waypoints that are graph neighbours is an edge traversal (a gap
+  of two hops counts both hops). Tracks never cross a death, spawn, teleport or silence of
+  more than a second; a still stretch over two minutes is AFK and ignored.
+* **`traffic`** writes the RCHT v1 object: per waypoint the share of human time and visits,
+  per edge the traversals, and a `hot` list (`hold`: still 3 s+ at least twice, 6 s in all;
+  `fight`: 8+ kill/death/damage events; `pickup`: 3+). Every entry carries
+  `RCBot_PositionHash` of the waypoint origin (`poshash.py`, a port of RCBot3's
+  `bot_poshash.h` checked against hashes printed by the real header), so RCBot3 drops the
+  entries of any waypoint that has since moved. Nothing is written when no sample matches.
+* **`propose`** finds (a) *new waypoints*: grounded ground more than 192 units from every
+  waypoint gets one on the trace at the generator's spacing (150; ladders 96/72), shared by
+  every pass over it; (b) *new links*: consecutive waypoints visited with no edge, where
+  the player came within 80 units of both and the graph's own route is missing or more
+  than 1.5 times the direct distance. A link is typed `ladder` (ladder events) over `drop`
+  (a `land` with fall over 64) over `jump` (a `jump` event; its takeoff point is kept)
+  over `walk`; recordings made before the movement events existed are typed from the
+  samples. Each node and link has `evidence` (visits/traversals) and `lives` (distinct
+  alive stretches).
+* **`apply`** takes the proposals with `evidence >= --min-evidence` (default 2) and
+  `lives >= --min-lives`, refuses a `.rcw` that is not the one they were made against (count
+  and hash of every waypoint they name), drops any new waypoint that is not in the same
+  strongly connected component as the existing graph (a pocket the player never left),
+  stays within 2048 waypoints (least evidence goes first) and writes a file that passes
+  `rcw_validator`. Existing waypoints are never removed or reordered; their yaw, area,
+  radius and the author field are kept. A jump link gets a launch point (the waypoint within
+  64 units of the takeoff, flagged `W_FL_JUMP`, or a new one there) unless
+  `--no-jump-flags`. Links touching `W_FL_UNREACHABLE` waypoints need `--unflag`, which
+  clears the flag on those that end up in the main component. `--symmetric` also adds the
+  way back along flat walks and ladders. A `.rcw` with a `.rcv` visibility table is refused.
+
+Every threshold is a field of `trail.TrailParams` (a few are command-line options).
+Output is deterministic: the same inputs give byte-identical files.
+
 ## The 3D skybox
 
 A map's 3D skybox (the miniature world round `sky_camera`) is real geometry in the BSP.
@@ -366,7 +423,12 @@ bsp-waypointer/
 │   ├── hoarder_candidates.py # Map analysis: Hoarder candidates, <map>.hoarder.txt
 │   ├── mode_scores.py        # Map analysis: advisory per-mode scores
 │   ├── analysis.py           # Map analysis: the JSON artifact, checksum, analyze_map
-│   └── map_analyze_cli.py    # hl2dm-map-analyze
+│   ├── map_analyze_cli.py    # hl2dm-map-analyze
+│   ├── poshash.py            # RCBot_PositionHash (port of bot_poshash.h)
+│   ├── mcrec.py              # MCREC v1 recordings -> tracks
+│   ├── rcw_doc.py            # Lossless editable .rcw
+│   ├── trail.py              # Human trail: traffic (.rch), proposals, apply
+│   └── trail_cli.py          # hl2dm-trail
 ├── docs/map_analysis.md      # The analysis JSON schema
 ├── tests/                    # Unit tests
 ├── pyproject.toml            # Project configuration
