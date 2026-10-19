@@ -85,6 +85,10 @@ This document provides comprehensive context for AI assistants working on the BS
 | Mode Scores | `mode_scores.py` | Map analysis: advisory dm/tdm/pvm/pvpvm/hoarder/ctf scores |
 | Analysis | `analysis.py` | Map analysis: `analyze_map`, the JSON artifact and its checksum |
 | Map Analyze CLI | `map_analyze_cli.py` | `hl2dm-map-analyze` |
+| Position Hash | `poshash.py` | `RCBot_PositionHash`, ported exactly (FNV-1a over floor(float32/32)); vectors printed by the real header |
+| MCREC | `mcrec.py` | MCREC v1 gameplay recordings -> continuous alive tracks (stdlib only) |
+| RCW Doc | `rcw_doc.py` | Lossless, editable `.rcw` (yaw/area/radius/author kept); `save` validates first |
+| Human Trail | `trail.py`, `trail_cli.py` | ADR-0325: `hl2dm-trail traffic, propose, apply` (also `hl2dm-waypoint-gen trail ...`) |
 
 ## Code Conventions
 
@@ -318,6 +322,17 @@ its sky_camera). Rules to keep:
   is written only on request (`--metadata`); RCBot3 does not read it.
 - **Reproducible.** Navmesh sampling is seeded, so a map converts the same way every run.
 
+### Human Trail (MC2 ADR-0325)
+`hl2dm-trail traffic|propose|apply` (README "Human Trail" has the rules). Invariants to keep:
+- **RCHT v1 is RCBot3's reader contract** (`bot_trail_store.h`): keys `v map rcw_waypoints source files
+  human_seconds players waypoints edges hot`, `t` in 0..1, edge `n >= 1`, `why` in hold|fight|pickup.
+  Do not add keys the spec does not list without checking that reader.
+- **Hashes are `RCBot_PositionHash`** of the float32 origin. Never change `poshash.py` without the C++.
+- **Apply never removes or reorders a waypoint**, keeps yaw/area/radius/author, validates before it
+  replaces anything, and keeps the output no worse than the input (strict contract only if the input met it).
+- **Tracks never cross a death, spawn, teleport or gap**: no link is proposed across one.
+- **Deterministic**: sorted iteration, no clocks; same inputs, byte-identical outputs.
+
 ### Map Analysis (MC2 Phase 8)
 `hl2dm-map-analyze` and `hl2dm-waypoint-gen --analysis` write the
 `bsp_waypointer_map_analysis` JSON artifact (v1.0.0), schema in `docs/map_analysis.md`.
@@ -475,6 +490,9 @@ mypy src                    # Type check
   `test_hoarder_candidates.py`, `test_mode_scores.py`: map analysis on synthetic graphs
   (`tests/analysis_scenes.py`) and synthetic geometry (`BoxWorldProbe`, a one-brush BSP)
 - `test_analysis_schema.py`: the JSON's required keys, checksum, byte-identical output
+- `test_trail.py` (+ `trail_scenes.py`, the synthetic MCREC/`.rcw` builders): the position hash against
+  hashes from RCBot3's real header, the MCREC reader, RCHT v1, proposal and apply rules, the CLI. No
+  test uses a recording from the game
 - `test_cli_analysis.py`: `hl2dm-map-analyze` and `--analysis`; opt-in real map with
   `HL2DM_BSP_DIR` + `HL2DM_RCW_DIR` (+ `MC2_GRAPHS_DIR`, `HL2DM_ANALYSIS_MAP`).
   `test_pvm_candidates.py` checks parity with MC2's `gen_map_spawns.py` when an MC2

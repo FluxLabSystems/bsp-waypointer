@@ -774,6 +774,11 @@ def run_analysis(
 
 def main(argv: Optional[List[str]] = None) -> int:
     """Main entry point."""
+    raw = sys.argv[1:] if argv is None else list(argv)
+    if raw and raw[0] == "trail":
+        # human trail tools (ADR-0325): hl2dm-waypoint-gen trail traffic|propose|apply ...
+        from .trail_cli import main as trail_main
+        return trail_main(raw[1:])
     parser = create_parser()
     args = parser.parse_args(argv)
 
