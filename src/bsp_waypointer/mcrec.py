@@ -24,6 +24,7 @@ from __future__ import annotations
 import gzip
 import json
 import math
+import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, Iterable, Iterator, List, NamedTuple, Optional, Sequence, Tuple, Union
@@ -103,6 +104,7 @@ class FileStats:
     tracks: int = 0
     samples: int = 0
     excluded_players: int = 0     # samples of players the filter left out
+    torn: int = 0                 # 1 when the gzip stream ended early / was corrupt (kept what was read)
 
 
 @dataclass
@@ -172,18 +174,35 @@ def _open(path: Path):
     return open(path, "r", encoding="utf-8", errors="replace")
 
 
+def _lines(f, stats: Optional["FileStats"] = None) -> Iterator[str]:
+    """Lines of an open recording. A truncated or corrupt gzip stream (the game
+    crashed mid-write) ends the iteration there instead of raising; ``stats.torn``
+    notes it (MC2 ADR-0353, audit S20-1)."""
+    it = iter(f)
+    while True:
+        try:
+            line = next(it)
+        except StopIteration:
+            return
+        except (EOFError, zlib.error, gzip.BadGzipFile, OSError):
+            if stats is not None:
+                stats.torn = 1
+            return
+        yield line
+
+
 def read_header(path: Union[str, Path]) -> dict:
     """The ``hdr`` object of a recording (its first non-empty line). McrecError if none."""
     p = Path(path)
     try:
         with _open(p) as f:
-            for line in f:
+            for line in _lines(f):
                 line = line.strip()
                 if not line:
                     continue
                 try:
                     obj = json.loads(line)
-                except ValueError:
+                except (ValueError, RecursionError):
                     raise McrecError(f"{p.name}: first line is not JSON") from None
                 if not isinstance(obj, dict) or obj.get("t") != "hdr":
                     raise McrecError(f"{p.name}: no hdr line")
@@ -242,14 +261,14 @@ def read_file(
             done.append(tr)
 
     with _open(p) as f:
-        for line in f:
+        for line in _lines(f, stats):
             line = line.strip()
             if not line:
                 continue
             stats.lines += 1
             try:
                 obj = json.loads(line)
-            except ValueError:
+            except (ValueError, RecursionError):
                 stats.bad_lines += 1
                 continue
             if not isinstance(obj, dict):
@@ -284,7 +303,8 @@ def read_file(
                     continue
                 pv = _vec(obj.get("p"))
                 ts = obj.get("ts")
-                if pv is None or not isinstance(ts, (int, float)):
+                if (pv is None or isinstance(ts, bool) or not isinstance(ts, (int, float))
+                        or not math.isfinite(ts)):
                     stats.bad_lines += 1
                     continue
                 f_bits = int(_num(obj.get("f"), 0))

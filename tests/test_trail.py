@@ -158,6 +158,37 @@ class TestMcrecReader:
         r.walk(1, S.path_x(100, 200), t)
         assert len(_read(r, tmp_path).tracks) == 1
 
+    def test_non_finite_ts_and_deep_nesting_lines_are_counted_not_fatal(self, tmp_path):
+        r = S.Rec()
+        r.player(1)
+        r.walk(1, S.path_x(0, 100), 0.0)
+        text = (r.text() + '{"t":"s","ts":NaN,"id":1,"p":[1,2,3]}\n'
+                + '{"t":"s","ts":Infinity,"id":1,"p":[1,2,3]}\n'
+                + '{"t":"s","ts":1e999,"id":1,"p":[1,2,3]}\n'
+                + '{"t":"s","ts":true,"id":1,"p":[1,2,3]}\n'
+                + '{"t":"s","ts":2.0,"id":1,"p":[1,2,3],"x":' + "[" * 100000 + "]" * 100000 + "}\n")
+        p = tmp_path / "n.mcrec.jsonl"
+        p.write_text(text, encoding="utf-8")
+        fd = mcrec.read_file(p, mcrec.player_filter("human"))
+        assert fd.stats.bad_lines >= 4
+        assert all(math.isfinite(sm.ts) for tr in fd.tracks for sm in tr.samples)
+        assert len(fd.tracks) == 1 and len(fd.tracks[0].samples) == 5
+
+    def test_truncated_gzip_keeps_what_was_read_and_counts_torn(self, tmp_path):
+        r = S.Rec()
+        r.player(1)
+        r.walk(1, S.path_x(0, 400), 0.0)
+        raw = gzip.compress(r.text().encode("utf-8"))
+        p = tmp_path / "t.mcrec.jsonl.gz"
+        p.write_bytes(raw[: len(raw) - 12])                       # the game died mid-write
+        fd = mcrec.read_file(p, mcrec.player_filter("human"))     # must not raise
+        assert fd.stats.torn == 1
+        # a corrupt stream is skipped, not raised out of iter_files
+        q = tmp_path / "c.mcrec.jsonl.gz"
+        q.write_bytes(raw[:30] + b"\x00" * 40)
+        got = list(mcrec.iter_files([q, p], None, mcrec.player_filter("human")))
+        assert isinstance(got, list)
+
     def test_torn_unknown_and_orphan_lines_are_counted_not_fatal(self, tmp_path):
         r = S.Rec()
         r.player(1)
