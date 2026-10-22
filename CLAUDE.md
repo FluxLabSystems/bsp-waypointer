@@ -307,7 +307,7 @@ its sky_camera). Rules to keep:
   look, not a walk, and keeps reading `CONTENTS_SOLID` leaves. The walking tests use the player
   mask: the hull sweep's leaf test, `point_in_player_solid`, `walk_path_clear` (a thin box
   swept over every player-solid world brush, detail and clip included, blocked only when it is
-  blocked at both 18 and 36 units up; calibrated on 12,000 real owner movement segments with no
+  blocked at both 18 and 36 units up; calibrated on 26,000 real owner movement segments (8 maps) with no
   false block) on EVERY edge, a drop passing when its chord is clear or when the walk to
   `drop_lip` and the fall from it are. Before any edge exists `_ground_waypoints` (and
   `_cull_blocked_samples` for plain samples) deals with a waypoint in player-solid world
