@@ -79,6 +79,194 @@ class BSPRayTracer:
             return False
         return bool(self.bsp.leafs[leaf_index].contents & ContentFlags.CONTENTS_SOLID)
 
+    def player_solid_contents_at(self, point: Vector3) -> int:
+        """The MASK_PLAYERSOLID world contents at a point: the leaf's, plus every
+        player-solid brush listed in the leaf that holds the point. 0 in open air.
+
+        Detail and clip brushes do not always reach the leaf's contents, so the
+        brushes are tested too. A point on a brush face is outside it.
+        """
+        if not self.bsp.nodes:
+            return 0
+        idx = 0
+        while idx >= 0:
+            if idx >= len(self.bsp.nodes):
+                return 0
+            node = self.bsp.nodes[idx]
+            if node.plane_index >= len(self.bsp.planes):
+                return 0
+            plane = self.bsp.planes[node.plane_index]
+            idx = node.children[0] if plane.distance_to_point(point) >= 0 else node.children[1]
+        leaf_index = -1 - idx
+        if leaf_index >= len(self.bsp.leafs):
+            return 0
+        leaf = self.bsp.leafs[leaf_index]
+        found = int(leaf.contents) & int(PLAYER_SOLID_CONTENTS)
+        for k in range(leaf.num_leaf_brushes):
+            lb = leaf.first_leaf_brush + k
+            if lb >= len(self.bsp.leaf_brushes):
+                continue
+            brush_index = self.bsp.leaf_brushes[lb]
+            if brush_index >= len(self.bsp.brushes):
+                continue
+            brush = self.bsp.brushes[brush_index]
+            if not (brush.contents & PLAYER_SOLID_CONTENTS):
+                continue
+            if self._point_in_brush(brush, point):
+                found |= int(brush.contents) & int(PLAYER_SOLID_CONTENTS)
+        return found
+
+    def point_in_player_solid(self, point: Vector3) -> bool:
+        """Whether a point is inside anything the player collides with in the world.
+
+        point_in_solid reads CONTENTS_SOLID leaf contents only. This reads
+        MASK_PLAYERSOLID's world bits (solid, window, grate, player clip); see
+        player_solid_contents_at.
+        """
+        return self.player_solid_contents_at(point) != 0
+
+    def lift_onto_surface(
+        self,
+        origin: Vector3,
+        max_lift: float = 40.0,
+        plateau: float = 12.0,
+        tolerance: float = 14.0,
+    ) -> Optional[Vector3]:
+        """Where a walker stands when a point is buried in a thin slab of player-solid world.
+
+        A navmesh sample can lie inside the floor it belongs to: the bottom of a
+        grate, a clip ramp laid over stairs (the treads are inside it). The floor
+        is the slab's top. Returns the point on that top when it is no more than
+        max_lift above the point, the top is a plateau (the ground at four points
+        plateau units round it is within tolerance of the same height: not a
+        railing's edge), and a standing player fits on it (nothing player-solid
+        20, 34 and 66 units above it). None otherwise: the point is in a wall, a
+        clip room or a thick block, or in open air.
+        """
+        top = self.ground_height(
+            origin.x, origin.y, origin.z, probe_up=0.0, probe_down=0.0, step_height=max_lift
+        )
+        if top is None or top - origin.z > max_lift:
+            return None
+        top = max(top, origin.z)
+        for dx, dy in ((plateau, 0.0), (-plateau, 0.0), (0.0, plateau), (0.0, -plateau)):
+            side = self.ground_height(
+                origin.x + dx, origin.y + dy, top, probe_up=0.0, probe_down=2.0 * tolerance,
+                step_height=tolerance,
+            )
+            if side is None or abs(side - top) > tolerance:
+                return None
+        for h in (20.0, 34.0, 66.0):
+            if self.point_in_player_solid(Vector3(origin.x, origin.y, top + h)):
+                return None
+        return Vector3(origin.x, origin.y, top)
+
+    def _point_in_brush(self, brush: Brush, point: Vector3) -> bool:
+        """Whether a point is strictly inside a convex brush."""
+        if brush.num_sides <= 0:
+            return False
+        for k in range(brush.num_sides):
+            side_index = brush.first_side + k
+            if side_index >= len(self.bsp.brush_sides):
+                return False
+            side = self.bsp.brush_sides[side_index]
+            if side.plane_index >= len(self.bsp.planes):
+                return False
+            if self.bsp.planes[side.plane_index].distance_to_point(point) >= 0:
+                return False
+        return True
+
+    def floor_support(
+        self,
+        origin: Vector3,
+        reach: float = 72.0,
+        spread: float = 10.0,
+        step_height: float = 18.0,
+    ) -> Optional[float]:
+        """Height of the world floor a player standing at origin has within reach below.
+
+        Looks for player-solid world brushes under the origin and under four
+        points spread units round it (a waypoint on a ledge edge counts), and
+        returns the highest top found that is no more than reach below the
+        origin; None when there is none. A top up to step_height above the
+        origin counts (a waypoint sunk slightly into its floor). Brushes only:
+        displacements, props and brush entities are not seen.
+        """
+        best: Optional[float] = None
+        for dx, dy in ((0.0, 0.0), (spread, 0.0), (-spread, 0.0), (0.0, spread), (0.0, -spread)):
+            top = self.ground_height(
+                origin.x + dx, origin.y + dy, origin.z,
+                probe_up=0.0, probe_down=reach, step_height=step_height,
+            )
+            if top is None or top < origin.z - reach:
+                continue
+            if best is None or top > best:
+                best = top
+        return best
+
+    def walk_path_clear(
+        self,
+        start: Vector3,
+        end: Vector3,
+        heights: Tuple[float, ...] = (18.0, 36.0),
+        half_width: float = 2.0,
+    ) -> bool:
+        """Whether a walker's body line from start to end is free of player-solid world brushes.
+
+        Sweeps a thin box (half_width wide, 2 units tall) over every
+        player-solid world brush, detail and player-clip brushes included, at
+        each height above the two feet. The path is blocked when it is
+        blocked at EVERY height: a wall or a clip brush stops a walker at all
+        of them, a low ledge or a crouch gap only at some. Calibrated on real
+        bot movement (no false blocks on 2,777 position pairs under 100 units
+        apart, ADR-0344).
+        """
+        box_lo = Vector3(-half_width, -half_width, -1.0)
+        box_hi = Vector3(half_width, half_width, 1.0)
+        for h in heights:
+            a = Vector3(start.x, start.y, start.z + h)
+            b = Vector3(end.x, end.y, end.z + h)
+            tr = self.trace_brushes(
+                a, b, box_lo, box_hi, contents_mask=int(PLAYER_SOLID_CONTENTS)
+            )
+            if tr.fraction >= 1.0 and not tr.start_solid:
+                return True
+        return False
+
+    def drop_lip(
+        self,
+        start: Vector3,
+        end: Vector3,
+        sample_spacing: float = 8.0,
+        step_height: float = 18.0,
+    ) -> Vector3:
+        """Where a walker leaves the ledge it stands on, going from start toward end.
+
+        Walks the straight horizontal line toward end at start's height and
+        returns the first point past the last sample that still has ground
+        within step_height under it (the point itself when the very first
+        sample has none, or when the ground never ends before end). A rise
+        of the ground above step_height ends the walk too: that is a wall, not
+        a lip. The returned point is level with start.
+        """
+        horizontal = start.distance_to_2d(end)
+        if horizontal <= 0.0:
+            return start
+        samples = max(1, int(horizontal // sample_spacing))
+        last = start
+        for k in range(1, samples + 1):
+            t = min(1.0, k * sample_spacing / horizontal)
+            p = Vector3(start.x + (end.x - start.x) * t, start.y + (end.y - start.y) * t, start.z)
+            ground = self.ground_height(
+                p.x, p.y, p.z, probe_up=0.0, probe_down=step_height, step_height=step_height
+            )
+            if ground is None or ground < start.z - step_height:
+                return p                      # the first point with no ground: off the edge
+            if ground > start.z + step_height:
+                return last                   # a wall
+            last = p
+        return last
+
     def line_of_sight(
         self,
         start: Vector3,
@@ -605,8 +793,9 @@ class BSPRayTracer:
 
             brush = self.bsp.brushes[brush_index]
 
-            # Only check solid brushes
-            if not (brush.contents & ContentFlags.CONTENTS_SOLID):
+            # Only check what a player collides with: solid, window, grate
+            # and player clip (ADR-0344)
+            if not (brush.contents & PLAYER_SOLID_CONTENTS):
                 continue
 
             self._clip_to_brush(brush, brush_index, start, end, mins, maxs, result)

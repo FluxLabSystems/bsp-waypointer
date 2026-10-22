@@ -35,7 +35,8 @@ from .playable_region import (
 from .ray_tracer import BSPRayTracer
 from .rcw_writer import write_waypoints
 from .recast_navmesh import RecastConfig, RecastNavmeshGenerator, is_recast_available
-from .waypoint_converter import HL2DMWaypointConverter
+from .vector import Vector3
+from .waypoint_converter import AVOID_POINT_RADIUS, HL2DMWaypointConverter
 
 
 # Configure logging
@@ -44,6 +45,25 @@ logging.basicConfig(
     format="%(levelname)s: %(message)s",
 )
 logger = logging.getLogger("bsp_waypointer")
+
+
+def load_avoid_points(path: Path) -> List[Tuple[Vector3, float]]:
+    """Read an --avoid-points file: 'x,y,z[,radius]' per line, '#' starts a comment."""
+    points: List[Tuple[Vector3, float]] = []
+    for number, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        line = raw.split("#", 1)[0].strip()
+        if not line or line.lower().startswith("x,"):
+            continue
+        parts = [p.strip() for p in line.replace(";", ",").split(",") if p.strip()]
+        try:
+            nums = [float(p) for p in parts]
+        except ValueError:
+            raise ValueError(f"{path}:{number}: not numbers: {raw.strip()!r}") from None
+        if len(nums) not in (3, 4):
+            raise ValueError(f"{path}:{number}: expected x,y,z[,radius]: {raw.strip()!r}")
+        radius = nums[3] if len(nums) == 4 else AVOID_POINT_RADIUS
+        points.append((Vector3(nums[0], nums[1], nums[2]), radius))
+    return points
 
 
 def _waypoint_budget(text: str) -> int:
@@ -193,6 +213,19 @@ Examples:
         help=(
             "How far outside the box round every spawn and pickup a waypoint may "
             "be before it counts as far from the match (default: %(default)s)"
+        ),
+    )
+
+    avoid = parser.add_argument_group("Known-bad spots (ADR-0344)")
+    avoid.add_argument(
+        "--avoid-points",
+        type=Path,
+        default=None,
+        metavar="FILE",
+        help=(
+            "A CSV of spots no waypoint may stay on (a repeat offender of bot stuck "
+            "records): one 'x,y,z' or 'x,y,z,radius' per line, '#' comments; the "
+            "radius defaults to %g units" % AVOID_POINT_RADIUS
         ),
     )
 
@@ -505,6 +538,7 @@ def generate_waypoints(
     analysis_seed: int = 0,
     keep_skybox: bool = False,
     playable_margin: float = SKYBOX_MARGIN,
+    avoid_points: Optional[Path] = None,
 ) -> int:
     """
     Generate waypoints from a BSP file.
@@ -632,15 +666,27 @@ def generate_waypoints(
         if use_ray_tracing and ray_tracer:
             logger.info("  Using BSP ray tracing for connection validation")
         spacing = calculate_spacing(density)
+        avoid_list = load_avoid_points(avoid_points) if avoid_points is not None else []
         converter = HL2DMWaypointConverter(
             spacing=spacing,
             max_waypoints=max_waypoints,
             ray_tracer=ray_tracer,
             use_ray_tracing=use_ray_tracing,
             region=region,
+            avoid_points=avoid_list,
         )
         waypoints = converter.convert(navmesh, entities, ladders, objectives=objectives)
         logger.info(f"  Total waypoints: {len(waypoints)}")
+        grounding = getattr(converter, "grounding_report", {})
+        if any(grounding.values()):
+            logger.info(
+                f"  Grounding: {grounding['embedded']} in solid or player clip, "
+                f"{grounding['lifted']} lifted onto the slab they lay in, "
+                f"{grounding['floorless']} without a floor dropped; {grounding['snapped']} put "
+                f"on the floor ({grounding['merged']} merged); {grounding['avoided']} on avoid points"
+            )
+            for at, kind, why in getattr(converter, "grounding_dropped", [])[:40]:
+                logger.info(f"    dropped ({why}) {kind} at {at.x:.0f} {at.y:.0f} {at.z:.0f}")
         if objectives:
             logger.info(f"  CTF objectives: {len(objectives)} waypoint(s) placed on them")
         if region is not None:
@@ -827,6 +873,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         analysis_seed=args.analysis_seed,
         keep_skybox=args.keep_skybox,
         playable_margin=args.playable_margin,
+        avoid_points=args.avoid_points,
     )
 
 
