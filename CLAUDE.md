@@ -302,6 +302,23 @@ its sky_camera). Rules to keep:
   `BSPRayTracer.ground_steps_ok`: no step up taller than a crouch-jump in the world
   brushes under the path, so a line that has risen above a wall cannot carry an edge
   onto the ledge behind it. Two ladder waypoints link freely only within one rung gap.
+- **Player clip is solid (ADR-0344).** `PLAYER_SOLID_CONTENTS` (solid, window, grate, player
+  clip: MASK_PLAYERSOLID's world bits) is what a walker collides with. Line of sight is a
+  look, not a walk, and keeps reading `CONTENTS_SOLID` leaves. The walking tests use the player
+  mask: the hull sweep's leaf test, `point_in_player_solid`, `walk_path_clear` (a thin box
+  swept over every player-solid world brush, detail and clip included, blocked only when it is
+  blocked at both 18 and 36 units up; calibrated on 26,000 real owner movement segments (8 maps) with no
+  false block) on EVERY edge, a drop passing when its chord is clear or when the walk to
+  `drop_lip` and the fall from it are. Before any edge exists `_ground_waypoints` (and
+  `_cull_blocked_samples` for plain samples) deals with a waypoint in player-solid world
+  at 2/20/34 units up: a thin slab it stands in (a grate's bottom, a clip ramp over stairs) is
+  lifted onto the slab's top (`lift_onto_surface`: top within 40, a plateau, head room);
+  a wall, a clip room or a thick block drops it. An item, weapon, spawn or objective with no
+  brush floor or navmesh polygon within 72 units is put on the floor under it (within 192) or
+  dropped. Doors, buttons, breakables, teleporters, ladder rungs, lifts and jump pads are
+  interaction points of brush entities and are left alone. `--avoid-points FILE` removes
+  waypoints within a radius of known-bad spots. The tracer is blind to displacements, props and
+  brush entities, so they are never a reason to drop a navmesh sample.
 - **What cannot be proven is flagged.** The main component is the largest strongly
   connected component a spawn can reach. Every waypoint outside it is flagged
   `W_FL_UNREACHABLE`, and a main waypoint is index 0. The converter raises only when the

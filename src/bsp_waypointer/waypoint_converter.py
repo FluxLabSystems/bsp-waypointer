@@ -70,6 +70,48 @@ OBSTACLE_GRID_CELL = 256.0
 OBSTACLE_GRID_MIN = 32
 OBSTACLE_GRID_MAX_CELLS = 64
 
+# ADR-0344: a waypoint is touched by a bot standing within 72 units of it
+# vertically (RCBot3 CWaypoint::touched), so a waypoint with no world floor
+# that close below it cannot be reached on foot. An entity waypoint (an item,
+# a spawn) with a floor farther down, up to SNAP_REACH, is put on that floor;
+# one with none is dropped. A ladder rung, a lift stop and a teleporter
+# entrance hang in the air by design and are not tested.
+GROUND_REACH = 72.0
+SNAP_REACH = 192.0
+_AIRBORNE_BY_DESIGN = (
+    WaypointFlag.W_FL_LADDER | WaypointFlag.W_FL_LIFT | WaypointFlag.W_FL_TELE_ENTRANCE
+)
+# Default radius of an avoid point (--avoid-points): no waypoint stays this close
+AVOID_POINT_RADIUS = 40.0
+
+
+def _is_standing_spot(wp: "Waypoint") -> bool:
+    """A waypoint a bot walks to and stands on: a navmesh sample, a spawn, a CTF objective, a
+    weapon or an item. Doors, buttons, breakables, teleporters, ladder rungs, lifts and jump
+    pads are interaction points of brush entities, placed at the entity (often in a wall, a
+    shaft or the air) and joined to the graph by explicit edges: the grounding pass leaves them."""
+    return (
+        wp.sampled
+        or wp.is_spawn
+        or wp.is_objective
+        or HL2DMWaypointSubType.WEAPON_CROWBAR <= wp.metadata.subtype <= HL2DMWaypointSubType.ITEM_AMMO_CRATE
+    )
+
+
+def _in_player_solid(tracer, point: Vector3) -> bool:
+    """MASK_PLAYERSOLID world test; a tracer without it falls back to CONTENTS_SOLID."""
+    test = getattr(tracer, "point_in_player_solid", None) or tracer.point_in_solid
+    return bool(test(point))
+
+
+def _blocked_at_standing_height(tracer, origin: Vector3, low: bool) -> bool:
+    """No player fits at a point: world solid or player clip at waist height (+20) or
+    where a crouched head would be (+34), and for a navmesh sample, at the ankles (+2)."""
+    heights = (2.0, 20.0, 34.0) if low else (20.0, 34.0)
+    return any(
+        _in_player_solid(tracer, Vector3(origin.x, origin.y, origin.z + h)) for h in heights
+    )
+
 
 def _build_obstacle_grid(obstacles) -> Tuple[Dict[Tuple[int, int], List[int]], List[int]]:
     """Bucket obstacle indices by the XY cells their padded box covers."""
@@ -138,6 +180,9 @@ class Waypoint:
     # RCBot3's per-waypoint area id (iArea); 0 = none. Set by --ctf-layout on
     # control points (index + 1).
     area: int = 0
+    # Placed on a navmesh sample (the floor is the mesh) rather than at an
+    # entity's origin. Only entity waypoints are tested for a floor (ADR-0344).
+    sampled: bool = False
 
     def has_flag(self, flag: WaypointFlag) -> bool:
         """Check if waypoint has a specific flag."""
@@ -194,6 +239,7 @@ class HL2DMWaypointConverter:
         ray_tracer: Optional["BSPRayTracer"] = None,
         use_ray_tracing: bool = True,
         region: Optional["PlayableRegion"] = None,
+        avoid_points: Optional[List[Tuple[Vector3, float]]] = None,
     ):
         """
         Initialize the waypoint converter.
@@ -206,12 +252,20 @@ class HL2DMWaypointConverter:
             region: Where waypoints may stand (``playable_region.build_region``): navmesh
                 samples in the 3D skybox are refused, and when the waypoint budget is short
                 the waypoints far from every spawn and pickup are culled first (ADR-0318)
+            avoid_points: (origin, radius) spots known to be bad: no waypoint is
+                kept within radius of one (ADR-0344)
         """
         self.spacing = spacing
         self.max_waypoints = max_waypoints
         self.ray_tracer = ray_tracer
         self.use_ray_tracing = use_ray_tracing
         self.region = region
+        self.avoid_points = list(avoid_points or [])
+        # (origin, subtype name, reason) of every waypoint the grounding pass dropped
+        self.grounding_dropped: List[Tuple[Vector3, str, str]] = []
+        self.grounding_report: Dict[str, int] = {
+            "embedded": 0, "lifted": 0, "snapped": 0, "floorless": 0, "avoided": 0, "merged": 0,
+        }
         self.region_report: Dict[str, int] = {"samples_dropped": 0, "teleporters_dropped": 0}
         self._waypoints: List[Waypoint] = []
         self._spatial_hash: Dict[Tuple[int, int, int], List[int]] = {}
@@ -264,6 +318,8 @@ class HL2DMWaypointConverter:
             and getattr(h, "team", 0)
         ]
         self._push_waypoint_links: List[Tuple[int, object]] = []
+        self._navmesh = navmesh
+        self._nav_index = None
 
         # Place waypoints on navigation mesh
         self._place_navmesh_waypoints(navmesh)
@@ -291,6 +347,10 @@ class HL2DMWaypointConverter:
         self._place_door_waypoints(entities.doors)
         self._place_lift_waypoints(getattr(entities, "lifts", []))
         self._place_push_waypoints(getattr(entities, "push_volumes", []))
+
+        # ADR-0344: nothing in solid or player clip, nothing hanging without a
+        # floor, nothing on a known-bad spot (must run while unconnected)
+        self._ground_waypoints()
 
         # Stage A: directed local candidate edges
         self._compute_connections()
@@ -454,7 +514,7 @@ class HL2DMWaypointConverter:
             sample_points = [p for p, k in zip(sample_points, keep) if k]
 
         for point in sample_points:
-            self._add_waypoint(point)
+            self._waypoints[self._add_waypoint(point)].sampled = True
 
     def _place_weapon_waypoints(self, weapons: List[WeaponSpawn]) -> None:
         """Place waypoints at weapon spawn locations."""
@@ -685,11 +745,8 @@ class HL2DMWaypointConverter:
             # standing spots (inside walls, or gaps too low to enter)
             if tracer is None:
                 return False
-            return tracer.point_in_solid(
-                Vector3(origin.x, origin.y, origin.z + 2)
-            ) or tracer.point_in_solid(
-                Vector3(origin.x, origin.y, origin.z + 20)
-            )
+            # MASK_PLAYERSOLID: a player-clip room is solid to a bot (ADR-0344)
+            return _blocked_at_standing_height(tracer, origin, low=True)
 
         def blocked(origin: Vector3) -> bool:
             if in_world_solid(origin):
@@ -710,6 +767,13 @@ class HL2DMWaypointConverter:
                     return True
             return False
 
+        # A sample inside a thin slab it stands on (the bottom of a grate, a clip
+        # ramp over stairs) is lifted onto the slab's top (ADR-0344); one in a
+        # wall, a clip room or a thick block is dropped.
+        for wp in self._waypoints:
+            if in_world_solid(wp.origin):
+                self._lift_waypoint(wp)
+
         kept = [wp for wp in self._waypoints if not blocked(wp.origin)]
 
         # Crouch-height clearance (open at +20, solid at head height):
@@ -717,7 +781,7 @@ class HL2DMWaypointConverter:
         if tracer is not None:
             for wp in kept:
                 o = wp.origin
-                if tracer.point_in_solid(Vector3(o.x, o.y, o.z + 54)):
+                if _in_player_solid(tracer, Vector3(o.x, o.y, o.z + 54)):
                     wp.add_flag(WaypointFlag.W_FL_CROUCH)
 
         if len(kept) == len(self._waypoints):
@@ -727,6 +791,167 @@ class HL2DMWaypointConverter:
         self._spatial_hash = {}
         for i, wp in enumerate(self._waypoints):
             wp.index = i
+            self._add_to_spatial_hash(wp.origin, i)
+
+    def _navmesh_floor_under(self, o: Vector3, reach: float) -> bool:
+        """Whether a navmesh polygon (displacement, prop top, brush entity, any walkable
+        surface the mesh was built from) lies under o, no more than reach below it and no
+        more than a step above it."""
+        nm = getattr(self, "_navmesh", None)
+        if nm is None or not nm.polygons:
+            return False
+        if self._nav_index is None:
+            lo = np.array([[min(v.x for v in p.vertices), min(v.y for v in p.vertices)] for p in nm.polygons])
+            hi = np.array([[max(v.x for v in p.vertices), max(v.y for v in p.vertices)] for p in nm.polygons])
+            zl = np.array([min(v.z for v in p.vertices) for p in nm.polygons])
+            zh = np.array([max(v.z for v in p.vertices) for p in nm.polygons])
+            self._nav_index = (lo, hi, zl, zh)
+        lo, hi, zl, zh = self._nav_index
+        step = DEFAULT_PLAYER_DIMS.step_height
+        cand = np.nonzero(
+            (lo[:, 0] <= o.x) & (hi[:, 0] >= o.x) & (lo[:, 1] <= o.y) & (hi[:, 1] >= o.y)
+            & (zh >= o.z - reach) & (zl <= o.z + step)
+        )[0]
+        return any(nm._point_in_polygon(o, nm.polygons[int(k)]) for k in cand)
+
+    def _lift_waypoint(self, wp: "Waypoint") -> bool:
+        """Put a waypoint buried in a thin slab on the slab's top; False when it cannot be."""
+        lift = getattr(self.ray_tracer, "lift_onto_surface", None)
+        if lift is None:
+            return False
+        up = lift(wp.origin)
+        if up is None:
+            return False
+        wp.origin = up
+        self.grounding_report["lifted"] += 1
+        return True
+
+    def _ground_waypoints(self) -> None:
+        """
+        Drop or fix the waypoints a bot cannot stand on (ADR-0344).
+
+        Runs after every waypoint is placed and before any connection exists:
+        1. a waypoint within an avoid point's radius is dropped;
+        2. a waypoint inside anything a player collides with (world solid,
+           window, grate, PLAYER CLIP) is put on the top of the thin slab it
+           lies in (lift_onto_surface: the bottom of a grate, a clip ramp over
+           stairs) or, when it is in a wall, a clip room or a thick block,
+           dropped; the old test read CONTENTS_SOLID only, so a clip room was
+           full of waypoints;
+        3. an item, weapon, spawn or objective waypoint (not a navmesh sample,
+           which is on the mesh by construction) with no world floor within
+           GROUND_REACH below it is put on the floor under it if there is one
+           within SNAP_REACH, else dropped.
+        Only a standing spot is tested (_is_standing_spot): a door, button,
+        breakable, teleporter, ladder rung, lift or jump pad is an interaction
+        point of a brush entity, placed at the entity and joined by explicit
+        edges, and is left where it is.
+        """
+        tracer = self.ray_tracer if self.use_ray_tracing else None
+        report = self.grounding_report
+        if tracer is None and not self.avoid_points:
+            return
+        drop: Set[int] = set()
+        snapped: Set[int] = set()
+        merged_into: Dict[int, int] = {}
+        for i, wp in enumerate(self._waypoints):
+            o = wp.origin
+            if any(o.distance_to(p) <= r for p, r in self.avoid_points):
+                drop.add(i)
+                report["avoided"] += 1
+                self.grounding_dropped.append((o, wp.metadata.subtype.name, "avoid"))
+                continue
+            if tracer is None or not _is_standing_spot(wp):
+                continue
+            if _blocked_at_standing_height(tracer, o, low=wp.sampled):
+                if self._lift_waypoint(wp):
+                    snapped.add(i)       # may now sit on another waypoint: merged below
+                    o = wp.origin
+                else:
+                    drop.add(i)
+                    report["embedded"] += 1
+                    self.grounding_dropped.append((o, wp.metadata.subtype.name, "embedded"))
+                    continue
+            if (
+                wp.sampled
+                or (wp.flags & _AIRBORNE_BY_DESIGN)
+                or not hasattr(tracer, "floor_support")
+            ):
+                continue
+            if tracer.floor_support(o, reach=GROUND_REACH) is not None:
+                continue
+            if self._navmesh_floor_under(o, GROUND_REACH):
+                continue        # a displacement, a prop's top or a brush entity: floor the brush tracer cannot see
+            floor = tracer.floor_support(o, reach=SNAP_REACH)
+            if floor is None:
+                drop.add(i)
+                report["floorless"] += 1
+                self.grounding_dropped.append((o, wp.metadata.subtype.name, "floorless"))
+                continue
+            wp.origin = Vector3(o.x, o.y, floor)
+            snapped.add(i)
+            report["snapped"] += 1
+        # A snapped waypoint may now sit on another one: fold it into that one.
+        self._spatial_hash = {}
+        for i, wp in enumerate(self._waypoints):
+            if i not in drop:
+                self._add_to_spatial_hash(wp.origin, i)
+        for i in sorted(snapped):
+            wp = self._waypoints[i]
+            for j in self._find_nearby_waypoints(wp.origin, MIN_WAYPOINT_DISTANCE):
+                if j == i or j in drop:
+                    continue
+                other = self._waypoints[j]
+                if other.origin.distance_to(wp.origin) >= 4.0:
+                    continue
+                other.flags |= wp.flags
+                other.is_spawn = other.is_spawn or wp.is_spawn
+                other.is_objective = other.is_objective or wp.is_objective
+                other.sampled = other.sampled or wp.sampled
+                if wp.metadata.weapon_priority > other.metadata.weapon_priority:
+                    other.metadata = wp.metadata
+                for c in wp.connections:
+                    other.add_connection(c)
+                drop.add(i)
+                merged_into[i] = j
+                report["merged"] += 1
+                break
+        if drop:
+            self._remove_waypoints(drop, merged_into)
+        else:
+            self._spatial_hash = {}
+            for i, wp in enumerate(self._waypoints):
+                self._add_to_spatial_hash(wp.origin, i)
+
+    def _remove_waypoints(self, drop: Set[int], merged_into: Optional[Dict[int, int]] = None) -> None:
+        """Remove waypoints before any connection exists, remapping every stored index.
+        A waypoint folded into another (merged_into: old index -> the index it joined) leaves
+        its explicit edges pointing at the one it joined."""
+        merged_into = merged_into or {}
+        index_map: Dict[int, int] = {}
+        kept: List[Waypoint] = []
+        for i, wp in enumerate(self._waypoints):
+            if i in drop:
+                continue
+            index_map[i] = len(kept)
+            kept.append(wp)
+        def new_index(old: int) -> int:
+            return index_map.get(merged_into.get(old, old), -1)
+
+        for wp in kept:
+            mapped = [new_index(c) for c in wp.connections]
+            wp.connections = list(dict.fromkeys(c for c in mapped if c >= 0))
+            wp.metadata.target_waypoint = new_index(wp.metadata.target_waypoint)
+        self._push_waypoint_links = [
+            (new_index(idx), vol)
+            for idx, vol in self._push_waypoint_links
+            if new_index(idx) >= 0
+        ]
+        self._waypoints = kept
+        for i, wp in enumerate(self._waypoints):
+            wp.index = i
+        self._spatial_hash = {}
+        for i, wp in enumerate(self._waypoints):
             self._add_to_spatial_hash(wp.origin, i)
 
     def _place_door_waypoints(self, doors: List[Door]) -> None:
@@ -1189,6 +1414,13 @@ class HL2DMWaypointConverter:
             ):
                 return False
 
+            # ADR-0344: the line of sight reads leaf contents, so a wall of
+            # detail brushes or a player-clip wall does not stop it. A walker
+            # needs the body line clear of MASK_PLAYERSOLID world brushes. A
+            # drop is judged by its two real legs, not the chord.
+            if not self._walk_path_clear(wp_a.origin, wp_b.origin, rise):
+                return False
+
             # A climb at any length, or a longer flat stretch, also needs a
             # player hull to walk the path (skipped for drops: falling needs
             # no walk clearance)
@@ -1216,6 +1448,23 @@ class HL2DMWaypointConverter:
                 return False
 
         return True
+
+    def _walk_path_clear(self, a: Vector3, b: Vector3, rise: float) -> bool:
+        """The body line from a to b is clear of player-solid world brushes (see
+        BSPRayTracer.walk_path_clear). A drop deeper than a crouch-jump passes
+        when its chord is clear (a ramp or stairs down), or when the walker can
+        run level to the lip of the ledge (BSPRayTracer.drop_lip) and fall from
+        there to b: a fall from the lip clears the cliff face, and a floor
+        between a and b still blocks it."""
+        tracer = self.ray_tracer
+        if not hasattr(tracer, "walk_path_clear"):
+            return True
+        if tracer.walk_path_clear(a, b):
+            return True
+        if rise >= -CROUCH_JUMP_RISE or not hasattr(tracer, "drop_lip"):
+            return False
+        lip = tracer.drop_lip(a, b)
+        return tracer.walk_path_clear(a, lip) and tracer.walk_path_clear(lip, b)
 
     def _obstacles_near(self, seg_a: Vector3, seg_b: Vector3):
         """
