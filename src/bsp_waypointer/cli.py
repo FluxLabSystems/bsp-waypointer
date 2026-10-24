@@ -708,6 +708,7 @@ def generate_waypoints(
             region=region,
             avoid_points=avoid_list,
             edge_proof=edge_proof,
+            surface_mesh=mesh,
         )
         waypoints = converter.convert(navmesh, entities, ladders, objectives=objectives)
         logger.info(f"  Total waypoints: {len(waypoints)}")

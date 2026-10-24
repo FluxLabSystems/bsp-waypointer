@@ -245,6 +245,7 @@ class HL2DMWaypointConverter:
         region: Optional["PlayableRegion"] = None,
         avoid_points: Optional[List[Tuple[Vector3, float]]] = None,
         edge_proof: str = "legacy",
+        surface_mesh=None,
     ):
         """
         Initialize the waypoint converter.
@@ -262,6 +263,9 @@ class HL2DMWaypointConverter:
             edge_proof: "legacy" (the chord tests) or "walk": with a tracer, every edge is proved
                 by walking the ground (BSPRayTracer.walk_follow: steps, slopes, jumps across gaps,
                 falls, the hull all the way, crouching), and doors nothing can open block
+            surface_mesh: the map's TriangleMesh (render faces, brush entities, prop collision):
+                with edge_proof "walk", its walkable triangles are the ground the brush tracer cannot
+                see (displacements, props). Without it the navmesh's polygons stand in
         """
         self.spacing = spacing
         self.max_waypoints = max_waypoints
@@ -273,6 +277,7 @@ class HL2DMWaypointConverter:
             raise ValueError("edge_proof must be legacy or walk, not %r" % edge_proof)
         self.edge_proof = edge_proof
         self._ground_hint = None
+        self._surface_mesh = surface_mesh
         self._closed_doors: List[Door] = []
         # (origin, subtype name, reason) of every waypoint the grounding pass dropped
         self.grounding_dropped: List[Tuple[Vector3, str, str]] = []
@@ -361,7 +366,8 @@ class HL2DMWaypointConverter:
         if self.edge_proof == "walk":
             self._closed_doors = [d for d in doors if not getattr(d, "opens", True)]
             doors = [d for d in doors if getattr(d, "opens", True)]
-            self._ground_hint = _navmesh_ground_hint(navmesh)
+            self._ground_hint = (_mesh_ground_hint(self._surface_mesh) if self._surface_mesh is not None
+                                 else _navmesh_ground_hint(navmesh))
         self._place_door_waypoints(doors)
         self._place_lift_waypoints(getattr(entities, "lifts", []))
         self._place_push_waypoints(getattr(entities, "push_volumes", []))
@@ -369,6 +375,9 @@ class HL2DMWaypointConverter:
         # ADR-0344: nothing in solid or player clip, nothing hanging without a
         # floor, nothing on a known-bad spot (must run while unconnected)
         self._ground_waypoints()
+        if self.edge_proof == "walk" and self.ray_tracer is not None \
+                and hasattr(self.ray_tracer, "hull_clear_at"):
+            self._place_by_walk_rules()
 
         # Stage A: directed local candidate edges
         self._compute_connections()
@@ -1476,6 +1485,70 @@ class HL2DMWaypointConverter:
 
         return True
 
+    def _place_by_walk_rules(self) -> None:
+        """edge_proof "walk": the placement to match the walk proof. Every navmesh sample is put on the
+        ground under it: the highest surface under the hull's footprint (the brushes and the render
+        mesh; within a step up, and down as far as a hull is tall, since a navmesh polygon merged over a
+        rise reads high), as the movement code puts a player beside a riser on the step. It must have
+        room for a standing hull (lifted a step, 1 unit in from the engine's 16); one
+        that has not is moved to the nearest clear spot within 16 units, or dropped. Entity points
+        (pickups, interaction points) stay where they are; a spawn's only goes down onto its floor."""
+        tracer = self.ray_tracer
+        step = DEFAULT_PLAYER_DIMS.step_height
+        moves = [(dx * r, dy * r) for r in (8.0, 16.0)
+                 for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1), (0.7071, 0.7071), (-0.7071, 0.7071),
+                                (0.7071, -0.7071), (-0.7071, -0.7071))]
+
+        down = DEFAULT_PLAYER_DIMS.standing_height
+
+        def floor_at(x: float, y: float, z0: float, up: float, dn: float) -> Optional[float]:
+            g = tracer.ground_at(x, y, z0, probe_up=up, probe_down=dn, step_height=step)
+            z = g[0] if g is not None else None
+            if self._ground_hint is not None:
+                h = self._ground_hint(x, y, z0, up, dn)
+                if h is not None and (z is None or h > z):
+                    z = h
+            return z
+
+        def grounded(p: Vector3) -> Optional[Vector3]:
+            z = floor_at(p.x, p.y, p.z, step, down)
+            if z is None:
+                return None
+            for dx, dy in ((-14.0, -14.0), (-14.0, 14.0), (14.0, -14.0), (14.0, 14.0)):
+                h = floor_at(p.x + dx, p.y + dy, z, step, 0.0)
+                if h is not None and z < h <= z + step:
+                    z = h
+            return Vector3(p.x, p.y, z)
+
+        drop: Set[int] = set()
+        moved = 0
+        for i, wp in enumerate(self._waypoints):
+            if wp.is_spawn and not wp.flags:
+                # a spawn's waypoint (perhaps merged with a sample that read high) only goes down
+                # onto its floor; it never moves in plan
+                g = grounded(wp.origin)
+                if g is not None and g.z <= wp.origin.z:
+                    wp.origin = g
+                continue
+            if not wp.sampled or wp.flags:
+                continue
+            here = grounded(wp.origin) or wp.origin
+            if tracer.hull_clear_at(here):
+                wp.origin = here
+                continue
+            for dx, dy in moves:
+                cand = grounded(Vector3(here.x + dx, here.y + dy, here.z))
+                if cand is not None and abs(cand.z - here.z) <= step and tracer.hull_clear_at(cand):
+                    wp.origin = cand
+                    moved += 1
+                    break
+            else:
+                drop.add(i)
+        if drop:
+            self._remove_waypoints(drop)
+        self.grounding_report["walk_moved"] = moved
+        self.grounding_report["walk_dropped"] = len(drop)
+
     def _walk_proof(self, wp_a: Waypoint, wp_b: Waypoint) -> bool:
         """edge_proof "walk": the edge stands when the ground walk from A ends on B's floor. A gap
         jumped on the way puts W_FL_JUMP on A; a passage only the ducked hull fits puts W_FL_CROUCH on
@@ -1492,15 +1565,15 @@ class HL2DMWaypointConverter:
         )
         if not proof.ok:
             return False
-        # B is on the floor the walk reached (an item or spawn waypoint may sit a step above it); an
-        # interaction point (a teleporter's trigger, a ladder rung, a button) only within the body's
-        # reach above it
-        rise_over = wp_b.origin.z - proof.end_z
-        if wp_b.flags & (WaypointFlag.W_FL_TELE_ENTRANCE | WaypointFlag.W_FL_LADDER
-                         | WaypointFlag.W_FL_USE):
-            if not -DEFAULT_PLAYER_DIMS.step_height <= rise_over <= DEFAULT_PLAYER_DIMS.standing_height:
-                return False
-        elif abs(rise_over) > DEFAULT_PLAYER_DIMS.step_height + 2.0:
+        # B is on the floor the walk reached: a waypoint may sit above it as far as the standing body
+        # reaches (a pickup hovers or lies on a prop; a teleporter's trigger, a ladder rung, a button
+        # are where the entity is), and no lower than a step under it. A B on a ledge is not let in
+        # this way: the walk onto its xy meets the ledge itself (a climb, or a wall)
+        # (a B just past a lip is reached from the lip: any floor the walk had within a hull radius
+        # of the end counts)
+        if not any(-DEFAULT_PLAYER_DIMS.step_height - 2.0 <= wp_b.origin.z - z
+                   <= DEFAULT_PLAYER_DIMS.standing_height
+                   for z in (proof.end_z,) + tuple(proof.near_end_z)):
             return False
         if proof.jump:
             wp_a.flags |= WaypointFlag.W_FL_JUMP
@@ -1912,6 +1985,46 @@ class HL2DMWaypointConverter:
         for i, wp in enumerate(self._waypoints):
             self._add_to_spatial_hash(wp.origin, i)
 
+
+
+def _mesh_ground_hint(mesh, bucket: float = 128.0):
+    """ground_hint for walk_follow from a TriangleMesh: the highest walkable triangle (normal z >= 0.7)
+    under (x, y) within the window, from a bucket grid built once."""
+    v = np.asarray(mesh.vertices, dtype=np.float64).reshape(-1, 3)
+    t = np.asarray(mesh.triangles, dtype=np.int64).reshape(-1, 3)
+    if len(t) == 0:
+        return None
+    tv = v[t]
+    n = np.cross(tv[:, 1] - tv[:, 0], tv[:, 2] - tv[:, 0])
+    ln = np.linalg.norm(n, axis=1)
+    ok = ln > 1e-9
+    walk = np.nonzero(ok & (n[:, 2] >= GROUND_NORMAL_Z * np.where(ok, ln, 1.0)))[0]
+    grid: Dict[Tuple[int, int], List[int]] = {}
+    lo = np.floor(tv[walk, :, :2].min(axis=1) / bucket).astype(int)
+    hi = np.floor(tv[walk, :, :2].max(axis=1) / bucket).astype(int)
+    for k, (a, b) in enumerate(zip(lo, hi)):
+        for gx in range(a[0], b[0] + 1):
+            for gy in range(a[1], b[1] + 1):
+                grid.setdefault((gx, gy), []).append(int(walk[k]))
+
+    def hint(x: float, y: float, feet: float, up: float, down: float) -> Optional[float]:
+        best = None
+        for k in grid.get((int(math.floor(x / bucket)), int(math.floor(y / bucket))), ()):
+            a, b, c = tv[k]
+            d = (b[1] - c[1]) * (a[0] - c[0]) + (c[0] - b[0]) * (a[1] - c[1])
+            if abs(d) < 1e-9:
+                continue
+            l1 = ((b[1] - c[1]) * (x - c[0]) + (c[0] - b[0]) * (y - c[1])) / d
+            l2 = ((c[1] - a[1]) * (x - c[0]) + (a[0] - c[0]) * (y - c[1])) / d
+            l3 = 1.0 - l1 - l2
+            if min(l1, l2, l3) < -1e-6:
+                continue
+            z = l1 * a[2] + l2 * b[2] + l3 * c[2]
+            if feet - down <= z <= feet + up and (best is None or z > best):
+                best = z
+        return best
+
+    return hint
 
 
 def _navmesh_ground_hint(navmesh: NavigationMesh, bucket: float = 128.0):

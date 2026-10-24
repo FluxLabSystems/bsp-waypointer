@@ -21,6 +21,9 @@ ON_EPSILON = 0.1
 
 # World brush contents a player stands on or is stopped by: MASK_PLAYERSOLID
 # without its entity bits (CONTENTS_MOVEABLE, CONTENTS_MONSTER)
+# walk_follow: sideways shifts tried for a stretch the hull is stopped on (a slide along a wall)
+SLIDE_OFFSETS = (0.0, 6.0, -6.0, 12.0, -12.0, 18.0, -18.0)
+
 PLAYER_SOLID_CONTENTS = (
     ContentFlags.CONTENTS_SOLID
     | ContentFlags.CONTENTS_WINDOW
@@ -39,6 +42,7 @@ class WalkProof:
     fall: float = 0.0           # the deepest drop taken on the way (one-way)
     crouch: bool = False        # only the ducked hull gets through
     end_z: float = 0.0          # the feet height the walk ended at
+    near_end_z: Tuple[float, ...] = ()   # every feet height within a hull radius of the end
 
 
 @dataclass
@@ -486,6 +490,17 @@ class BSPRayTracer:
                     best, best_nz = hi, nz
         return None if best is None else (best, best_nz)
 
+    def hull_clear_at(self, p: Vector3, radius: float = 15.0, height: float = 72.0,
+                      lift: float = 18.0) -> bool:
+        """Whether a player hull standing at p (lifted a step, as a walker's is over a stair nose)
+        overlaps no player-solid brush."""
+        lo = Vector3(-radius, -radius, 0)
+        hi = Vector3(radius, radius, height - lift)
+        a = Vector3(p.x, p.y, p.z + lift)
+        r = self.trace_brushes(a, Vector3(a.x, a.y, a.z + 0.5), lo, hi,
+                               contents_mask=int(PLAYER_SOLID_CONTENTS))
+        return not r.start_solid and r.fraction >= 1.0
+
     def walk_follow(
         self,
         start: Vector3,
@@ -519,8 +534,8 @@ class BSPRayTracer:
         wall is not read as starting inside it. Where the standing hull is blocked the ducked one is
         tried, and the proof says the walk needs crouching. The tracer cannot see displacements,
         props or brush entities: ``ground_hint(x, y, feet, up, down)``, when given, supplies the
-        height of a walkable surface there (the converter's navmesh, which has the displacements),
-        and a stretch with no ground from either is a gap."""
+        height of the highest walkable surface there (the map's render mesh, which has them); the
+        higher of the two is the ground, and a stretch with no ground from either is a gap."""
         horizontal = start.distance_to_2d(end)
         n = max(1, int(-(-horizontal // spacing)))
 
@@ -529,10 +544,14 @@ class BSPRayTracer:
             return start.x + (end.x - start.x) * u, start.y + (end.y - start.y) * u
 
         def ground(x: float, y: float, at: float, down: float) -> Optional[Tuple[float, float]]:
-            g = self.ground_at(x, y, at, probe_up=climb, probe_down=down, step_height=climb)
-            if g is None and ground_hint is not None:
+            # a brush counts when it starts within a step of the feet: one starting higher is
+            # overhead (a rail, a beam), which the hull pass meets, not a floor to climb onto
+            g = self.ground_at(x, y, at, probe_up=climb, probe_down=down, step_height=step_height)
+            if ground_hint is not None:
+                # the higher of the two: stairs or a platform that is a brush entity or a prop stand
+                # on the world's floor, which the brushes alone report
                 h = ground_hint(x, y, at, climb, down)
-                if h is not None:
+                if h is not None and (g is None or h > g[0] + 0.5):
                     g = (h, 1.0)
             return g
 
@@ -599,8 +618,15 @@ class BSPRayTracer:
         if unsupported_from is not None:
             return WalkProof(False, "no ground for the last %.0f units" % (horizontal - unsupported_from))
         proof.end_z = feet
+        near = radius + spacing
+        proof.near_end_z = tuple(sorted({f for d, f in profile if d >= horizontal - near}))
 
-        # pass 2: the hull along the profile
+        # pass 2: the hull along the profile. A stretch the hull is stopped on is tried again shifted
+        # sideways by up to about a hull width: the movement code slides a player along a wall or
+        # round a corner it grazes, while a gap narrower than the hull stops it whatever the line
+        ux, uy = ((end.x - start.x) / horizontal, (end.y - start.y) / horizontal) if horizontal else (1.0, 0.0)
+        side = (-uy, ux)
+
         def clear(h: float) -> bool:
             mins = Vector3(-radius, -radius, 0)
             maxs = Vector3(radius, radius, h)
@@ -611,9 +637,13 @@ class BSPRayTracer:
                 level = max(f for d, f in profile if d0 - reach <= d <= d1 + reach) + step_height
                 x0, y0 = point(d0)
                 x1, y1 = point(d1)
-                r = self.trace_brushes(Vector3(x0, y0, level), Vector3(x1, y1, level), mins, maxs,
-                                       contents_mask=int(PLAYER_SOLID_CONTENTS))
-                if r.start_solid or r.fraction < 1.0:
+                for off in SLIDE_OFFSETS:
+                    sx, sy = side[0] * off, side[1] * off
+                    r = self.trace_brushes(Vector3(x0 + sx, y0 + sy, level), Vector3(x1 + sx, y1 + sy, level),
+                                           mins, maxs, contents_mask=int(PLAYER_SOLID_CONTENTS))
+                    if not r.start_solid and r.fraction >= 1.0:
+                        break
+                else:
                     return False
             return True
 
