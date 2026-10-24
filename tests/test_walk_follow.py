@@ -95,3 +95,9 @@ def test_ground_hint_fills_what_the_brushes_cannot_show():
     assert not w.walk_follow(V(0, 0, 0), V(400, 0, 0)).ok
     hint = lambda x, y, feet, up, down: 0.0
     assert w.walk_follow(V(0, 0, 0), V(400, 0, 0), ground_hint=hint).ok
+
+
+def test_a_beam_above_head_height_does_not_block():
+    beam = [((100, -100, 78), (228, 100, 80))]          # a detail slab at 78, above a standing head
+    p = World(flat(), beam).walk_follow(V(0, 0, 0), V(300, 0, 0))
+    assert p.ok and not p.crouch

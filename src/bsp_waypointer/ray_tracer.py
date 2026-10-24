@@ -629,7 +629,7 @@ class BSPRayTracer:
 
         def clear(h: float) -> bool:
             mins = Vector3(-radius, -radius, 0)
-            maxs = Vector3(radius, radius, h)
+            maxs = Vector3(radius, radius, h - step_height)   # lifted a step: the head stays at h
             for i in range(0, len(profile) - 1, hull_every):
                 j = min(i + hull_every, len(profile) - 1)
                 d0, d1 = profile[i][0], profile[j][0]
