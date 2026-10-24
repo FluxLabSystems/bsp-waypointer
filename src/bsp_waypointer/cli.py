@@ -35,6 +35,7 @@ from .playable_region import (
 from .ray_tracer import BSPRayTracer
 from .rcw_writer import write_waypoints
 from .recast_native import clip_brush_planes, clip_brush_triangles
+from .synth_navmesh import SynthNavigationMesh
 from .recast_navmesh import RecastConfig, RecastNavmeshGenerator, is_recast_available
 from .vector import Vector3
 from .waypoint_converter import AVOID_POINT_RADIUS, HL2DMWaypointConverter
@@ -299,12 +300,24 @@ Examples:
     # Navmesh options
     navmesh = parser.add_argument_group("Navmesh Options")
     navmesh.add_argument(
+        "--edge-proof",
+        choices=["legacy", "walk"],
+        default="legacy",
+        help=(
+            "How an edge is proved with the ray tracer: legacy (the chord tests) or walk (walk the "
+            "ground: steps, slopes, jumps across gaps, falls, the hull all the way, crouching; and "
+            "doors nothing can open block). Default: legacy"
+        ),
+    )
+    navmesh.add_argument(
         "--navmesh-generator",
-        choices=["simple", "recast"],
+        choices=["simple", "recast", "synth"],
         default="simple",
         help=(
             "Navmesh generator to use (default: simple). recast needs the native library "
-            "(python tools/build_recast.py) and falls back to simple without it"
+            "(python tools/build_recast.py) and falls back to simple without it; synth combines "
+            "the two (Recast decides where a player can stand, simple's triangles how high, "
+            "samples from both)"
         ),
     )
     navmesh.add_argument(
@@ -543,6 +556,7 @@ def generate_waypoints(
     keep_skybox: bool = False,
     playable_margin: float = SKYBOX_MARGIN,
     avoid_points: Optional[Path] = None,
+    edge_proof: str = "legacy",
 ) -> int:
     """
     Generate waypoints from a BSP file.
@@ -635,9 +649,20 @@ def generate_waypoints(
         logger.info("Generating navigation mesh...")
 
         # Select navmesh generator
-        if navmesh_generator == "recast":
+        simple_config = NavmeshConfig(
+            agent_height=agent_height,
+            agent_radius=agent_radius,
+            agent_climb=step_height,
+            cell_size=cell_size,
+            cell_height=cell_height,
+        )
+        if navmesh_generator == "synth" and not is_recast_available():
+            logger.warning("  synth needs Recast (python tools/build_recast.py); using simple")
+            navmesh_generator = "simple"
+        if navmesh_generator in ("recast", "synth"):
             if is_recast_available():
-                logger.info("  Using Recast navmesh generator")
+                logger.info("  Using Recast navmesh generator"
+                            + (" + simple, synthesised" if navmesh_generator == "synth" else ""))
             else:
                 logger.info("  Recast not available, using enhanced fallback")
 
@@ -660,17 +685,11 @@ def generate_waypoints(
                     clips = (clip_mesh.vertices, clip_mesh.triangles, clip_brush_planes(bsp))
                     logger.info(f"  Player clip: {len(clips[2])} brushes made solid")
             navmesh = recast_gen.generate(mesh, clips)
+            if navmesh_generator == "synth":
+                navmesh = SynthNavigationMesh(navmesh, NavmeshGenerator(simple_config).generate(mesh))
         else:
             logger.info("  Using simple navmesh generator")
-            config = NavmeshConfig(
-                agent_height=agent_height,
-                agent_radius=agent_radius,
-                agent_climb=step_height,
-                cell_size=cell_size,
-                cell_height=cell_height,
-            )
-            navgen = NavmeshGenerator(config)
-            navmesh = navgen.generate(mesh)
+            navmesh = NavmeshGenerator(simple_config).generate(mesh)
 
         logger.info(f"  Navigation polygons: {navmesh.num_polygons}")
 
@@ -688,9 +707,17 @@ def generate_waypoints(
             use_ray_tracing=use_ray_tracing,
             region=region,
             avoid_points=avoid_list,
+            edge_proof=edge_proof,
         )
         waypoints = converter.convert(navmesh, entities, ladders, objectives=objectives)
         logger.info(f"  Total waypoints: {len(waypoints)}")
+        synth = getattr(navmesh, "report", None)
+        if synth:
+            logger.info(
+                f"  Synth samples: {synth['from_recast']} from Recast's grid, {synth['from_simple']} "
+                f"from simple, {synth['simple_rejected']} of simple's refused (not standable), "
+                f"{synth['snapped']} put on the exact surface"
+            )
         grounding = getattr(converter, "grounding_report", {})
         if any(grounding.values()):
             logger.info(
@@ -869,6 +896,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         include_entities=not args.no_entities,
         weapon_priority=args.weapon_priority,
         navmesh_generator=args.navmesh_generator,
+        edge_proof=args.edge_proof,
         cell_size=args.cell_size,
         cell_height=args.cell_height,
         use_ray_tracing=not args.no_raytracing,

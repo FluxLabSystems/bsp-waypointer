@@ -595,6 +595,27 @@ CROUCH_JUMP_RISE = 45.0
 # Maximum one-way drop connection depth (survivable fall)
 MAX_DROP_CONNECTION = 600.0
 
+# The ground-following walk proof (BSPRayTracer.walk_follow), from MC2's movement code:
+# - ground is a surface whose normal has z >= 0.7 (gamemovement.cpp CategorizePosition), so a
+#   rise onto anything steeper is a slide back, not a walk;
+# - a gap is jumped when its unsupported stretch is no wider than a plain running jump carries
+#   the hull: 190 u/s (hl2_normspeed) for the 0.533 s of a 160 u/s jump at 600 gravity, plus the
+#   32-unit hull overhang = 133; 0.9 of it, so the bot need not jump perfectly.
+# - a crouch-jump rises 160^2 / 1200 = 21.3 plus the 36 the feet tuck up (ducking in the air
+#   finishes at once): 57.3; 3 units less, so the bot need not jump perfectly. (CROUCH_JUMP_RISE,
+#   45, is the legacy proof's more cautious figure.)
+GROUND_NORMAL_Z = 0.7
+JUMP_GAP_MAX = 120.0
+WALK_CLIMB = 54.0
+WALK_SAMPLE_SPACING = 16.0
+
+# Door spawnflags (func_door / func_door_rotating)
+SF_DOOR_USE_OPENS = 256
+SF_DOOR_TOUCH_OPENS = 1024
+SF_DOOR_LOCKED = 2048
+# Inputs that open a door (or unlock one a player can then open)
+DOOR_OPEN_INPUTS = frozenset({"open", "toggle", "setposition", "setanimation", "unlock"})
+
 # The walk-off-and-fall path of a drop. A bot leaves the upper surface at a
 # ledge, falls, then walks on at the lower height, so how far it travels
 # while falling decides how much of the path belongs to each height.

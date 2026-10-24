@@ -21,10 +21,14 @@ from .constants import (
     CHARGER_ENTITIES,
     DEFAULT_STATIC_PROP_HALF_EXTENTS,
     DOOR_ENTITIES,
+    DOOR_OPEN_INPUTS,
     DYNAMIC_PROP_ENTITIES,
     HEALTH_ITEMS,
     HL2DMWaypointSubType,
     HURT_ENTITIES,
+    SF_DOOR_LOCKED,
+    SF_DOOR_TOUCH_OPENS,
+    SF_DOOR_USE_OPENS,
     LADDER_DISMOUNT_ENTITIES,
     LADDER_ENTITIES,
     LIFT_ENTITIES,
@@ -173,6 +177,9 @@ class Door:
     maxs: Vector3
     classname: str
     requires_use: bool  # True if player must press USE
+    # Whether anything can ever open it (ADR navlab): touch or use opens it and it is not locked, or
+    # some entity's output fires Open/Toggle/Unlock... at its name
+    opens: bool = True
 
 
 @dataclass
@@ -682,6 +689,7 @@ class HL2DMEntityAnalyzer:
                 # Check spawnflags for USE requirement
                 spawnflags = entity.get_int("spawnflags", 0)
                 requires_use = bool(spawnflags & 256)  # SF_DOOR_USE_OPENS
+                opens = self._door_opens(entity, spawnflags)
 
                 self._data.doors.append(
                     Door(
@@ -690,8 +698,26 @@ class HL2DMEntityAnalyzer:
                         maxs=maxs,
                         classname=entity.classname,
                         requires_use=requires_use,
+                        opens=opens,
                     )
                 )
+
+    def _door_opens(self, door, spawnflags: int) -> bool:
+        """Whether a door can ever open: by touch or use when it is not locked, or by an output of
+        any entity firing an opening input at its name (a trigger, a button, a relay)."""
+        by_player = bool(spawnflags & (SF_DOOR_USE_OPENS | SF_DOOR_TOUCH_OPENS))
+        locked = bool(spawnflags & SF_DOOR_LOCKED)
+        name = door.get("targetname", "").strip().lower()
+        fired = set()
+        if name:
+            for ent in self._bsp.entities:
+                for value in ent.properties.values():
+                    parts = value.replace("\x1b", ",").split(",")
+                    if len(parts) >= 2 and parts[0].strip().lower() == name:
+                        fired.add(parts[1].strip().lower())
+        if fired & (DOOR_OPEN_INPUTS - {"unlock"}):
+            return True
+        return by_player and (not locked or "unlock" in fired)
 
     def _prop_collision(
         self, model_name: str, origin: Vector3, angles: Vector3, solid: int

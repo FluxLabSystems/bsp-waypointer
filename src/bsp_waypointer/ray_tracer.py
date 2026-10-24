@@ -30,6 +30,18 @@ PLAYER_SOLID_CONTENTS = (
 
 
 @dataclass
+class WalkProof:
+    """What BSPRayTracer.walk_follow found walking the ground from one point to another."""
+    ok: bool
+    reason: str = ""            # why not, when not ok
+    jump: bool = False          # a gap or ledge on the way has to be jumped
+    gap: float = 0.0            # the widest unsupported stretch crossed
+    fall: float = 0.0           # the deepest drop taken on the way (one-way)
+    crouch: bool = False        # only the ducked hull gets through
+    end_z: float = 0.0          # the feet height the walk ended at
+
+
+@dataclass
 class TraceResult:
     """Result of a ray trace operation."""
     hit: bool
@@ -432,9 +444,24 @@ class BSPRayTracer:
         Unlike trace_line, which reads leaf contents only, this sees detail
         brushes. It does not see displacements, props or brush entities.
         """
+        found = self.ground_at(x, y, feet_z, probe_up, probe_down, step_height)
+        return None if found is None else found[0]
+
+    def ground_at(
+        self,
+        x: float,
+        y: float,
+        feet_z: float,
+        probe_up: float = 60.0,
+        probe_down: float = 128.0,
+        step_height: float = 18.0,
+    ) -> Optional[Tuple[float, float]]:
+        """ground_height, and the z of the normal of the surface it found (1.0 for a flat top): the
+        same search, keeping which plane is the top."""
         top_z = feet_z + probe_up
         bottom_z = feet_z - probe_down
         best: Optional[float] = None
+        best_nz = 1.0
         seen = set()
         for leaf_index in self._leaves_on_vertical(x, y, top_z, bottom_z):
             leaf = self.bsp.leafs[leaf_index]
@@ -449,15 +476,152 @@ class BSPRayTracer:
                 brush = self.bsp.brushes[brush_index]
                 if not (brush.contents & PLAYER_SOLID_CONTENTS):
                     continue
-                span = self._brush_z_span(brush, x, y)
+                span = self._brush_z_span(brush, x, y, with_normal=True)
                 if span is None:
                     continue
-                lo, hi = span
+                lo, hi, nz = span
                 if lo > feet_z + step_height or hi < bottom_z:
                     continue
                 if best is None or hi > best:
-                    best = hi
-        return best
+                    best, best_nz = hi, nz
+        return None if best is None else (best, best_nz)
+
+    def walk_follow(
+        self,
+        start: Vector3,
+        end: Vector3,
+        spacing: float = 16.0,
+        step_height: float = 18.0,
+        climb: float = 45.0,
+        max_gap: float = 120.0,
+        max_fall: float = 600.0,
+        ground_nz: float = 0.7,
+        radius: float = 14.0,
+        height: float = 72.0,
+        crouch_height: float = 36.0,
+        hull_every: int = 4,
+        ground_hint=None,
+    ) -> WalkProof:
+        """Walk the ground from start to end the way the movement code does, not along the chord.
+
+        Pass 1, the ground profile: the 2D line is sampled every ``spacing`` units and the ground under
+        the feet found at each (ground_at: world brushes incl. detail and player clip). The feet
+        - follow ground within a step up or down (stairs, and slopes whose surface is ground: normal
+          z >= ``ground_nz``; rising onto a steeper surface fails);
+        - rise onto ground up to ``climb`` above them as a jump; anything higher is a wall;
+        - cross a stretch with no ground within a step below as a gap, its edges found to a unit by
+          bisection: ground at about the same height coming back within ``max_gap`` is a jump; ground
+          found far below is a fall (one-way, at most ``max_fall``); nothing below at all fails.
+        Pass 2, the hull: swept with trace_brushes over the player-solid brushes, ``hull_every`` samples
+        at a time, a step above the highest ground within a hull radius of the stretch (so a crest, a
+        ledge being jumped onto or the lip of a drop does not read as a wall, and a real wall or a slit
+        narrower than the hull does). ``radius`` is the engine's 16 less 2 units, so a waypoint grazing a
+        wall is not read as starting inside it. Where the standing hull is blocked the ducked one is
+        tried, and the proof says the walk needs crouching. The tracer cannot see displacements,
+        props or brush entities: ``ground_hint(x, y, feet, up, down)``, when given, supplies the
+        height of a walkable surface there (the converter's navmesh, which has the displacements),
+        and a stretch with no ground from either is a gap."""
+        horizontal = start.distance_to_2d(end)
+        n = max(1, int(-(-horizontal // spacing)))
+
+        def point(d: float) -> Tuple[float, float]:
+            u = d / horizontal if horizontal > 0 else 1.0
+            return start.x + (end.x - start.x) * u, start.y + (end.y - start.y) * u
+
+        def ground(x: float, y: float, at: float, down: float) -> Optional[Tuple[float, float]]:
+            g = self.ground_at(x, y, at, probe_up=climb, probe_down=down, step_height=climb)
+            if g is None and ground_hint is not None:
+                h = ground_hint(x, y, at, climb, down)
+                if h is not None:
+                    g = (h, 1.0)
+            return g
+
+        def supported(d: float, at: float) -> bool:
+            px, py = point(d)
+            g = ground(px, py, at, step_height)
+            return g is not None and at - step_height <= g[0] <= at + climb
+
+        def edge(lo: float, hi: float, at: float, lo_supported: bool) -> float:
+            """Where support changes between lo and hi (lo has ``lo_supported``), to a unit."""
+            while hi - lo > 1.0:
+                mid = (lo + hi) / 2
+                if supported(mid, at) == lo_supported:
+                    lo = mid
+                else:
+                    hi = mid
+            return (lo + hi) / 2
+
+        # pass 1: the ground profile, as (distance, feet height) at every sample. A start point above
+        # its floor (an item, a teleporter's trigger) starts from the floor under it
+        proof = WalkProof(ok=True)
+        feet = start.z
+        g0 = ground(start.x, start.y, start.z, height)
+        if g0 is not None and g0[0] <= start.z:
+            feet = g0[0]
+        profile: List[Tuple[float, float]] = [(0.0, feet)]
+        last_ground = 0.0
+        unsupported_from: Optional[float] = None
+        prev = 0.0
+        for k in range(1, n + 1):
+            here = horizontal * k / n
+            x, y = point(here)
+            probe_down = max_fall + step_height if unsupported_from is not None else step_height
+            g = ground(x, y, feet, probe_down)
+            if g is not None and g[0] > feet + climb:
+                return WalkProof(False, "a wall or ledge %.0f high" % (g[0] - feet))
+            if g is not None and g[0] >= feet - step_height:
+                z, nz = g
+                if z > feet + 0.5 and nz < ground_nz:
+                    return WalkProof(False, "too steep (normal z %.2f)" % nz)
+                if z > feet + step_height:
+                    proof.jump = True
+                if unsupported_from is not None:
+                    width = edge(prev, here, feet, False) - unsupported_from
+                    proof.gap = max(proof.gap, width)
+                    if width > max_gap:
+                        return WalkProof(False, "gap %.0f wider than a jump (%.0f)" % (width, max_gap))
+                    proof.jump = True
+                    unsupported_from = None
+                feet = z
+                last_ground = here
+            elif g is not None:
+                drop = feet - g[0]           # ground far below: a fall from the lip
+                if drop > max_fall:
+                    return WalkProof(False, "fall %.0f deeper than %.0f" % (drop, max_fall))
+                proof.fall = max(proof.fall, drop)
+                feet = g[0]
+                last_ground = here
+                unsupported_from = None
+            elif unsupported_from is None:
+                unsupported_from = edge(prev, here, feet, True)
+            profile.append((here, feet))
+            prev = here
+        if unsupported_from is not None:
+            return WalkProof(False, "no ground for the last %.0f units" % (horizontal - unsupported_from))
+        proof.end_z = feet
+
+        # pass 2: the hull along the profile
+        def clear(h: float) -> bool:
+            mins = Vector3(-radius, -radius, 0)
+            maxs = Vector3(radius, radius, h)
+            for i in range(0, len(profile) - 1, hull_every):
+                j = min(i + hull_every, len(profile) - 1)
+                d0, d1 = profile[i][0], profile[j][0]
+                reach = radius + spacing      # the hull overhangs the samples by its radius
+                level = max(f for d, f in profile if d0 - reach <= d <= d1 + reach) + step_height
+                x0, y0 = point(d0)
+                x1, y1 = point(d1)
+                r = self.trace_brushes(Vector3(x0, y0, level), Vector3(x1, y1, level), mins, maxs,
+                                       contents_mask=int(PLAYER_SOLID_CONTENTS))
+                if r.start_solid or r.fraction < 1.0:
+                    return False
+            return True
+
+        if not clear(height):
+            if not clear(crouch_height):
+                return WalkProof(False, "hull blocked")
+            proof.crouch = True
+        return proof
 
     def ground_steps_ok(
         self,
@@ -536,10 +700,12 @@ class BSPRayTracer:
         return leaves
 
     def _brush_z_span(
-        self, brush: Brush, x: float, y: float
-    ) -> Optional[Tuple[float, float]]:
-        """The z interval a convex brush occupies on the vertical line at (x, y), or None."""
+        self, brush: Brush, x: float, y: float, with_normal: bool = False
+    ):
+        """The z interval a convex brush occupies on the vertical line at (x, y), or None.
+        ``with_normal``: (lo, hi, the z of the top plane's normal)."""
         lo, hi = float("-inf"), float("inf")
+        top_nz = 1.0
         for k in range(brush.num_sides):
             side_index = brush.first_side + k
             if side_index >= len(self.bsp.brush_sides):
@@ -554,12 +720,13 @@ class BSPRayTracer:
                 if c > ON_EPSILON:
                     return None
             elif n.z > 0:
-                hi = min(hi, -c / n.z)
+                if -c / n.z < hi:
+                    hi, top_nz = -c / n.z, n.z
             else:
                 lo = max(lo, -c / n.z)
         if not (lo < hi) or lo == float("-inf") or hi == float("inf"):
             return None
-        return lo, hi
+        return (lo, hi, top_nz) if with_normal else (lo, hi)
 
     def _recursive_hull_check(
         self,

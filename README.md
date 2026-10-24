@@ -533,6 +533,25 @@ The tool uses BSP tree traversal for accurate line-of-sight checks:
   straight sweep that has risen above a wall cannot connect the floor to the ledge behind it
 - Validates waypoint connections against actual map geometry
 
+### Synthesis and the walk proof
+
+`--navmesh-generator synth` treats Recast and the simple generator as two kinds of evidence:
+Recast's polygons decide where a player can stand (clips, the hull's distance from walls and
+ledges), simple's exact render triangles decide how high, and the samples come from both (Recast's
+polygon centres and an even grid over them, then simple's samples where Recast says one can stand).
+
+`--edge-proof walk` proves each edge by walking the ground as the movement code does: steps, ramps up
+to 45.57 degrees, ledges up to a crouch-jump, gaps a running jump clears (W_FL_JUMP), falls, the hull
+all the way (ducking where it must: W_FL_CROUCH), and doors that nothing can open as walls.
+
+On mapforge navlab's 59 fixture maps:
+
+| | Pass | Phantom zones | False edges | Misplaced | Coverage |
+|---|---|---|---|---|---|
+| simple (legacy proof) | 40 | 6 | 34 | 25 | 62% |
+| recast (legacy proof) | 48 | 5 | 32 | 6 | 53% |
+| synth + walk | 59 | 0 | 0 | 0 | 79% |
+
 ### Recast Integration
 
 With `--navmesh-generator recast` and the native library built, the navmesh comes from Recast's

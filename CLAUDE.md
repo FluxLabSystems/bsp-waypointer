@@ -69,6 +69,7 @@ This document provides comprehensive context for AI assistants working on the BS
 | BSP Parser | `bsp_parser.py` | Binary BSP file parsing |
 | Geometry Extractor | `geometry_extractor.py` | BSP → triangle mesh |
 | Navmesh Generator | `navmesh_generator.py` | Triangle mesh → navigation mesh (the default, `simple`) |
+| Synth | `synth_navmesh.py` | `--navmesh-generator synth`: Recast decides where a player can stand, simple's triangles how high; samples from both |
 | Recast | `recast_navmesh.py`, `recast_native.py` | `--navmesh-generator recast`: Recast v1.6.0 (vendored, `native/`) through the ctypes library `tools/build_recast.py` builds; clips as solids |
 | Entity Analyzer | `entity_analyzer.py` | Entity lump → game objects |
 | Playable Region | `playable_region.py` | The 3D skybox's BSP area, the spawn/pickup box, mesh crop, waypoint audit (numpy only) |
@@ -295,6 +296,23 @@ its sky_camera). Rules to keep:
 - `--keep-skybox` and `generate_waypoints(keep_skybox=True)` restore the old behaviour;
   `analysis.generate_graph` uses the region too.
 
+### The Walk Proof (`--edge-proof walk`, opt-in)
+`BSPRayTracer.walk_follow` proves an edge by walking the ground as the movement code does, instead of
+the legacy chord tests (line of sight, thin-box sweep, straight hull sweep over 256 units, ground
+steps). Pass 1 builds the ground profile every 16 units (`ground_at`: brushes incl. detail and clip,
+with the top plane's normal; `ground_hint` adds the navmesh's surfaces, which have the displacements):
+steps within 18, slopes with normal z >= 0.7 (`GROUND_NORMAL_Z`), ledges up to `WALK_CLIMB` (54: the
+engine's crouch-jump 57.3 less 3) as jumps, gaps up to `JUMP_GAP_MAX` (120: a 190 u/s running jump
+carries the hull 133) as jumps with their edges bisected to a unit, and falls up to
+`MAX_DROP_CONNECTION`. Pass 2 sweeps the hull (`trace_brushes`, radius 14 = 16 less 2, player-solid
+mask) a step above the highest ground within a hull radius of each 64-unit stretch, then the ducked
+hull if the standing one is blocked (W_FL_CROUCH on both ends). A jump puts W_FL_JUMP on the source.
+An edge stands when the walk ends on B's floor (an interaction point: within body reach). With it,
+doors nothing can open (`Door.opens`: not touch/use-opened unlocked, and no Open/Toggle/... input
+fired at the name) get no door edges and block edges through them. Every rule is checked by
+mapforge navlab's fixture maps (`python -m mapforge navlab`), which derive the expected answers from
+MC2's movement code; `tests/test_walk_follow.py` checks the rules on analytic worlds.
+
 ### The RCBot3 Output Contract
 - **Edges are proven.** Apart from the explicit entity edges (teleporter, ladder rungs and
   dismounts, door sides, lift pairs, jump pads), every connection passes `_can_connect`.
@@ -452,7 +470,7 @@ mypy src                    # Type check
 
 ## Known Limitations
 
-1. **Navmesh Generation**: The default is the simplified grid-based generator. Recast is opt-in
+1. **Navmesh Generation**: The default is the simplified grid-based generator. Recast and synth are opt-in
    (`--navmesh-generator recast`, after `python tools/build_recast.py`); it uses no detail mesh, so
    a point inside a polygon that merges a climbable step is interpolated between its heights
 2. **Line-of-Sight**: Without a ray tracer, connection validity uses only the vertical and
@@ -486,7 +504,8 @@ mypy src                    # Type check
 
 ## Future Enhancement Areas
 
-1. **Recast as the default**: once it beats `simple` on fixture maps (mapforge navlab) and in play
+1. **synth + walk as the default**: it passes all 59 navlab fixtures (simple 40, Recast 48); next,
+   real maps and play
 2. **Ray Tracing**: Use BSP tree for accurate line-of-sight checks
 3. **Multi-Game Support**: Extend to TF2, CS:S, other Source games
 4. **GUI**: Add graphical interface for waypoint editing
