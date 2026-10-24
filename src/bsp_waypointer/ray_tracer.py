@@ -560,6 +560,15 @@ class BSPRayTracer:
             g = ground(px, py, at, step_height)
             return g is not None and at - step_height <= g[0] <= at + climb
 
+        def resumes(d: float, at: float) -> bool:
+            """Does ground at this level come back within a jump past d (before the end)?"""
+            k = 1
+            while k * spacing <= max_gap and d + k * spacing <= horizontal:
+                if supported(d + k * spacing, at):
+                    return True
+                k += 1
+            return False
+
         def edge(lo: float, hi: float, at: float, lo_supported: bool) -> float:
             """Where support changes between lo and hi (lo has ``lo_supported``), to a unit."""
             while hi - lo > 1.0:
@@ -580,6 +589,7 @@ class BSPRayTracer:
         profile: List[Tuple[float, float]] = [(0.0, feet)]
         last_ground = 0.0
         unsupported_from: Optional[float] = None
+        steep_rise = 0.0
         prev = 0.0
         for k in range(1, n + 1):
             here = horizontal * k / n
@@ -591,18 +601,30 @@ class BSPRayTracer:
             if g is not None and g[0] >= feet - step_height:
                 z, nz = g
                 if z > feet + 0.5 and nz < ground_nz:
-                    return WalkProof(False, "too steep (normal z %.2f)" % nz)
+                    # the step-up carries a player over a steep lip lower than a step (a chamfer, a
+                    # brush edge read at its corner); a steep climb taller than that is a slide
+                    steep_rise += z - feet
+                    if steep_rise > step_height:
+                        return WalkProof(False, "too steep (normal z %.2f)" % nz)
+                else:
+                    steep_rise = 0.0
                 if z > feet + step_height:
                     proof.jump = True
                 if unsupported_from is not None:
                     width = edge(prev, here, feet, False) - unsupported_from
-                    proof.gap = max(proof.gap, width)
-                    if width > max_gap:
-                        return WalkProof(False, "gap %.0f wider than a jump (%.0f)" % (width, max_gap))
-                    proof.jump = True
+                    if width > 2 * radius + 4:
+                        # a crack narrower than the engine's 32-unit hull is straddled, not jumped
+                        proof.gap = max(proof.gap, width)
+                        if width > max_gap:
+                            return WalkProof(False, "gap %.0f wider than a jump (%.0f)" % (width, max_gap))
+                        proof.jump = True
                     unsupported_from = None
                 feet = z
                 last_ground = here
+            elif g is not None and resumes(here, feet):
+                # ground far below, but the floor comes back at this level within a jump: a gap
+                if unsupported_from is None:
+                    unsupported_from = edge(prev, here, feet, True)
             elif g is not None:
                 drop = feet - g[0]           # ground far below: a fall from the lip
                 if drop > max_fall:
@@ -615,8 +637,10 @@ class BSPRayTracer:
                 unsupported_from = edge(prev, here, feet, True)
             profile.append((here, feet))
             prev = here
-        if unsupported_from is not None:
+        if unsupported_from is not None and horizontal - unsupported_from > radius + spacing:
             return WalkProof(False, "no ground for the last %.0f units" % (horizontal - unsupported_from))
+        # (a last stretch within a hull radius of the end with no ground under it is B just past a
+        # lip: B is reached from the lip, at the last floor found)
         proof.end_z = feet
         near = radius + spacing
         proof.near_end_z = tuple(sorted({f for d, f in profile if d >= horizontal - near}))

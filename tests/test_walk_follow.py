@@ -101,3 +101,12 @@ def test_a_beam_above_head_height_does_not_block():
     beam = [((100, -100, 78), (228, 100, 80))]          # a detail slab at 78, above a standing head
     p = World(flat(), beam).walk_follow(V(0, 0, 0), V(300, 0, 0))
     assert p.ok and not p.crouch
+
+
+def test_a_crack_narrower_than_the_hull_is_straddled_and_a_pit_with_a_far_floor_is_a_gap():
+    crack = World(lambda x, y: None if 100 <= x < 124 else (0.0, 1.0))           # 24 wide
+    p = crack.walk_follow(V(0, 0, 0), V(300, 0, 0))
+    assert p.ok and not p.jump
+    pit = World(lambda x, y: (-500.0, 1.0) if 100 <= x < 180 else (0.0, 1.0))   # 80 wide, floor far below
+    p = pit.walk_follow(V(0, 0, 0), V(300, 0, 0), max_fall=600.0)
+    assert p.ok and p.jump and p.fall == 0

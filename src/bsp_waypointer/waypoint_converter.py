@@ -1566,13 +1566,13 @@ class HL2DMWaypointConverter:
         if legacy:
             if not proof.ok and proof.reason.startswith(WALK_GROUND_REFUSALS):
                 return False
-            if proof.ok and proof.jump:
-                wp_a.flags |= WaypointFlag.W_FL_JUMP
-            return True
-        if abs(rise) > CROUCH_JUMP_RISE and proof.ok and self._walk_reaches(proof, wp_b):
-            self._walk_flags(proof, wp_a, wp_b)
-            return True
-        return False
+        elif not (abs(rise) > CROUCH_JUMP_RISE and proof.ok and self._walk_reaches(proof, wp_b)):
+            return False
+        # Only a gap the walk found jumped is flagged: ledges keep the legacy flag pass, and the
+        # hull pass (crouching) has no vote here
+        if proof.ok and proof.gap > 0.0:
+            wp_a.flags |= WaypointFlag.W_FL_JUMP
+        return True
 
     def _legacy_tracer_ok(self, wp_a: Waypoint, wp_b: Waypoint, rise: float, distance: float) -> bool:
         """The legacy proof's tracer checks: line of sight, the body line clear of player-solid

@@ -296,6 +296,17 @@ its sky_camera). Rules to keep:
 - `--keep-skybox` and `generate_waypoints(keep_skybox=True)` restore the old behaviour;
   `analysis.generate_graph` uses the region too.
 
+### The Hybrid Proof (`--edge-proof hybrid`, opt-in) -- the candidate
+The full walk proof is right on navlab's fixtures but too strict on live maps (its hull pass meets
+real trims and props: dm_overwatch live 69% -> 52%). Hybrid keeps the legacy proof
+(`_legacy_tracer_ok`, extracted unchanged; legacy output is byte-identical) and lets the walk's
+ground profile veto an edge over no ground, a too-wide gap, a too-deep fall or a steep climb
+(`WALK_GROUND_REFUSALS`), and rescue climbs and drops the chord tests refuse. Only a gap the walk
+jumped is flagged W_FL_JUMP. Live maps (simple navmesh): lockdown and overwatch equal to legacy,
+steamlab better (81% vs 78% live, 8 vs 10 pickups cut off), runoff worse (45% vs 51%): its vetoes
+are steep rock brushes, cracks on downhill displacement and steep displacement hills, which need
+in-engine evidence to settle.
+
 ### The Walk Proof (`--edge-proof walk`, opt-in)
 `BSPRayTracer.walk_follow` proves an edge by walking the ground as the movement code does, instead of
 the legacy chord tests (line of sight, thin-box sweep, straight hull sweep over 256 units, ground
@@ -504,8 +515,8 @@ mypy src                    # Type check
 
 ## Future Enhancement Areas
 
-1. **synth + walk as the default**: it passes all 59 navlab fixtures (simple 40, Recast 48); next,
-   real maps and play
+1. **hybrid (and synth) as the default**: after the runoff vetoes are settled in engine; synth's
+   merge of pickups into samples moves their waypoints 17-73 units and loses some (fix first)
 2. **Ray Tracing**: Use BSP tree for accurate line-of-sight checks
 3. **Multi-Game Support**: Extend to TF2, CS:S, other Source games
 4. **GUI**: Add graphical interface for waypoint editing
