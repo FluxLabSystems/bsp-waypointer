@@ -125,6 +125,33 @@ class BSPRayTracer:
         """
         return self.player_solid_contents_at(point) != 0
 
+    def leaf_contents_at(self, point: Vector3) -> int:
+        """The BSP leaf contents at a point (every bit, water and slime included); 0 with no tree."""
+        if not self.bsp.nodes:
+            return 0
+        idx = 0
+        while idx >= 0:
+            if idx >= len(self.bsp.nodes):
+                return 0
+            node = self.bsp.nodes[idx]
+            if node.plane_index >= len(self.bsp.planes):
+                return 0
+            plane = self.bsp.planes[node.plane_index]
+            idx = node.children[0] if plane.distance_to_point(point) >= 0 else node.children[1]
+        leaf_index = -1 - idx
+        if leaf_index >= len(self.bsp.leafs):
+            return 0
+        return int(self.bsp.leafs[leaf_index].contents)
+
+    def on_water_surface(self, point: Vector3) -> bool:
+        """Whether a point rests on the surface of water or slime: liquid just below it, none just above.
+        A navmesh built from the BSP faces has a layer on a water surface as well as on the pool's floor."""
+        liquid = int(ContentFlags.CONTENTS_WATER) | int(ContentFlags.CONTENTS_SLIME)
+        return bool(
+            self.leaf_contents_at(Vector3(point.x, point.y, point.z - 6.0)) & liquid
+            and not self.leaf_contents_at(Vector3(point.x, point.y, point.z + 4.0)) & liquid
+        )
+
     def lift_onto_surface(
         self,
         origin: Vector3,

@@ -429,6 +429,14 @@ def log_connectivity_report(report: dict, total_waypoints: int) -> None:
         f"{report['bridges']} bridge edges (all traversal-checked), "
         f"{report['spawn_coverage']:.0%} of spawns can reach it"
     )
+    if report.get("pockets"):
+        logger.info(
+            f"  Pockets: {report['pockets']} holding a pickup or spawn searched, "
+            f"{report['pockets_joined']} joined by {report['pocket_waypoints']} route waypoints and "
+            f"{report['pocket_edges']} edges; {report['pocket_standoffs']} pickups moved off a prop"
+            + (f"; {report['pocket_over_budget']} routes dropped at the cap"
+               if report.get("pocket_over_budget") else "")
+        )
     if report["unreachable_flagged"]:
         logger.warning(
             f"  {report['unreachable_flagged']} waypoints flagged unreachable "
@@ -683,7 +691,9 @@ def generate_waypoints(
                 f"  Grounding: {grounding['embedded']} in solid or player clip, "
                 f"{grounding['lifted']} lifted onto the slab they lay in, "
                 f"{grounding['floorless']} without a floor dropped; {grounding['snapped']} put "
-                f"on the floor ({grounding['merged']} merged); {grounding['avoided']} on avoid points"
+                f"on the floor ({grounding['merged']} merged); {grounding['avoided']} on avoid points; "
+                f"{grounding.get('wade', 0)} on a water surface lowered to the floor "
+                f"({grounding.get('wade_merged', 0)} folded into a floor sample)"
             )
             for at, kind, why in getattr(converter, "grounding_dropped", [])[:40]:
                 logger.info(f"    dropped ({why}) {kind} at {at.x:.0f} {at.y:.0f} {at.z:.0f}")
