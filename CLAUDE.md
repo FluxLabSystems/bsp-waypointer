@@ -72,6 +72,7 @@ This document provides comprehensive context for AI assistants working on the BS
 | Entity Analyzer | `entity_analyzer.py` | Entity lump → game objects |
 | Playable Region | `playable_region.py` | The 3D skybox's BSP area, the spawn/pickup box, mesh crop, waypoint audit (numpy only) |
 | Waypoint Converter | `waypoint_converter.py` | Navmesh + entities → waypoints |
+| Waypoint Budget | `budget.py` | ADR-0378: protect, drop unreachable samples, thin the dense ground with connectivity kept, drop flagged samples (`--budget`, default 1900) |
 | Graph Contract | `graph_contract.py` | Components, main-component choice, RCBot3 load-audit model (stdlib only) |
 | RCW Writer | `rcw_writer.py` | Waypoints → .rcw binary file |
 | RCW Validator | `rcw_validator.py` | RCBot3's loader checks, its load-time audit, the graph contract |

@@ -18,6 +18,7 @@ from .constants import (
     DEFAULT_PLAYER_DIMS,
     DEFAULT_WAYPOINT_SPACING,
     FLAGGED_SPAWN_AREA_WARN,
+    DEFAULT_WAYPOINT_BUDGET,
     MAX_WAYPOINTS,
     SPAWN_REACH_COVERAGE,
     PlayerDimensions,
@@ -71,6 +72,14 @@ def _waypoint_budget(text: str) -> int:
     value = int(text)
     if not 2 <= value <= MAX_WAYPOINTS:
         raise argparse.ArgumentTypeError(f"must be 2..{MAX_WAYPOINTS}")
+    return value
+
+
+def _budget_arg(text: str) -> int:
+    """argparse type: a waypoint budget, or 0 for the old grid cap."""
+    value = int(text)
+    if value != 0 and not 2 <= value <= MAX_WAYPOINTS:
+        raise argparse.ArgumentTypeError(f"must be 0 or 2..{MAX_WAYPOINTS}")
     return value
 
 
@@ -142,6 +151,18 @@ Examples:
         help=f"Maximum waypoints, 2..{MAX_WAYPOINTS} (RCBot3's limit; default: {MAX_WAYPOINTS})",
     )
 
+    general.add_argument(
+        "-b", "--budget",
+        type=_budget_arg,
+        default=DEFAULT_WAYPOINT_BUDGET,
+        metavar="N",
+        help=(
+            "Waypoints to spend (ADR-0378), 2..max-waypoints. Past it the generator drops "
+            "samples no spawn reaches and thins the dense open ground, with connectivity kept "
+            "and every spawn and pickup protected; the rest of max-waypoints stays free for "
+            "hl2dm-trail propose. 0 = the old grid cap at max-waypoints (default: %(default)s)"
+        ),
+    )
     general.add_argument(
         "--game-dir",
         type=Path,
@@ -497,6 +518,7 @@ def _analyze_entities(bsp, include_entities, include_chargers, include_ammo, inc
         if not include_ammo:
             entities.ammo_pickups = []
             entities.ammo_crates = []
+            entities.extra_pickups = [e for e in entities.extra_pickups if "ammo" not in e[0]]
         if not include_teleporters:
             entities.teleporters = []
     else:
@@ -511,6 +533,7 @@ def generate_waypoints(
     author: str = "BSP-Waypoint-Generator-HL2DM",
     density: float = 0.5,
     max_waypoints: int = MAX_WAYPOINTS,
+    budget: Optional[int] = DEFAULT_WAYPOINT_BUDGET,
     agent_height: float = DEFAULT_PLAYER_DIMS.standing_height,
     agent_radius: float = DEFAULT_PLAYER_DIMS.radius,
     step_height: float = DEFAULT_PLAYER_DIMS.step_height,
@@ -674,6 +697,7 @@ def generate_waypoints(
             use_ray_tracing=use_ray_tracing,
             region=region,
             avoid_points=avoid_list,
+            budget=budget or None,
         )
         waypoints = converter.convert(navmesh, entities, ladders, objectives=objectives)
         logger.info(f"  Total waypoints: {len(waypoints)}")
@@ -691,6 +715,13 @@ def generate_waypoints(
             logger.info(f"  CTF objectives: {len(objectives)} waypoint(s) placed on them")
         if region is not None:
             _report_region(region, converter, waypoints)
+        bud = getattr(converter, "budget_report", None)
+        if bud:
+            logger.info(
+                f"  Budget {converter.budget}: {bud['candidates']} candidates ({bud['protected']} protected), "
+                f"{bud['dropped_unreachable']} unreachable dropped, {bud['thinned']} thinned "
+                f"(covering distance {bud['cover']} u), {bud.get('dropped_flagged', 0)} flagged dropped"
+            )
         team_hz = getattr(converter, "team_hazard_waypoints", 0)
         if team_hz:
             logger.info(f"  Team-only hazards: {team_hz} waypoint(s) barred to one team")
@@ -846,6 +877,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         author=args.author,
         density=args.density,
         max_waypoints=args.max_waypoints,
+        budget=args.budget,
         agent_height=args.agent_height,
         agent_radius=args.agent_radius,
         step_height=args.step_height,

@@ -79,6 +79,8 @@ General Options:
   -a, --author NAME       Author name for waypoint file
   -d, --density FLOAT     Waypoint density (0.1-1.0, default: 0.5)
   -m, --max-waypoints N   Maximum waypoints, 2..2048 (default: 2048)
+  -b, --budget N          Waypoints to spend (default: 1900; 0 = the old grid cap at -m); see
+                          "The waypoint budget"
 
 Entity Options:
   --weapon-priority       Prioritize weapon spawn waypoints
@@ -276,6 +278,29 @@ dropped as well (`--playable-margin`). On every map, when the budget has to cull
 waypoints far from that box go last and do not stretch the culling grid. A finished graph
 with more than 25 % of its live waypoints in the sky (or far from the match) logs a
 warning. `--keep-skybox` turns all of it off.
+
+## The waypoint budget
+
+RCBot3 holds at most 2048 waypoints. The old cap cut a map that placed more by priority per grid
+cell, after the edges were made: a large map lost whole floors, spawns had no waypoint near, and
+hundreds of islands were left to flag. With `--budget N` (default 1900, so the trail tools have
+148 to add to) the generator spends N waypoints instead (`budget.py`, ADR-0378):
+
+1. Spawns, CTF objectives, every pickup, door, ladder, lift, teleporter, button and push pad, and
+   every waypoint with a flag or a one-way edge are protected and stay.
+2. A plain navmesh sample no spawn can walk to is dropped.
+3. The rest is thinned where it is dense: the sample whose nearest kept neighbour is closest goes
+   first, kept longer within 600 units of a protected waypoint. A sample goes only if its kept
+   neighbours stay joined by two-way edges (strong connectivity is untouched) and every sample it
+   stood for keeps a kept waypoint within the covering distance. That distance starts at 240 units
+   and grows only if the budget is not met yet, so the spacing is as fine as the budget allows.
+4. After the connectivity pass, a plain sample it flagged `W_FL_UNREACHABLE` is dropped too.
+
+No edge is invented: stage A already holds every traversable pair within 400 units. A ladder
+longer than 1,024 units (an elevator shaft) gets rungs 256 apart, longer than 4,096 units
+1,024 apart. MC2's CTF spawns (`ctf_*_player_spawn`) and pickups (`weapon_ctf_*`,
+`item_ammo_ctf_*`, `ctf_cloak`, `ctf_shield`, `ctf_regen`, `ctf_vampire`) and ammo crates get
+protected waypoints.
 
 ## Waypoint Flags
 
