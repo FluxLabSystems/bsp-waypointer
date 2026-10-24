@@ -607,6 +607,10 @@ MAX_DROP_CONNECTION = 600.0
 GROUND_NORMAL_Z = 0.7
 JUMP_GAP_MAX = 120.0
 WALK_CLIMB = 54.0
+# The walk refusals of its ground profile (pass 1) that may veto an edge in edge_proof "hybrid": no
+# ground, a gap too wide, a fall too deep, a slope too steep. Not "a wall or ledge" (a rail the
+# legacy body line clears) nor the hull pass.
+WALK_GROUND_REFUSALS = ("gap", "no ground", "fall", "too steep")
 WALK_SAMPLE_SPACING = 16.0
 
 # Door spawnflags (func_door / func_door_rotating)

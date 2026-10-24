@@ -301,12 +301,13 @@ Examples:
     navmesh = parser.add_argument_group("Navmesh Options")
     navmesh.add_argument(
         "--edge-proof",
-        choices=["legacy", "walk"],
+        choices=["legacy", "walk", "hybrid"],
         default="legacy",
         help=(
             "How an edge is proved with the ray tracer: legacy (the chord tests) or walk (walk the "
             "ground: steps, slopes, jumps across gaps, falls, the hull all the way, crouching; and "
-            "doors nothing can open block). Default: legacy"
+            "doors nothing can open block), or hybrid (legacy, with the walk's ground profile vetoing "
+            "edges over no ground and rescuing climbs and drops). Default: legacy"
         ),
     )
     navmesh.add_argument(

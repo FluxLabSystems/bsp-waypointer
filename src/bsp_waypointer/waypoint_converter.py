@@ -23,6 +23,7 @@ from .constants import (
     GROUND_NORMAL_Z,
     HAZARD_DAMAGE_THRESHOLD,
     JUMP_GAP_MAX,
+    WALK_GROUND_REFUSALS,
     HL2DMWaypointSubType,
     LADDER_RUNG_SPACING,
     MAX_CONNECTION_DISTANCE,
@@ -262,7 +263,9 @@ class HL2DMWaypointConverter:
                 kept within radius of one (ADR-0344)
             edge_proof: "legacy" (the chord tests) or "walk": with a tracer, every edge is proved
                 by walking the ground (BSPRayTracer.walk_follow: steps, slopes, jumps across gaps,
-                falls, the hull all the way, crouching), and doors nothing can open block
+                falls, the hull all the way, crouching), and doors nothing can open block; "hybrid":
+                the legacy proof, with the walk's ground profile vetoing edges over no ground and
+                rescuing climbs and drops (_hybrid_proof), and the same doors
             surface_mesh: the map's TriangleMesh (render faces, brush entities, prop collision):
                 with edge_proof "walk", its walkable triangles are the ground the brush tracer cannot
                 see (displacements, props). Without it the navmesh's polygons stand in
@@ -273,8 +276,8 @@ class HL2DMWaypointConverter:
         self.use_ray_tracing = use_ray_tracing
         self.region = region
         self.avoid_points = list(avoid_points or [])
-        if edge_proof not in ("legacy", "walk"):
-            raise ValueError("edge_proof must be legacy or walk, not %r" % edge_proof)
+        if edge_proof not in ("legacy", "walk", "hybrid"):
+            raise ValueError("edge_proof must be legacy, walk or hybrid, not %r" % edge_proof)
         self.edge_proof = edge_proof
         self._ground_hint = None
         self._surface_mesh = surface_mesh
@@ -363,7 +366,7 @@ class HL2DMWaypointConverter:
         self._place_button_waypoints(entities.buttons)
         self._place_breakable_waypoints(entities.breakables)
         doors = list(entities.doors)
-        if self.edge_proof == "walk":
+        if self.edge_proof in ("walk", "hybrid"):
             self._closed_doors = [d for d in doors if not getattr(d, "opens", True)]
             doors = [d for d in doors if getattr(d, "opens", True)]
             self._ground_hint = (_mesh_ground_hint(self._surface_mesh) if self._surface_mesh is not None
@@ -1436,53 +1439,15 @@ class HL2DMWaypointConverter:
                                        expand=DEFAULT_PLAYER_DIMS.radius):
                 return False
 
-        if self.edge_proof == "walk" and self.ray_tracer and self.use_ray_tracing \
+        if self.edge_proof in ("walk", "hybrid") and self.ray_tracer and self.use_ray_tracing \
                 and hasattr(self.ray_tracer, "walk_follow"):
-            return self._walk_proof(wp_a, wp_b)
+            if self.edge_proof == "walk":
+                return self._walk_proof(wp_a, wp_b)
+            return self._hybrid_proof(wp_a, wp_b, rise, distance)
 
         # Use ray tracing for accurate line-of-sight check
         if self.ray_tracer and self.use_ray_tracing:
-            # Check line of sight at player eye level
-            if not self.ray_tracer.line_of_sight(
-                wp_a.origin,
-                wp_b.origin,
-                player_height_offset=DEFAULT_PLAYER_DIMS.crouch_height,
-            ):
-                return False
-
-            # ADR-0344: the line of sight reads leaf contents, so a wall of
-            # detail brushes or a player-clip wall does not stop it. A walker
-            # needs the body line clear of MASK_PLAYERSOLID world brushes. A
-            # drop is judged by its two real legs, not the chord.
-            if not self._walk_path_clear(wp_a.origin, wp_b.origin, rise):
-                return False
-
-            # A climb at any length, or a longer flat stretch, also needs a
-            # player hull to walk the path (skipped for drops: falling needs
-            # no walk clearance)
-            climb = rise > CROUCH_JUMP_RISE
-            if (climb or distance > 256) and rise >= -CROUCH_JUMP_RISE:
-                if not self.ray_tracer.can_walk_between(
-                    wp_a.origin,
-                    wp_b.origin,
-                    player_radius=DEFAULT_PLAYER_DIMS.radius,
-                    player_height=DEFAULT_PLAYER_DIMS.standing_height,
-                    step_height=DEFAULT_PLAYER_DIMS.step_height,
-                ):
-                    return False
-
-            # The gradient rule assumes the ground rises along the path. Once
-            # the line has risen above a wall, the eye line and the straight
-            # hull sweep both pass over it into the ledge behind, so walk the
-            # ground: no upward step may exceed a crouch-jump (M-087)
-            if climb and not self.ray_tracer.ground_steps_ok(
-                wp_a.origin,
-                wp_b.origin,
-                max_step=CROUCH_JUMP_RISE,
-                step_height=DEFAULT_PLAYER_DIMS.step_height,
-            ):
-                return False
-
+            return self._legacy_tracer_ok(wp_a, wp_b, rise, distance)
         return True
 
     def _place_by_walk_rules(self) -> None:
@@ -1549,11 +1514,8 @@ class HL2DMWaypointConverter:
         self.grounding_report["walk_moved"] = moved
         self.grounding_report["walk_dropped"] = len(drop)
 
-    def _walk_proof(self, wp_a: Waypoint, wp_b: Waypoint) -> bool:
-        """edge_proof "walk": the edge stands when the ground walk from A ends on B's floor. A gap
-        jumped on the way puts W_FL_JUMP on A; a passage only the ducked hull fits puts W_FL_CROUCH on
-        both ends."""
-        proof = self.ray_tracer.walk_follow(
+    def _walk(self, wp_a: Waypoint, wp_b: Waypoint):
+        return self.ray_tracer.walk_follow(
             wp_a.origin, wp_b.origin,
             spacing=WALK_SAMPLE_SPACING,
             step_height=DEFAULT_PLAYER_DIMS.step_height,
@@ -1563,23 +1525,99 @@ class HL2DMWaypointConverter:
             ground_nz=GROUND_NORMAL_Z,
             ground_hint=self._ground_hint,
         )
-        if not proof.ok:
-            return False
-        # B is on the floor the walk reached: a waypoint may sit above it as far as the standing body
-        # reaches (a pickup hovers or lies on a prop; a teleporter's trigger, a ladder rung, a button
-        # are where the entity is), and no lower than a step under it. A B on a ledge is not let in
-        # this way: the walk onto its xy meets the ledge itself (a climb, or a wall)
-        # (a B just past a lip is reached from the lip: any floor the walk had within a hull radius
-        # of the end counts)
-        if not any(-DEFAULT_PLAYER_DIMS.step_height - 2.0 <= wp_b.origin.z - z
+
+    @staticmethod
+    def _walk_reaches(proof, wp_b: Waypoint) -> bool:
+        """B is on the floor the walk reached: a waypoint may sit above it as far as the standing body
+        reaches (a pickup hovers or lies on a prop; a teleporter's trigger, a ladder rung, a button are
+        where the entity is), and no lower than a step under it; a B just past a lip is reached from
+        the lip (any floor the walk had within a hull radius of the end counts). A B on a ledge is not
+        let in this way: the walk onto its xy meets the ledge itself (a climb, or a wall)."""
+        return any(-DEFAULT_PLAYER_DIMS.step_height - 2.0 <= wp_b.origin.z - z
                    <= DEFAULT_PLAYER_DIMS.standing_height
-                   for z in (proof.end_z,) + tuple(proof.near_end_z)):
-            return False
+                   for z in (proof.end_z,) + tuple(proof.near_end_z))
+
+    @staticmethod
+    def _walk_flags(proof, wp_a: Waypoint, wp_b: Waypoint) -> None:
         if proof.jump:
             wp_a.flags |= WaypointFlag.W_FL_JUMP
         if proof.crouch:
             wp_a.flags |= WaypointFlag.W_FL_CROUCH
             wp_b.flags |= WaypointFlag.W_FL_CROUCH
+
+    def _walk_proof(self, wp_a: Waypoint, wp_b: Waypoint) -> bool:
+        """edge_proof "walk": the edge stands when the ground walk from A reaches B (_walk_reaches). A
+        gap or ledge jumped on the way puts W_FL_JUMP on A; a passage only the ducked hull fits puts
+        W_FL_CROUCH on both ends."""
+        proof = self._walk(wp_a, wp_b)
+        if not proof.ok or not self._walk_reaches(proof, wp_b):
+            return False
+        self._walk_flags(proof, wp_a, wp_b)
+        return True
+
+    def _hybrid_proof(self, wp_a: Waypoint, wp_b: Waypoint, rise: float, distance: float) -> bool:
+        """edge_proof "hybrid": each proof decides where it has been shown right. The legacy proof
+        decides; the walk's ground profile vetoes an edge it accepts that crosses no ground, a gap
+        wider than a jump, a fall too deep or a slope too steep to walk up (a lethal pit); the walk
+        rescues a climb or a drop the legacy chord tests refuse (a ramp's crest, the cliff below a
+        lip). The walk's hull pass, which real maps' trims and props make too strict, has no vote."""
+        legacy = self._legacy_tracer_ok(wp_a, wp_b, rise, distance)
+        proof = self._walk(wp_a, wp_b)
+        if legacy:
+            if not proof.ok and proof.reason.startswith(WALK_GROUND_REFUSALS):
+                return False
+            if proof.ok and proof.jump:
+                wp_a.flags |= WaypointFlag.W_FL_JUMP
+            return True
+        if abs(rise) > CROUCH_JUMP_RISE and proof.ok and self._walk_reaches(proof, wp_b):
+            self._walk_flags(proof, wp_a, wp_b)
+            return True
+        return False
+
+    def _legacy_tracer_ok(self, wp_a: Waypoint, wp_b: Waypoint, rise: float, distance: float) -> bool:
+        """The legacy proof's tracer checks: line of sight, the body line clear of player-solid
+        brushes (a drop by its two legs), the hull for a climb or a stretch over 256, the ground steps
+        of a climb."""
+        # Check line of sight at player eye level
+        if not self.ray_tracer.line_of_sight(
+            wp_a.origin,
+            wp_b.origin,
+            player_height_offset=DEFAULT_PLAYER_DIMS.crouch_height,
+        ):
+            return False
+
+        # ADR-0344: the line of sight reads leaf contents, so a wall of
+        # detail brushes or a player-clip wall does not stop it. A walker
+        # needs the body line clear of MASK_PLAYERSOLID world brushes. A
+        # drop is judged by its two real legs, not the chord.
+        if not self._walk_path_clear(wp_a.origin, wp_b.origin, rise):
+            return False
+
+        # A climb at any length, or a longer flat stretch, also needs a
+        # player hull to walk the path (skipped for drops: falling needs
+        # no walk clearance)
+        climb = rise > CROUCH_JUMP_RISE
+        if (climb or distance > 256) and rise >= -CROUCH_JUMP_RISE:
+            if not self.ray_tracer.can_walk_between(
+                wp_a.origin,
+                wp_b.origin,
+                player_radius=DEFAULT_PLAYER_DIMS.radius,
+                player_height=DEFAULT_PLAYER_DIMS.standing_height,
+                step_height=DEFAULT_PLAYER_DIMS.step_height,
+            ):
+                return False
+
+        # The gradient rule assumes the ground rises along the path. Once
+        # the line has risen above a wall, the eye line and the straight
+        # hull sweep both pass over it into the ledge behind, so walk the
+        # ground: no upward step may exceed a crouch-jump (M-087)
+        if climb and not self.ray_tracer.ground_steps_ok(
+            wp_a.origin,
+            wp_b.origin,
+            max_step=CROUCH_JUMP_RISE,
+            step_height=DEFAULT_PLAYER_DIMS.step_height,
+        ):
+            return False
         return True
 
     def _walk_path_clear(self, a: Vector3, b: Vector3, rise: float) -> bool:
