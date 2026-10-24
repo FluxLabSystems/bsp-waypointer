@@ -41,6 +41,12 @@ COVER_STEPS = (240.0, 300.0, 360.0, 440.0, 560.0, 720.0)
 # A kept sample is held longer when a protected waypoint is within this many units
 PROTECT_RADIUS = 600.0
 PROTECT_WEIGHT = 0.6
+# A plain sample with no world floor within RCBot3's touch height (72 units) hangs in the air as far
+# as the nav check at map load is concerned ("hovering"): it is cut off, with every edge on it. It is
+# thinned first (its key is scaled by this) -- a prop top or a displacement the tracer cannot see
+# can look the same, so it goes only where the budget needs it.
+FLOATING_WEIGHT = 0.25
+FLOOR_REACH = 72.0
 # Bounds of the local search that proves two neighbours stay joined
 BFS_MAX_NODES = 600
 BFS_MAX_DEPTH = 10
@@ -72,7 +78,7 @@ def spend_budget(conv, budget: int, drop_unreachable: bool = True) -> Dict[str, 
     distance cannot take more away (the caller then falls back to the grid cap)."""
     wps = conv._waypoints
     rep: Dict[str, int] = {
-        "candidates": len(wps), "protected": 0, "dropped_unreachable": 0, "thinned": 0,
+        "candidates": len(wps), "protected": 0, "dropped_unreachable": 0, "thinned": 0, "floating": 0,
         "final": len(wps), "cover": 0,
     }
     if len(wps) <= budget:
@@ -119,6 +125,16 @@ def spend_budget(conv, budget: int, drop_unreachable: bool = True) -> Dict[str, 
             blk = P[s:s + 512]
             d = np.sqrt(((blk[:, None, :] - P[pidx][None, :, :]) ** 2).sum(axis=2)).min(axis=1)
             weight[s:s + 512] = 1.0 + PROTECT_WEIGHT * np.clip(1.0 - d / PROTECT_RADIUS, 0.0, 1.0)
+
+    # floating plain samples (see FLOATING_WEIGHT)
+    tracer = conv.ray_tracer if getattr(conv, "use_ray_tracing", False) else None
+    floating = 0
+    if tracer is not None and hasattr(tracer, "floor_support"):
+        for i in range(n):
+            if removable[i] and tracer.floor_support(wps[i].origin, reach=FLOOR_REACH) is None:
+                weight[i] *= FLOATING_WEIGHT
+                floating += 1
+    rep["floating"] = floating
 
     kept = [True] * n
     att: Dict[int, List[int]] = {}      # kept waypoint -> removed samples it stands for

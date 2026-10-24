@@ -719,7 +719,7 @@ def generate_waypoints(
         if bud:
             logger.info(
                 f"  Budget {converter.budget}: {bud['candidates']} candidates ({bud['protected']} protected), "
-                f"{bud['dropped_unreachable']} unreachable dropped, {bud['thinned']} thinned "
+                f"{bud['dropped_unreachable']} unreachable dropped, {bud['thinned']} thinned ({bud.get('floating', 0)} floating thinned first) "
                 f"(covering distance {bud['cover']} u), {bud.get('dropped_flagged', 0)} flagged dropped"
             )
         team_hz = getattr(converter, "team_hazard_waypoints", 0)
