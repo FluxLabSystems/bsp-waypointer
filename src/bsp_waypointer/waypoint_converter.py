@@ -22,6 +22,10 @@ from .constants import (
     DEGREE_REPAIR_RANGES,
     HAZARD_DAMAGE_THRESHOLD,
     HL2DMWaypointSubType,
+    LADDER_HUGE_LENGTH,
+    LADDER_HUGE_RUNG_SPACING,
+    LADDER_LONG_LENGTH,
+    LADDER_LONG_RUNG_SPACING,
     LADDER_RUNG_SPACING,
     MAX_CONNECTION_DISTANCE,
     MAX_DROP_CONNECTION,
@@ -94,6 +98,7 @@ def _is_standing_spot(wp: "Waypoint") -> bool:
         wp.sampled
         or wp.is_spawn
         or wp.is_objective
+        or wp.keep
         or HL2DMWaypointSubType.WEAPON_CROWBAR <= wp.metadata.subtype <= HL2DMWaypointSubType.ITEM_AMMO_CRATE
     )
 
@@ -177,6 +182,9 @@ class Waypoint:
     # --ctf-layout, MC2 ADR-0264). Kept through the waypoint cap like a spawn,
     # so a bot sent to the objective has a waypoint ON it.
     is_objective: bool = False
+    # A pickup with no waypoint subtype (an MC2 CTF weapon, ammo or power-up, an
+    # ammo crate) is here: the waypoint budget keeps it (ADR-0378).
+    keep: bool = False
     # RCBot3's per-waypoint area id (iArea); 0 = none. Set by --ctf-layout on
     # control points (index + 1).
     area: int = 0
@@ -240,6 +248,7 @@ class HL2DMWaypointConverter:
         use_ray_tracing: bool = True,
         region: Optional["PlayableRegion"] = None,
         avoid_points: Optional[List[Tuple[Vector3, float]]] = None,
+        budget: Optional[int] = None,
     ):
         """
         Initialize the waypoint converter.
@@ -254,9 +263,14 @@ class HL2DMWaypointConverter:
                 the waypoints far from every spawn and pickup are culled first (ADR-0318)
             avoid_points: (origin, radius) spots known to be bad: no waypoint is
                 kept within radius of one (ADR-0344)
+            budget: Spend this many waypoints (ADR-0378, ``budget.spend_budget``): what
+                is protected stays, unreachable samples go, the rest is thinned where it is
+                dense with connectivity kept. None keeps the old grid cap at max_waypoints.
         """
         self.spacing = spacing
         self.max_waypoints = max_waypoints
+        self.budget = None if budget is None else max(2, min(int(budget), max_waypoints))
+        self.budget_report: Dict[str, int] = {}
         self.ray_tracer = ray_tracer
         self.use_ray_tracing = use_ray_tracing
         self.region = region
@@ -336,6 +350,7 @@ class HL2DMWaypointConverter:
         self._place_ammo_waypoints(entities.ammo_pickups)
         self._place_spawn_waypoints(entities.spawn_points)
         self._place_objective_waypoints(objectives or [])
+        self._place_extra_pickup_waypoints(getattr(entities, "extra_pickups", []))
         self._place_teleporter_waypoints(entities.teleporters)
         self._place_ladder_waypoints(entities.ladders, ladders or [])
         self._place_useable_ladder_waypoints(
@@ -361,6 +376,11 @@ class HL2DMWaypointConverter:
         # Optimize waypoint count if needed (BEFORE connectivity
         # finalization — culling can re-fragment the graph, so degree
         # repair and the connectivity guarantee must run on the final set)
+        if self.budget is not None and len(self._waypoints) > self.budget:
+            from .budget import spend_budget
+
+            self.budget_report = spend_budget(self, self.budget)
+        # The old grid cap: the whole answer without a budget, the backstop with one
         if len(self._waypoints) > self.max_waypoints:
             self._optimize_waypoint_count()
 
@@ -375,6 +395,13 @@ class HL2DMWaypointConverter:
         # flag everything outside the main component W_FL_UNREACHABLE
         # (raises only when the main component has fewer than two waypoints)
         self._ensure_connectivity()
+
+        # ADR-0378: a plain sample the connectivity pass flagged is no use to a bot
+        if self.budget_report:
+            from .budget import drop_flagged_plain
+
+            self.budget_report["dropped_flagged"] = drop_flagged_plain(self)
+            self.budget_report["final"] = len(self._waypoints)
 
         # Assign additional flags based on geometry
         self._assign_geometry_flags(navmesh)
@@ -616,6 +643,16 @@ class HL2DMWaypointConverter:
             self._waypoints[idx].is_objective = True
             self._objective_origins.append(origin)
             self.objective_waypoints += 1
+
+    def _place_extra_pickup_waypoints(self, extras) -> None:
+        """A waypoint on each pickup the subtype tables do not list (MC2 CTF weapons,
+        ammo and power-ups, ammo crates). It carries no subtype, so RCBot3 reads it as
+        a plain waypoint; the budget keeps it, and the connectivity pass joins it."""
+        self.extra_pickup_waypoints = 0
+        for _name, at in extras:
+            idx = self._add_waypoint(at)
+            self._waypoints[idx].keep = True
+            self.extra_pickup_waypoints += 1
 
     def _floor_under(self, at: Vector3, depth: float = 1024.0) -> Vector3:
         """The world floor under a point (the point itself without a tracer, or
@@ -907,6 +944,7 @@ class HL2DMWaypointConverter:
                 other.flags |= wp.flags
                 other.is_spawn = other.is_spawn or wp.is_spawn
                 other.is_objective = other.is_objective or wp.is_objective
+                other.keep = other.keep or wp.keep
                 other.sampled = other.sampled or wp.sampled
                 if wp.metadata.weapon_priority > other.metadata.weapon_priority:
                     other.metadata = wp.metadata
@@ -1031,7 +1069,12 @@ class HL2DMWaypointConverter:
         """
         span = top - bottom
         length = span.length()
-        steps = max(1, int(length / LADDER_RUNG_SPACING))
+        rung = LADDER_RUNG_SPACING
+        if length > LADDER_HUGE_LENGTH:
+            rung = LADDER_HUGE_RUNG_SPACING
+        elif length > LADDER_LONG_LENGTH:
+            rung = LADDER_LONG_RUNG_SPACING
+        steps = max(1, int(length / rung))
 
         chain: List[int] = []
         for i in range(steps + 1):

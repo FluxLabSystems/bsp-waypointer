@@ -36,6 +36,8 @@ from .constants import (
     SF_TRIGGER_DISALLOW_BOTS,
     SF_TRIGGER_ONLY_CLIENTS_IN_VEHICLES,
     SPAWN_ENTITIES,
+    EXTRA_PICKUP_ENTITIES,
+    EXTRA_PICKUP_PREFIXES,
     SPAWN_OUTSIDE_WORLD_MARGIN,
     STATIC_PROP_SIZE_HINTS,
     TELEPORT_DESTINATION,
@@ -271,6 +273,9 @@ class HL2DMEntityData:
     useable_ladders: List[UseableLadder] = field(default_factory=list)
     ladder_dismounts: List[LadderDismount] = field(default_factory=list)
     lifts: List[Lift] = field(default_factory=list)
+    # Pickups with no waypoint subtype (MC2 CTF weapons, ammo and power-ups, ammo
+    # crates): (classname, origin). Each gets a waypoint the budget keeps.
+    extra_pickups: List[Tuple[str, Vector3]] = field(default_factory=list)
 
     @property
     def total_entities(self) -> int:
@@ -294,6 +299,7 @@ class HL2DMEntityData:
             + len(self.useable_ladders)
             + len(self.ladder_dismounts)
             + len(self.lifts)
+            + len(self.extra_pickups)
         )
 
 
@@ -337,6 +343,7 @@ class HL2DMEntityAnalyzer:
 
         # Parse all entity types
         self._parse_spawn_points()
+        self._parse_extra_pickups()
         self._parse_weapons()
         self._parse_health_items()
         self._parse_armor_items()
@@ -447,6 +454,15 @@ class HL2DMEntityAnalyzer:
                     self._data.spawn_points.append(spawn)
                 else:
                     self._data.invalid_spawn_points.append(spawn)
+
+    def _parse_extra_pickups(self) -> None:
+        """Pickups the subtype tables do not list (MC2 CTF weapons, ammo, power-ups, ammo crates)."""
+        for entity in self._bsp.entities:
+            name = entity.classname
+            if name in EXTRA_PICKUP_ENTITIES or name.startswith(EXTRA_PICKUP_PREFIXES):
+                origin = entity.get_vector("origin")
+                if origin:
+                    self._data.extra_pickups.append((name, origin))
 
     def _spawn_in_world(self, origin: Vector3) -> bool:
         """
