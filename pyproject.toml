@@ -39,11 +39,8 @@ dev = [
     "ruff>=0.1.0",
     "mypy>=1.0.0",
 ]
-recast = [
-    "PyRecastDetour>=0.1.0",
-]
 all = [
-    "bsp-waypointer[dev,recast]",
+    "bsp-waypointer[dev]",
 ]
 
 [project.scripts]

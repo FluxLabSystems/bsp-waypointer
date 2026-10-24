@@ -1,0 +1,2 @@
+Vendored from https://github.com/recastnavigation/recastnavigation tag v1.6.0 (commit 6dc1667),
+Recast/ only, unmodified. zlib licence: License.txt.

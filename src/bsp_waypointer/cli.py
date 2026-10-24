@@ -23,7 +23,7 @@ from .constants import (
     PlayerDimensions,
 )
 from .entity_analyzer import HL2DMEntityAnalyzer
-from .geometry_extractor import GeometryExtractor
+from .geometry_extractor import GeometryExtractor, TriangleMesh
 from .navmesh_generator import NavmeshConfig, NavmeshGenerator
 from .playable_region import (
     FAR_SHARE_WARN,
@@ -34,6 +34,7 @@ from .playable_region import (
 )
 from .ray_tracer import BSPRayTracer
 from .rcw_writer import write_waypoints
+from .recast_native import clip_brush_planes, clip_brush_triangles
 from .recast_navmesh import RecastConfig, RecastNavmeshGenerator, is_recast_available
 from .vector import Vector3
 from .waypoint_converter import AVOID_POINT_RADIUS, HL2DMWaypointConverter
@@ -300,8 +301,11 @@ Examples:
     navmesh.add_argument(
         "--navmesh-generator",
         choices=["simple", "recast"],
-        default="recast",
-        help="Navmesh generator to use (default: recast if available, else simple)",
+        default="simple",
+        help=(
+            "Navmesh generator to use (default: simple). recast needs the native library "
+            "(python tools/build_recast.py) and falls back to simple without it"
+        ),
     )
     navmesh.add_argument(
         "--cell-size",
@@ -519,7 +523,7 @@ def generate_waypoints(
     include_teleporters: bool = True,
     include_entities: bool = True,
     weapon_priority: bool = False,
-    navmesh_generator: str = "recast",
+    navmesh_generator: str = "simple",
     cell_size: float = 8.0,
     cell_height: float = 4.0,
     use_ray_tracing: bool = True,
@@ -645,7 +649,17 @@ def generate_waypoints(
                 agent_max_climb=step_height,
             )
             recast_gen = RecastNavmeshGenerator(recast_config)
-            navmesh = recast_gen.generate(mesh)
+            clips = None
+            if is_recast_available():
+                # Player clips have no faces, so they are added as solids (ADR-0344's player-solid rule)
+                cv, ct = clip_brush_triangles(bsp)
+                if len(ct):
+                    clip_mesh = TriangleMesh(vertices=cv, triangles=ct)
+                    if region is not None:
+                        clip_mesh, _ = crop_mesh(clip_mesh, region)
+                    clips = (clip_mesh.vertices, clip_mesh.triangles, clip_brush_planes(bsp))
+                    logger.info(f"  Player clip: {len(clips[2])} brushes made solid")
+            navmesh = recast_gen.generate(mesh, clips)
         else:
             logger.info("  Using simple navmesh generator")
             config = NavmeshConfig(

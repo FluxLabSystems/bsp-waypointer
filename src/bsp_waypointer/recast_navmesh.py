@@ -18,39 +18,22 @@ from .constants import DEFAULT_PLAYER_DIMS, PlayerDimensions
 from .geometry_extractor import TriangleMesh
 from .navmesh_generator import NavEdge, NavigationMesh, NavmeshConfig, NavPolygon
 from .vector import BoundingBox, Vector3
+from . import recast_native
 
 logger = logging.getLogger(__name__)
 
-# Try to import Recast bindings
-RECAST_AVAILABLE = False
+# Recast comes from the bundled native library (native/recast_c, built by tools/build_recast.py).
+RECAST_AVAILABLE = recast_native.available()
 RECAST_INSTALL_MSG = """
 ================================================================================
-Recast/Detour library not found - using enhanced fallback navmesh generation.
+Recast native library not loaded - using the fallback navmesh generation.
+%s
 
-For better navmesh quality, install PyRecastDetour:
+Build it (MSVC on Windows, c++ elsewhere):
 
-    pip install PyRecastDetour
-
-Or install with all optional dependencies:
-
-    pip install bsp-waypointer[recast]
-
-See README.md for more information.
+    python tools/build_recast.py
 ================================================================================
 """
-
-try:
-    import pyrecast as recast
-    RECAST_AVAILABLE = True
-    logger.debug("PyRecastDetour is available")
-except ImportError:
-    try:
-        # Alternative package name
-        import recastnavigation as recast
-        RECAST_AVAILABLE = True
-        logger.debug("recastnavigation is available")
-    except ImportError:
-        logger.debug("No Recast bindings available, using fallback implementation")
 
 
 _RECAST_WARNING_SHOWN = False
@@ -60,7 +43,7 @@ def _show_recast_install_instructions() -> None:
     """Show installation instructions for Recast (only once per session)."""
     global _RECAST_WARNING_SHOWN
     if not _RECAST_WARNING_SHOWN and not RECAST_AVAILABLE:
-        logger.warning(RECAST_INSTALL_MSG)
+        logger.warning(RECAST_INSTALL_MSG % recast_native.load_error())
         _RECAST_WARNING_SHOWN = True
 
 
@@ -132,7 +115,9 @@ class RecastNavmeshGenerator:
         """Check if Recast library is available."""
         return RECAST_AVAILABLE
 
-    def generate(self, mesh: TriangleMesh) -> NavigationMesh:
+    def generate(self, mesh: TriangleMesh,
+                 extra_solids: Optional[Tuple[np.ndarray, np.ndarray, List[np.ndarray]]] = None
+                 ) -> NavigationMesh:
         """
         Generate navigation mesh from triangle mesh.
 
@@ -141,96 +126,78 @@ class RecastNavmeshGenerator:
 
         Args:
             mesh: Input triangle mesh
+            extra_solids: (vertices, triangles, planes) of brushes with no faces of their own (the
+                player clips): Recast rasterises the triangles and makes floor inside the planes
+                unwalkable. The fallback ignores them
 
         Returns:
             Navigation mesh for pathfinding
         """
         if RECAST_AVAILABLE:
-            return self._generate_with_recast(mesh)
+            return self._generate_with_recast(mesh, extra_solids)
         else:
             _show_recast_install_instructions()
             return self._generate_fallback(mesh)
 
-    def _generate_with_recast(self, mesh: TriangleMesh) -> NavigationMesh:
-        """Generate navmesh using Recast library."""
+    def settings(self) -> recast_native.RecastSettings:
+        """Recast's parameters from this config. The cell height is lowered, if need be, to a divisor of the
+        climb: Recast counts the climb in whole cells and rounds down, so 18 units on 4-unit cells would
+        climb only 16 and refuse every real step."""
+        c = self.config
+        ch = c.cell_height
+        cells = int(np.ceil(c.agent_max_climb / ch - 1e-6))
+        if cells > 0 and abs(cells * ch - c.agent_max_climb) > 1e-3:
+            ch = c.agent_max_climb / cells
+        return recast_native.RecastSettings(
+            cell_size=c.cell_size, cell_height=ch, walkable_slope=c.agent_max_slope,
+            agent_height=c.agent_height, agent_climb=c.agent_max_climb, agent_radius=c.agent_radius,
+            max_edge_len=c.edge_max_len, max_edge_error=c.edge_max_error,
+            min_region_area=c.region_min_size, merge_region_area=c.region_merge_size)
+
+    def _generate_with_recast(self, mesh: TriangleMesh,
+                              extra_solids: Optional[Tuple[np.ndarray, np.ndarray, List[np.ndarray]]] = None
+                              ) -> NavigationMesh:
+        """Generate the navmesh with Recast. ``extra_solids``: see ``generate``
+        (``recast_native.clip_brush_triangles`` and ``clip_brush_planes``)."""
         if mesh.num_triangles == 0:
             return NavigationMesh()
-
-        try:
-            # Get mesh bounds
-            bounds = mesh.bounds
-            if bounds is None:
-                return NavigationMesh()
-
-            # Calculate grid dimensions
-            bmin = [bounds.mins.x, bounds.mins.y, bounds.mins.z]
-            bmax = [bounds.maxs.x, bounds.maxs.y, bounds.maxs.z]
-
-            # Build Recast navmesh
-            # This is a simplified API - actual implementation depends on
-            # which Python bindings are being used
-            vertices = mesh.vertices.flatten().tolist()
-            triangles = mesh.triangles.flatten().tolist()
-
-            # Create Recast context and build navmesh
-            nav_data = recast.build_navmesh(
-                vertices=vertices,
-                triangles=triangles,
-                bounds_min=bmin,
-                bounds_max=bmax,
-                cell_size=self.config.cell_size,
-                cell_height=self.config.cell_height,
-                agent_height=self.config.agent_height,
-                agent_radius=self.config.agent_radius,
-                agent_max_climb=self.config.agent_max_climb,
-                agent_max_slope=self.config.agent_max_slope,
-                region_min_size=self.config.region_min_size,
-                region_merge_size=self.config.region_merge_size,
-                edge_max_len=self.config.edge_max_len,
-                edge_max_error=self.config.edge_max_error,
-                detail_sample_dist=self.config.detail_sample_dist,
-                detail_sample_max_error=self.config.detail_sample_max_error,
-            )
-
-            # Convert Recast output to our NavigationMesh format
-            return self._convert_recast_output(nav_data, bounds)
-
-        except Exception as e:
-            logger.warning(f"Recast generation failed: {e}, using fallback")
-            return self._generate_fallback(mesh)
+        bounds = mesh.bounds
+        if bounds is None:
+            return NavigationMesh()
+        verts = np.asarray(mesh.vertices, dtype=np.float32).reshape(-1, 3)
+        tris = np.asarray(mesh.triangles, dtype=np.int32).reshape(-1, 3)
+        planes: List[np.ndarray] = []
+        if extra_solids is not None:
+            ev, et, planes = extra_solids
+            if len(et):
+                tris = np.vstack([tris, np.asarray(et, dtype=np.int32) + len(verts)])
+                verts = np.vstack([verts, np.asarray(ev, dtype=np.float32)])
+        pm = recast_native.build_polymesh(verts, tris, self.settings(), planes)
+        return self._convert_recast_output(pm, bounds)
 
     def _convert_recast_output(
-        self, nav_data: dict, bounds: BoundingBox
+        self, pm: recast_native.PolyMesh, bounds: BoundingBox
     ) -> NavigationMesh:
-        """Convert Recast output to NavigationMesh format."""
+        """Recast's polygon mesh as a NavigationMesh: Recast's own neighbours, and the shared-edge
+        connectivity the converter reads."""
         polygons = []
-        edges = []
-
-        # Extract polygons from Recast navmesh
-        if "polygons" in nav_data:
-            for i, poly_data in enumerate(nav_data["polygons"]):
-                vertices = [
-                    Vector3(v[0], v[1], v[2]) for v in poly_data.vertices
-                ]
-                center = sum(vertices, Vector3.zero()) / len(vertices)
-                normal = self._calculate_polygon_normal(vertices)
-                area = self._calculate_polygon_area(vertices)
-                neighbors = list(poly_data.neighbors) if hasattr(poly_data, "neighbors") else []
-
-                polygons.append(
-                    NavPolygon(
-                        index=i,
-                        vertices=vertices,
-                        center=center,
-                        normal=normal,
-                        area=area,
-                        neighbors=neighbors,
-                    )
+        for i, idx in enumerate(pm.polys):
+            vertices = [Vector3(float(pm.verts[k][0]), float(pm.verts[k][1]), float(pm.verts[k][2]))
+                        for k in idx]
+            if len(vertices) < 3:
+                continue
+            center = sum(vertices, Vector3.zero()) / len(vertices)
+            polygons.append(
+                NavPolygon(
+                    index=len(polygons),
+                    vertices=vertices,
+                    center=center,
+                    normal=self._calculate_polygon_normal(vertices),
+                    area=self._calculate_polygon_area(vertices),
+                    neighbors=[n for n in pm.neighbours[i] if n >= 0],
                 )
-
-        # Compute connectivity edges (same as fallback path)
+            )
         edges = self._compute_connectivity(polygons)
-
         return NavigationMesh(
             polygons=polygons,
             edges=edges,

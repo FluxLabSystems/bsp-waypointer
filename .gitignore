@@ -154,3 +154,6 @@ Thumbs.db
 *.rcm
 *.rcv
 *.obj
+
+# Recast native library (tools/build_recast.py)
+src/bsp_waypointer/_native/

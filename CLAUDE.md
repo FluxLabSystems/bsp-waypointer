@@ -68,7 +68,8 @@ This document provides comprehensive context for AI assistants working on the BS
 | Constants | `constants.py` | HL2DM definitions, flags, weapon data |
 | BSP Parser | `bsp_parser.py` | Binary BSP file parsing |
 | Geometry Extractor | `geometry_extractor.py` | BSP → triangle mesh |
-| Navmesh Generator | `navmesh_generator.py` | Triangle mesh → navigation mesh |
+| Navmesh Generator | `navmesh_generator.py` | Triangle mesh → navigation mesh (the default, `simple`) |
+| Recast | `recast_navmesh.py`, `recast_native.py` | `--navmesh-generator recast`: Recast v1.6.0 (vendored, `native/`) through the ctypes library `tools/build_recast.py` builds; clips as solids |
 | Entity Analyzer | `entity_analyzer.py` | Entity lump → game objects |
 | Playable Region | `playable_region.py` | The 3D skybox's BSP area, the spawn/pickup box, mesh crop, waypoint audit (numpy only) |
 | Waypoint Converter | `waypoint_converter.py` | Navmesh + entities → waypoints |
@@ -451,7 +452,9 @@ mypy src                    # Type check
 
 ## Known Limitations
 
-1. **Navmesh Generation**: Uses simplified grid-based approach, not Recast/Detour
+1. **Navmesh Generation**: The default is the simplified grid-based generator. Recast is opt-in
+   (`--navmesh-generator recast`, after `python tools/build_recast.py`); it uses no detail mesh, so
+   a point inside a polygon that merges a climbable step is interpolated between its heights
 2. **Line-of-Sight**: Without a ray tracer, connection validity uses only the vertical and
    slope rules and the props. A solid prop is judged by its own collision: the player box,
    swept from step height to head height, must clear each convex piece of its `.phy`
@@ -483,7 +486,7 @@ mypy src                    # Type check
 
 ## Future Enhancement Areas
 
-1. **Recast Integration**: Replace navmesh generator with Recast/Detour bindings
+1. **Recast as the default**: once it beats `simple` on fixture maps (mapforge navlab) and in play
 2. **Ray Tracing**: Use BSP tree for accurate line-of-sight checks
 3. **Multi-Game Support**: Extend to TF2, CS:S, other Source games
 4. **GUI**: Add graphical interface for waypoint editing

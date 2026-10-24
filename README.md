@@ -44,19 +44,31 @@ pip install -e .
 
 ### Optional Dependencies
 
-#### Recast/Detour (Recommended)
+#### Recast (opt-in)
 
-For higher-quality navmesh generation, install the Recast/Detour library:
+`--navmesh-generator recast` builds the navmesh with Recast (recastnavigation v1.6.0, vendored in
+`native/recastnavigation`, zlib licence) through a small C library loaded with ctypes. No Python
+binding builds Recast navmeshes, so the library is built here once:
 
 ```bash
-# Install with Recast support
-pip install bsp-waypointer[recast]
-
-# Or install PyRecastDetour separately
-pip install PyRecastDetour
+python tools/build_recast.py     # MSVC (found with vswhere) on Windows, c++ elsewhere
 ```
 
-Without Recast, the tool uses an enhanced fallback navmesh generator that produces good results but may not be as optimal for complex geometry.
+It writes `src/bsp_waypointer/_native/recast_c.dll` (`librecast_c.so`), which is not committed.
+`BSP_WAYPOINTER_RECAST_LIB` points at a library elsewhere. Without it, `recast` falls back to the
+simple generator with a warning. The default stays `simple` until the two have been compared on
+real maps and in play.
+
+What the Recast path does:
+- Recast is y-up: Source's (x, y, z) goes in as (x, z, -y), a rotation, so triangle winding and
+  the walkable-slope test are kept.
+- The cell height is lowered, if need be, to a divisor of the step height (18 on 4-unit cells
+  becomes 3.6), because Recast counts the climb in whole cells and rounds down.
+- Player clips (no faces in the BSP) are added as solids: their triangles are rasterised, and floor
+  inside a clip brush's planes is made unwalkable (vbsp does not split the floor's faces under a
+  clip, so Recast would otherwise walk inside it).
+- Polygon vertices are lowered onto the walkable surface under them (Recast's sit one to two cells
+  above it).
 
 ## Usage
 
@@ -99,7 +111,7 @@ Agent Parameters:
 
 Navmesh Options:
   --navmesh-generator {simple,recast}
-                          Navmesh generator (default: recast if available)
+                          Navmesh generator (default: simple; recast needs tools/build_recast.py)
   --cell-size N           Navmesh cell size in units (default: 8.0)
   --cell-height N         Navmesh cell height in units (default: 4.0)
 
@@ -347,7 +359,7 @@ ladders = extractor.get_ladders()
 # Create ray tracer for accurate line-of-sight
 ray_tracer = BSPRayTracer(bsp)
 
-# Generate navmesh (using Recast if available)
+# Generate navmesh (Recast when its library is built: tools/build_recast.py)
 if is_recast_available():
     config = RecastConfig(agent_height=72.0, agent_radius=16.0)
     navgen = RecastNavmeshGenerator(config)
@@ -447,8 +459,11 @@ cd bsp-waypointer
 # Install in development mode with dev dependencies
 pip install -e ".[dev]"
 
-# Install with all optional dependencies (including Recast)
+# Install with all optional dependencies
 pip install -e ".[all]"
+
+# Build the Recast library (for --navmesh-generator recast)
+python tools/build_recast.py
 ```
 
 ### Running Tests
@@ -476,7 +491,7 @@ mypy src
 
 ## Limitations
 
-- Without PyRecastDetour installed, navmesh generation uses an enhanced fallback algorithm
+- Recast is opt-in and needs its native library built (`python tools/build_recast.py`)
 - Some complex geometry may not generate optimal waypoints
 - Areas the traversal model cannot prove reachable are flagged `W_FL_UNREACHABLE`, so bots
   never route through them (on dm_lockdown about a fifth of the waypoints, including
@@ -518,19 +533,17 @@ The tool uses BSP tree traversal for accurate line-of-sight checks:
   straight sweep that has risen above a wall cannot connect the floor to the ledge behind it
 - Validates waypoint connections against actual map geometry
 
-### Recast/Detour Integration
+### Recast Integration
 
-When PyRecastDetour is installed, the tool uses industry-standard navmesh generation:
-- Polygon merging for reduced navmesh complexity
-- Proper handling of complex geometry
-- Configurable cell size and agent parameters
+With `--navmesh-generator recast` and the native library built, the navmesh comes from Recast's
+solo-mesh build (see "Recast (opt-in)" above).
 
 ## Future Enhancements
 
 - Support for additional Source engine games (TF2, CS:S)
 - GUI application for waypoint editing
 - Improved displacement surface handling
-- Pre-built Recast wheels for easier installation
+- Recast's detail mesh, for heights inside polygons that merge a step
 
 ## License
 
