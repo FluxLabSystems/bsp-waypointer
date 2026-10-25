@@ -83,6 +83,13 @@ OBSTACLE_GRID_MAX_CELLS = 64
 # entrance hang in the air by design and are not tested.
 GROUND_REACH = 72.0
 SNAP_REACH = 192.0
+# RCBot3's body box at a waypoint (bot_nav_verify.cpp kBodyMins/kBodyMaxs): a waypoint whose box starts in solid
+# is moved to the first of eight spots 24 units round it where the box fits, and the engine routes from THAT spot
+BODY_MINS = Vector3(-12.0, -12.0, 8.0)
+BODY_MAXS = Vector3(12.0, 12.0, 56.0)
+RESEAT_RADII = (24.0, 48.0)
+RESEAT_DIRECTIONS = 16
+RESEAT_NEIGHBOUR_RANGE = 250.0
 _AIRBORNE_BY_DESIGN = (
     WaypointFlag.W_FL_LADDER | WaypointFlag.W_FL_LIFT | WaypointFlag.W_FL_TELE_ENTRANCE
 )
@@ -382,6 +389,9 @@ class HL2DMWaypointConverter:
         # ADR-0344: nothing in solid or player clip, nothing hanging without a
         # floor, nothing on a known-bad spot (must run while unconnected)
         self._ground_waypoints()
+
+        # ADR-0394: a button in a wall is moved to the side of it a bot stands on
+        self._reseat_button_waypoints()
 
         # Stage A: directed local candidate edges
         self._compute_connections()
@@ -1000,6 +1010,62 @@ class HL2DMWaypointConverter:
         if drop:
             self._remove_waypoints(drop, merged_into)
         else:
+            self._spatial_hash = {}
+            for i, wp in enumerate(self._waypoints):
+                self._add_to_spatial_hash(wp.origin, i)
+
+    def _body_fits(self, tracer, origin: Vector3) -> bool:
+        """RCBot3's body box fits at origin (not in the world, a detail brush or player clip)."""
+        r = tracer.trace_hull(origin, origin + Vector3(0.0, 0.0, 1.0), BODY_MINS, BODY_MAXS)
+        return not (r.start_solid or r.all_solid)
+
+    def _reseat_button_waypoints(self) -> None:
+        """
+        A button waypoint sits at the button, usually in a wall (stargate's door buttons: 12 units
+        into a cellar wall). RCBot3 does not route from there: it takes the first of eight spots
+        24 units round the waypoint where its body box fits, always the east one first, and judges the
+        edges from that spot, so when the room is on the west side of the wall every edge is a wall
+        and the waypoint is a pocket that traps the bots standing under it (stargate wp 1359:
+        10 of 10 edges cut, 4 bots without a route for minutes).
+
+        A button whose box starts in solid is put on the free spot (24, then 48 units round it) from
+        which most navmesh samples within RESEAT_NEIGHBOUR_RANGE are in sight, the nearest spot on a
+        tie. The button waypoint is an interaction marker: nothing in HL2DM routes by its position.
+        """
+        tracer = self.ray_tracer if self.use_ray_tracing else None
+        if tracer is None or not hasattr(tracer, "trace_hull"):
+            return
+        moved = 0
+        for wp in self._waypoints:
+            if wp.metadata.subtype != HL2DMWaypointSubType.BUTTON or wp.flags & WaypointFlag.W_FL_HEALTH:
+                continue
+            o = wp.origin
+            if self._body_fits(tracer, o):
+                continue
+            neighbours = [
+                w.origin for w in self._waypoints
+                if w is not wp and w.sampled and w.origin.distance_to(o) <= RESEAT_NEIGHBOUR_RANGE
+            ]
+            best = None
+            best_key = None
+            for radius in RESEAT_RADII:
+                for k in range(RESEAT_DIRECTIONS):
+                    ang = 2.0 * math.pi * k / RESEAT_DIRECTIONS
+                    c = Vector3(o.x + radius * math.cos(ang), o.y + radius * math.sin(ang), o.z)
+                    if not self._body_fits(tracer, c):
+                        continue
+                    seen = sum(
+                        1 for n in neighbours
+                        if tracer.line_of_sight(c, n, player_height_offset=DEFAULT_PLAYER_DIMS.crouch_height)
+                    )
+                    key = (-seen, radius)
+                    if best_key is None or key < best_key:
+                        best, best_key = c, key
+            if best is not None:
+                wp.origin = best
+                moved += 1
+        self.grounding_report["button_reseated"] = moved
+        if moved:
             self._spatial_hash = {}
             for i, wp in enumerate(self._waypoints):
                 self._add_to_spatial_hash(wp.origin, i)
