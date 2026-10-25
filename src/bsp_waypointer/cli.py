@@ -342,6 +342,14 @@ Examples:
     # Ray tracing options
     raytracing = parser.add_argument_group("Ray Tracing Options")
     raytracing.add_argument(
+        "--no-engine-check",
+        action="store_true",
+        help=(
+            "Do not refuse the edges RCBot3's load-time edge check would cut (a 24-wide hull sweep and the "
+            "ground profile, MC2 ADR-0398); the old walk test alone"
+        ),
+    )
+    raytracing.add_argument(
         "--no-raytracing",
         action="store_true",
         help="Disable BSP ray tracing for line-of-sight checks",
@@ -570,6 +578,7 @@ def generate_waypoints(
     keep_skybox: bool = False,
     playable_margin: float = SKYBOX_MARGIN,
     avoid_points: Optional[Path] = None,
+    engine_check: bool = True,
 ) -> int:
     """
     Generate waypoints from a BSP file.
@@ -706,6 +715,7 @@ def generate_waypoints(
             region=region,
             avoid_points=avoid_list,
             budget=budget or None,
+            engine_check=engine_check,
         )
         waypoints = converter.convert(navmesh, entities, ladders, objectives=objectives)
         logger.info(f"  Total waypoints: {len(waypoints)}")
@@ -738,6 +748,12 @@ def generate_waypoints(
             logger.info(
                 f"  Roof sheets: {converter.roof_dropped} flagged plain sample(s) with open sky above "
                 f"and nothing of the match near them removed (ADR-0398)"
+            )
+        tele = getattr(converter, "teleport_entry_report", None)
+        if tele and tele.get("isolated"):
+            logger.info(
+                f"  Teleporters: {tele['isolated']} of {tele['entrances']} entrance(s) had no way in; "
+                f"{tele['joined']} joined by {tele['edges']} drop edge(s) from the rim (ADR-0398)"
             )
         team_hz = getattr(converter, "team_hazard_waypoints", 0)
         if team_hz:
@@ -923,6 +939,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         keep_skybox=args.keep_skybox,
         playable_margin=args.playable_margin,
         avoid_points=args.avoid_points,
+        engine_check=not args.no_engine_check,
     )
 
 
