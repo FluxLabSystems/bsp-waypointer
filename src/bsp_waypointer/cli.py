@@ -714,6 +714,7 @@ def generate_waypoints(
             logger.info(
                 f"  Grounding: {grounding['embedded']} in solid or player clip, "
                 f"{grounding['lifted']} lifted onto the slab they lay in, "
+                f"{grounding.get('ledge', 0)} put on a detail shelf over their feet, "
                 f"{grounding['floorless']} without a floor dropped; {grounding['snapped']} put "
                 f"on the floor ({grounding['merged']} merged); {grounding['avoided']} on avoid points; "
                 f"{grounding.get('wade', 0)} on a water surface lowered to the floor "

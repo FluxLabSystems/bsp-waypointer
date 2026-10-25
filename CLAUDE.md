@@ -315,6 +315,11 @@ its sky_camera). Rules to keep:
   `_cull_blocked_samples` for plain samples) deals with a waypoint in player-solid world
   at 2/20/34 units up: a thin slab it stands in (a grate's bottom, a clip ramp over stairs) is
   lifted onto the slab's top (`lift_onto_surface`: top within 40, a plateau, head room);
+  a standing spot with a player-solid brush, detail brushes included, across its hull 4..16 units
+  above its feet (a 4-unit func_detail grate shelf whose underside is 3 units over a waypoint:
+  none of the +2/+20/+34 points is in it, and floor_support only looks down) is put on that
+  brush's top when it is a plateau and a player fits (`lift_onto_ledge`, MC2 ADR-0379;
+  `grounding_report["ledge"]`);
   a wall, a clip room or a thick block drops it. An item, weapon, spawn or objective with no
   brush floor or navmesh polygon within 72 units is put on the floor under it (within 192) or
   dropped. Doors, buttons, breakables, teleporters, ladder rungs, lifts and jump pads are

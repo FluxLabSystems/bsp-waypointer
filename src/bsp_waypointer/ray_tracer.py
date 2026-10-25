@@ -188,6 +188,46 @@ class BSPRayTracer:
                 return None
         return Vector3(origin.x, origin.y, top)
 
+    def lift_onto_ledge(
+        self,
+        origin: Vector3,
+        max_lift: float = 16.0,
+        min_lift: float = 4.0,
+        plateau: float = 12.0,
+        tolerance: float = 14.0,
+    ) -> Optional[Vector3]:
+        """Where a standing spot goes when a player-solid brush (detail brushes included) lies
+        across its hull just above its feet.
+
+        A shelf of func_detail grate, 4 units thick, whose underside is 3 units above a waypoint
+        is in none of the points the grounding pass tests (+2/+20/+34) and in no leaf's contents,
+        yet a player standing there is inside it, and RCBot3's trace from the waypoint starts in
+        solid. The brushes the vertical line at (x, y) crosses between the feet and max_lift above
+        them are read as in ground_height. The spot moves onto their highest top when that is more
+        than min_lift and at most max_lift above the feet (less than min_lift is the render skin
+        against the collision brush, not a shelf), the top is a plateau (the ground at four points
+        plateau units round it is within tolerance of the same height: not a rail or a post), and
+        a standing player fits on it (nothing player-solid 20, 34 and 66 units above it). None
+        otherwise: no brush across the line, a spot that already stands on its brush, a wall or
+        block taller than max_lift, a thin barrier, or no head room.
+        """
+        top = self.ground_height(
+            origin.x, origin.y, origin.z, probe_up=max_lift, probe_down=0.0, step_height=max_lift
+        )
+        if top is None or not (min_lift <= top - origin.z <= max_lift):
+            return None
+        for dx, dy in ((plateau, 0.0), (-plateau, 0.0), (0.0, plateau), (0.0, -plateau)):
+            side = self.ground_height(
+                origin.x + dx, origin.y + dy, top, probe_up=0.0, probe_down=2.0 * tolerance,
+                step_height=tolerance,
+            )
+            if side is None or abs(side - top) > tolerance:
+                return None
+        for h in (20.0, 34.0, 66.0):
+            if self.point_in_player_solid(Vector3(origin.x, origin.y, top + h)):
+                return None
+        return Vector3(origin.x, origin.y, top)
+
     def _point_in_brush(self, brush: Brush, point: Vector3) -> bool:
         """Whether a point is strictly inside a convex brush."""
         if brush.num_sides <= 0:
