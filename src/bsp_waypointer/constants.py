@@ -600,12 +600,14 @@ MAX_DROP_CONNECTION = 600.0
 #   rise onto anything steeper is a slide back, not a walk;
 # - a gap is jumped when its unsupported stretch is no wider than a plain running jump carries
 #   the hull: 190 u/s (hl2_normspeed) for the 0.533 s of a 160 u/s jump at 600 gravity, plus the
-#   32-unit hull overhang = 133; 0.9 of it, so the bot need not jump perfectly.
+#   32-unit hull overhang = 133. (It was 0.9 of that, 120, until the in-engine probe -- rcbotd mc
+#   edgeprobe, mapforge navlab -- found dm_runoff's 122-133 gaps as walkable for bots as edges no
+#   proof doubts: 9 of 16 against 18 of 28, Fisher p 0.75.)
 # - a crouch-jump rises 160^2 / 1200 = 21.3 plus the 36 the feet tuck up (ducking in the air
 #   finishes at once): 57.3; 3 units less, so the bot need not jump perfectly. (CROUCH_JUMP_RISE,
 #   45, is the legacy proof's more cautious figure.)
 GROUND_NORMAL_Z = 0.7
-JUMP_GAP_MAX = 120.0
+JUMP_GAP_MAX = 133.0
 WALK_CLIMB = 54.0
 # The walk refusals of its ground profile (pass 1) that may veto an edge in edge_proof "hybrid": no
 # ground, a gap too wide, a fall too deep, a slope too steep. Not "a wall or ledge" (a rail the
