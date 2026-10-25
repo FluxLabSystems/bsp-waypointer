@@ -72,6 +72,8 @@ This document provides comprehensive context for AI assistants working on the BS
 | Entity Analyzer | `entity_analyzer.py` | Entity lump → game objects |
 | Playable Region | `playable_region.py` | The 3D skybox's BSP area, the spawn/pickup box, mesh crop, waypoint audit (numpy only) |
 | Waypoint Converter | `waypoint_converter.py` | Navmesh + entities → waypoints |
+| Waypoint Budget | `budget.py` | ADR-0378: protect, drop unreachable samples, thin the dense ground with connectivity kept, drop flagged samples (`--budget`, default 1900) |
+| Pocket Bridge | `pocket_bridge.py` | Stage C1b (MC2 ADR-0377): a pocket with a pickup/spawn/objective gets an A* route over a 48-unit lattice to main; a pickup inside a prop's collision moves to a standing spot |
 | Graph Contract | `graph_contract.py` | Components, main-component choice, RCBot3 load-audit model (stdlib only) |
 | RCW Writer | `rcw_writer.py` | Waypoints → .rcw binary file |
 | RCW Validator | `rcw_validator.py` | RCBot3's loader checks, its load-time audit, the graph contract |
@@ -319,6 +321,22 @@ its sky_camera). Rules to keep:
   interaction points of brush entities and are left alone. `--avoid-points FILE` removes
   waypoints within a radius of known-bad spots. The tracer is blind to displacements, props and
   brush entities, so they are never a reason to drop a navmesh sample.
+- **A pocket with a pickup gets a searched route (ADR-0377).** After the pairwise bridging (C1) and
+  before the flagging (C2), `pocket_bridge.bridge_pockets` takes every strongly connected component
+  outside main that holds a pickup (subtype, or the HEALTH/AMMO flag when the subtype was lost in a
+  merge), a spawn or an objective, and runs A* from it to main (and, separately, from main back to it)
+  over a lattice of standing points 48 units apart (then 32): every hop must pass `_connect_refusal`,
+  the same test any edge passes, so no unproven edge is invented. The route points become
+  waypoints. A pickup whose own spot is inside a prop's collision (no player stands there) first moves
+  to the nearest standing spot within 28 units. Under the waypoint cap, samples of dead areas
+  (outside main, no pickup/spawn/objective) are dropped to make room. A pocket no route reaches stays
+  flagged: a pickup inside a pipe or under a low ceiling, on a ledge only a lift or a jump pad reaches.
+  `_connect_refusal` returns the name of the first rule that refuses an edge (`_can_connect` is
+  `_connect_refusal(...) is None`).
+- **A sample on shallow water goes to the floor (ADR-0377).** The navmesh has a layer on a water surface
+  as well as the pool's floor. `_wade_down` (in `_ground_waypoints`) lowers a sample resting on water
+  or slime onto the floor within 64 units below (`BSPRayTracer.on_water_surface`) and folds it into a
+  floor sample within 40 units; deep water keeps its surface sample.
 - **What cannot be proven is flagged.** The main component is the largest strongly
   connected component a spawn can reach. Every waypoint outside it is flagged
   `W_FL_UNREACHABLE`, and a main waypoint is index 0. The converter raises only when the
@@ -475,11 +493,12 @@ mypy src                    # Type check
    RCBot3 never routes through them. RCBot3 builds before rcbot3 `dae0c423`
    still walk at a pickup they find by classname and take flagged goals; from `dae0c423`
    they do neither for this generator's files, so a pickup the model wrongly isolates is
-   skipped (from rcbot3 `f8a21910` the pickup rule applies only to files whose author
+   skipped (round 16 ADR-0377: a pocket with a pickup now gets a searched route first; what is
+   left is inside a prop, under a low ceiling or on a ledge only a lift reaches) (from rcbot3 `f8a21910` the pickup rule applies only to files whose author
    starts with `BSP-Waypoint`, or is exactly `HL2DM-Manager` -- RCBot3 matches the
    manager's name by an exact comparison, not as a prefix). A waypoint within a player
    radius of a prop's collision (an item lying against a prop, whose waypoint is on the
-   item) stays isolated: no player can stand there
+   item) moves to the nearest standing spot within 28 units (ADR-0377); one with none stays isolated
 
 ## Future Enhancement Areas
 

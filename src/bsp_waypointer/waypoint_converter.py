@@ -22,6 +22,10 @@ from .constants import (
     DEGREE_REPAIR_RANGES,
     HAZARD_DAMAGE_THRESHOLD,
     HL2DMWaypointSubType,
+    LADDER_HUGE_LENGTH,
+    LADDER_HUGE_RUNG_SPACING,
+    LADDER_LONG_LENGTH,
+    LADDER_LONG_RUNG_SPACING,
     LADDER_RUNG_SPACING,
     MAX_CONNECTION_DISTANCE,
     MAX_DROP_CONNECTION,
@@ -55,6 +59,7 @@ from .graph_contract import (
     strongly_connected_components,
 )
 from .navmesh_generator import NavigationMesh
+from .pocket_bridge import bridge_pockets
 from .vector import Vector3, segment_intersects_aabb, swept_box_intersects_hull
 
 if TYPE_CHECKING:
@@ -83,6 +88,12 @@ _AIRBORNE_BY_DESIGN = (
 )
 # Default radius of an avoid point (--avoid-points): no waypoint stays this close
 AVOID_POINT_RADIUS = 40.0
+# MC2 ADR-0377: a navmesh sample on the surface of water over a floor this close below is a wading
+# spot; the bot walks the floor, so the sample goes down to it (a waypoint left on the surface hangs
+# 5..40 units over the floor, is flagged JUMP against its neighbours, and a bot in the pool chases
+# it by swimming up and stays in the water: dm_underpass's pit, 76 of 165 rescues)
+WADE_REACH = 64.0
+WADE_DEDUPE = 40.0
 
 
 def _is_standing_spot(wp: "Waypoint") -> bool:
@@ -94,6 +105,7 @@ def _is_standing_spot(wp: "Waypoint") -> bool:
         wp.sampled
         or wp.is_spawn
         or wp.is_objective
+        or wp.keep
         or HL2DMWaypointSubType.WEAPON_CROWBAR <= wp.metadata.subtype <= HL2DMWaypointSubType.ITEM_AMMO_CRATE
     )
 
@@ -177,6 +189,9 @@ class Waypoint:
     # --ctf-layout, MC2 ADR-0264). Kept through the waypoint cap like a spawn,
     # so a bot sent to the objective has a waypoint ON it.
     is_objective: bool = False
+    # A pickup with no waypoint subtype (an MC2 CTF weapon, ammo or power-up, an
+    # ammo crate) is here: the waypoint budget keeps it (ADR-0378).
+    keep: bool = False
     # RCBot3's per-waypoint area id (iArea); 0 = none. Set by --ctf-layout on
     # control points (index + 1).
     area: int = 0
@@ -217,6 +232,14 @@ def _empty_connectivity_report(n: int) -> Dict[str, float]:
         "unreachable_sinks": 0,      # reachable from main, cannot return
         "unreachable_islands": 0,    # neither
         "spawns_outside_main": 0,
+        # MC2 ADR-0377: pockets with a pickup/spawn/objective joined to main by a searched route
+        "pockets": 0,                # pockets that held one and were searched
+        "pockets_joined": 0,         # ...and now have a route both ways
+        "pocket_waypoints": 0,       # route points added
+        "pocket_edges": 0,           # proven edges added
+        "pocket_standoffs": 0,       # pickup waypoints moved off a prop to a standing spot
+        "pocket_over_budget": 0,     # routes found but not added (waypoint cap)
+        "pocket_dropped": 0,         # dead-area samples dropped to make room under the cap
         # waypoints in the largest strongly connected component that holds a
         # flagged spawn (0 when every spawn is in main): RCBot3 cannot use the
         # edges inside a flagged area, so a bot spawning in a flagged room
@@ -240,6 +263,7 @@ class HL2DMWaypointConverter:
         use_ray_tracing: bool = True,
         region: Optional["PlayableRegion"] = None,
         avoid_points: Optional[List[Tuple[Vector3, float]]] = None,
+        budget: Optional[int] = None,
     ):
         """
         Initialize the waypoint converter.
@@ -254,9 +278,14 @@ class HL2DMWaypointConverter:
                 the waypoints far from every spawn and pickup are culled first (ADR-0318)
             avoid_points: (origin, radius) spots known to be bad: no waypoint is
                 kept within radius of one (ADR-0344)
+            budget: Spend this many waypoints (ADR-0378, ``budget.spend_budget``): what
+                is protected stays, unreachable samples go, the rest is thinned where it is
+                dense with connectivity kept. None keeps the old grid cap at max_waypoints.
         """
         self.spacing = spacing
         self.max_waypoints = max_waypoints
+        self.budget = None if budget is None else max(2, min(int(budget), max_waypoints))
+        self.budget_report: Dict[str, int] = {}
         self.ray_tracer = ray_tracer
         self.use_ray_tracing = use_ray_tracing
         self.region = region
@@ -265,6 +294,7 @@ class HL2DMWaypointConverter:
         self.grounding_dropped: List[Tuple[Vector3, str, str]] = []
         self.grounding_report: Dict[str, int] = {
             "embedded": 0, "lifted": 0, "snapped": 0, "floorless": 0, "avoided": 0, "merged": 0,
+            "wade": 0, "wade_merged": 0,
         }
         self.region_report: Dict[str, int] = {"samples_dropped": 0, "teleporters_dropped": 0}
         self._waypoints: List[Waypoint] = []
@@ -336,6 +366,7 @@ class HL2DMWaypointConverter:
         self._place_ammo_waypoints(entities.ammo_pickups)
         self._place_spawn_waypoints(entities.spawn_points)
         self._place_objective_waypoints(objectives or [])
+        self._place_extra_pickup_waypoints(getattr(entities, "extra_pickups", []))
         self._place_teleporter_waypoints(entities.teleporters)
         self._place_ladder_waypoints(entities.ladders, ladders or [])
         self._place_useable_ladder_waypoints(
@@ -361,6 +392,11 @@ class HL2DMWaypointConverter:
         # Optimize waypoint count if needed (BEFORE connectivity
         # finalization — culling can re-fragment the graph, so degree
         # repair and the connectivity guarantee must run on the final set)
+        if self.budget is not None and len(self._waypoints) > self.budget:
+            from .budget import spend_budget
+
+            self.budget_report = spend_budget(self, self.budget)
+        # The old grid cap: the whole answer without a budget, the backstop with one
         if len(self._waypoints) > self.max_waypoints:
             self._optimize_waypoint_count()
 
@@ -375,6 +411,13 @@ class HL2DMWaypointConverter:
         # flag everything outside the main component W_FL_UNREACHABLE
         # (raises only when the main component has fewer than two waypoints)
         self._ensure_connectivity()
+
+        # ADR-0378: a plain sample the connectivity pass flagged is no use to a bot
+        if self.budget_report:
+            from .budget import drop_flagged_plain
+
+            self.budget_report["dropped_flagged"] = drop_flagged_plain(self)
+            self.budget_report["final"] = len(self._waypoints)
 
         # Assign additional flags based on geometry
         self._assign_geometry_flags(navmesh)
@@ -465,6 +508,17 @@ class HL2DMWaypointConverter:
         if key not in self._spatial_hash:
             self._spatial_hash[key] = []
         self._spatial_hash[key].append(index)
+
+    def _move_waypoint(self, index: int, origin: Vector3) -> None:
+        """Move a waypoint (before its edges are judged again) and keep the spatial hash true."""
+        wp = self._waypoints[index]
+        key = (int(wp.origin.x / self._cell_size), int(wp.origin.y / self._cell_size),
+               int(wp.origin.z / self._cell_size))
+        bucket = self._spatial_hash.get(key)
+        if bucket and index in bucket:
+            bucket.remove(index)
+        wp.origin = origin
+        self._add_to_spatial_hash(origin, index)
 
     def _find_nearby_waypoints(
         self, origin: Vector3, radius: float
@@ -616,6 +670,16 @@ class HL2DMWaypointConverter:
             self._waypoints[idx].is_objective = True
             self._objective_origins.append(origin)
             self.objective_waypoints += 1
+
+    def _place_extra_pickup_waypoints(self, extras) -> None:
+        """A waypoint on each pickup the subtype tables do not list (MC2 CTF weapons,
+        ammo and power-ups, ammo crates). It carries no subtype, so RCBot3 reads it as
+        a plain waypoint; the budget keeps it, and the connectivity pass joins it."""
+        self.extra_pickup_waypoints = 0
+        for _name, at in extras:
+            idx = self._add_waypoint(at)
+            self._waypoints[idx].keep = True
+            self.extra_pickup_waypoints += 1
 
     def _floor_under(self, at: Vector3, depth: float = 1024.0) -> Vector3:
         """The world floor under a point (the point itself without a tracer, or
@@ -854,7 +918,11 @@ class HL2DMWaypointConverter:
         drop: Set[int] = set()
         snapped: Set[int] = set()
         merged_into: Dict[int, int] = {}
+        if tracer is not None and hasattr(tracer, "on_water_surface"):
+            self._wade_down(tracer, drop)
         for i, wp in enumerate(self._waypoints):
+            if i in drop:
+                continue
             o = wp.origin
             if any(o.distance_to(p) <= r for p, r in self.avoid_points):
                 drop.add(i)
@@ -907,6 +975,7 @@ class HL2DMWaypointConverter:
                 other.flags |= wp.flags
                 other.is_spawn = other.is_spawn or wp.is_spawn
                 other.is_objective = other.is_objective or wp.is_objective
+                other.keep = other.keep or wp.keep
                 other.sampled = other.sampled or wp.sampled
                 if wp.metadata.weapon_priority > other.metadata.weapon_priority:
                     other.metadata = wp.metadata
@@ -922,6 +991,37 @@ class HL2DMWaypointConverter:
             self._spatial_hash = {}
             for i, wp in enumerate(self._waypoints):
                 self._add_to_spatial_hash(wp.origin, i)
+
+    def _wade_down(self, tracer, drop: Set[int]) -> None:
+        """Put navmesh samples that rest on shallow water onto the floor under it (WADE_REACH). One
+        that then sits within WADE_DEDUPE (flat) of another waypoint at the floor's height is added
+        to `drop` instead: the pool's own floor layer already has a sample there."""
+        lowered: List[int] = []
+        for i, wp in enumerate(self._waypoints):
+            if not wp.sampled or i in drop or not tracer.on_water_surface(wp.origin):
+                continue
+            floor = tracer.floor_support(wp.origin, reach=WADE_REACH)
+            if floor is None or floor >= wp.origin.z - 2.0:
+                continue
+            wp.origin = Vector3(wp.origin.x, wp.origin.y, floor)
+            lowered.append(i)
+        if not lowered:
+            return
+        self.grounding_report["wade"] += len(lowered)
+        self._spatial_hash = {}
+        for i, wp in enumerate(self._waypoints):
+            self._add_to_spatial_hash(wp.origin, i)
+        for i in lowered:
+            wp = self._waypoints[i]
+            for j in self._find_nearby_waypoints(wp.origin, WADE_DEDUPE + 8.0):
+                if j == i or j in drop or j in lowered and j > i:
+                    continue
+                other = self._waypoints[j]
+                if (other.origin.distance_to_2d(wp.origin) <= WADE_DEDUPE and abs(other.origin.z - wp.origin.z) <= 24.0
+                        and other.sampled and not wp.is_spawn and not wp.is_objective and not wp.flags):
+                    drop.add(i)
+                    self.grounding_report["wade_merged"] += 1
+                    break
 
     def _remove_waypoints(self, drop: Set[int], merged_into: Optional[Dict[int, int]] = None) -> None:
         """Remove waypoints before any connection exists, remapping every stored index.
@@ -1031,7 +1131,12 @@ class HL2DMWaypointConverter:
         """
         span = top - bottom
         length = span.length()
-        steps = max(1, int(length / LADDER_RUNG_SPACING))
+        rung = LADDER_RUNG_SPACING
+        if length > LADDER_HUGE_LENGTH:
+            rung = LADDER_HUGE_RUNG_SPACING
+        elif length > LADDER_LONG_LENGTH:
+            rung = LADDER_LONG_RUNG_SPACING
+        steps = max(1, int(length / rung))
 
         chain: List[int] = []
         for i in range(steps + 1):
@@ -1216,6 +1321,18 @@ class HL2DMWaypointConverter:
                         rep["bridges"] += 1
             sccs = strongly_connected_components(self._adjacency())
 
+        # C1b (MC2 ADR-0377): a pocket with a pickup, a spawn or an objective gets a searched route
+        # to main on the ground, every hop proven; what no route reaches stays flagged below
+        if len(sccs) > 1:
+            pocket = bridge_pockets(self)
+            rep.update(pocket)
+            n = len(self._waypoints)
+            spawns = [
+                i for i, wp in enumerate(self._waypoints)
+                if wp.is_spawn or wp.metadata.subtype == HL2DMWaypointSubType.SPAWN_POINT
+            ]
+            sccs = strongly_connected_components(self._adjacency())
+
         # C2: classify against the main component and flag the rest
         adj = self._adjacency()
         main = set(sccs[choose_main_component(adj, sccs, spawns)])
@@ -1310,8 +1427,19 @@ class HL2DMWaypointConverter:
         wp_b: Waypoint,
         max_range: float = CONNECTION_RANGE_LOCAL,
     ) -> bool:
+        """Whether a DIRECTED connection A -> B is traversable (see _connect_refusal)."""
+        return self._connect_refusal(wp_a, wp_b, max_range) is None
+
+    def _connect_refusal(
+        self,
+        wp_a: Waypoint,
+        wp_b: Waypoint,
+        max_range: float = CONNECTION_RANGE_LOCAL,
+    ) -> Optional[str]:
         """
-        Check whether a DIRECTED connection A -> B is traversable.
+        None when a DIRECTED connection A -> B is traversable, else the name of the first
+        rule that refuses it: range, climb, deep_drop, hazard, prop, los, walk_path,
+        hull_walk or ground_steps.
 
         Vertical rules: a rise above crouch-jump height passes only as a
         walkable gradient, and with a tracer only when the ground under the
@@ -1327,7 +1455,7 @@ class HL2DMWaypointConverter:
 
         # Too far
         if distance > max_range:
-            return False
+            return "range"
 
         horizontal_dist = wp_a.origin.distance_to_2d(wp_b.origin)
         rise = wp_b.origin.z - wp_a.origin.z
@@ -1337,7 +1465,7 @@ class HL2DMWaypointConverter:
             wp_a.has_flag(WaypointFlag.W_FL_TELE_ENTRANCE)
             and wp_b.has_flag(WaypointFlag.W_FL_TELE_EXIT)
         ):
-            return True
+            return None
 
         # Ladder rules: two ladder waypoints of one column connect freely
         # within one rung gap (LADDER_RUNG_SPACING) of each other; a single
@@ -1356,10 +1484,10 @@ class HL2DMWaypointConverter:
         b_ladder = wp_b.has_flag(WaypointFlag.W_FL_LADDER)
         if a_ladder and b_ladder:
             if horizontal_dist < 64 and abs(rise) <= LADDER_RUNG_SPACING:
-                return True
+                return None
         elif a_ladder or b_ladder:
             if distance < 200:
-                return True
+                return None
 
         # Vertical rules. A rise is traversable when it's either within
         # crouch-jump height (a discrete ledge) OR a walkable gradient
@@ -1367,10 +1495,10 @@ class HL2DMWaypointConverter:
         # absolute rise over a long horizontal run can far exceed a
         # jumpable ledge). Steeper climbs need ladders/lifts.
         if rise > CROUCH_JUMP_RISE and rise > horizontal_dist:
-            return False
+            return "climb"
         if rise < -MAX_DROP_CONNECTION:
             # Drop too deep to survive
-            return False
+            return "deep_drop"
 
         # Cheap AABB blocking against hazards and solid props before the
         # more expensive ray tracing. A prop whose box the body line
@@ -1385,7 +1513,7 @@ class HL2DMWaypointConverter:
         seg_b = wp_b.origin + body_lift
         for hz in getattr(self, "_hazards", []):
             if segment_intersects_aabb(seg_a, seg_b, hz.mins, hz.maxs):
-                return False
+                return "hazard"
         legs = ((seg_a, seg_b),)
         if rise < -CROUCH_JUMP_RISE:
             split = self._drop_walk_split(wp_a.origin, wp_b.origin)
@@ -1402,7 +1530,7 @@ class HL2DMWaypointConverter:
                 )
                 for leg_a, leg_b in legs
             ) and not self._clear_of_prop(obs, wp_a.origin, wp_b.origin, rise):
-                return False
+                return "prop"
 
         # Use ray tracing for accurate line-of-sight check
         if self.ray_tracer and self.use_ray_tracing:
@@ -1412,14 +1540,14 @@ class HL2DMWaypointConverter:
                 wp_b.origin,
                 player_height_offset=DEFAULT_PLAYER_DIMS.crouch_height,
             ):
-                return False
+                return "los"
 
             # ADR-0344: the line of sight reads leaf contents, so a wall of
             # detail brushes or a player-clip wall does not stop it. A walker
             # needs the body line clear of MASK_PLAYERSOLID world brushes. A
             # drop is judged by its two real legs, not the chord.
             if not self._walk_path_clear(wp_a.origin, wp_b.origin, rise):
-                return False
+                return "walk_path"
 
             # A climb at any length, or a longer flat stretch, also needs a
             # player hull to walk the path (skipped for drops: falling needs
@@ -1433,7 +1561,7 @@ class HL2DMWaypointConverter:
                     player_height=DEFAULT_PLAYER_DIMS.standing_height,
                     step_height=DEFAULT_PLAYER_DIMS.step_height,
                 ):
-                    return False
+                    return "hull_walk"
 
             # The gradient rule assumes the ground rises along the path. Once
             # the line has risen above a wall, the eye line and the straight
@@ -1445,9 +1573,9 @@ class HL2DMWaypointConverter:
                 max_step=CROUCH_JUMP_RISE,
                 step_height=DEFAULT_PLAYER_DIMS.step_height,
             ):
-                return False
+                return "ground_steps"
 
-        return True
+        return None
 
     def _walk_path_clear(self, a: Vector3, b: Vector3, rise: float) -> bool:
         """The body line from a to b is clear of player-solid world brushes (see

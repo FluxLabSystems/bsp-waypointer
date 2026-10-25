@@ -358,6 +358,15 @@ LADDER_DISMOUNT_ENTITIES = frozenset({"info_ladder_dismount"})
 # Vertical spacing between intermediate waypoints along a ladder
 LADDER_RUNG_SPACING = 72.0
 
+# A ladder longer than this (an elevator shaft: dm_911_katv9_fix has eight of 16,464
+# units) gets farther-apart rungs, so one ladder does not spend 229 of the
+# waypoint budget. RCBot3 does not judge an edge to or from a ladder waypoint and
+# reads an edge as a walk only up to 1,500 units (bot_nav_verify.cpp).
+LADDER_LONG_LENGTH = 1024.0
+LADDER_LONG_RUNG_SPACING = 256.0
+LADDER_HUGE_LENGTH = 4096.0
+LADDER_HUGE_RUNG_SPACING = 1024.0
+
 
 # =============================================================================
 # Prop Entities (point entities referencing studio models)
@@ -438,6 +447,17 @@ SPAWN_ENTITIES = frozenset({
     "info_player_start",
     "info_player_combine",
     "info_player_rebel",
+    # MC2's CTF spawn rooms (ctf_substation has 28 and one info_player_start)
+    "ctf_combine_player_spawn",
+    "ctf_rebel_player_spawn",
+})
+
+# Pickups of MC2's CTF maps (ADR-0378). They carry no weapon subtype RCBot3 knows,
+# but a bot is sent to them and the owner walks to them, so each gets a waypoint
+# the waypoint budget keeps.
+EXTRA_PICKUP_PREFIXES = ("weapon_ctf_", "item_ammo_ctf_")
+EXTRA_PICKUP_ENTITIES = frozenset({
+    "ctf_cloak", "ctf_shield", "ctf_regen", "ctf_vampire", "item_ammo_crate",
 })
 
 # Source's coordinate limit (MAX_COORD_INTEGER): the engine cannot place an
@@ -569,6 +589,10 @@ class ContentFlags(IntFlag):
 # loader rejects a file that exceeds either
 MAX_WAYPOINTS = 2048
 MAX_PATHS_PER_WAYPOINT = 255
+
+# Default waypoint budget (ADR-0378): what the generator spends, leaving the rest
+# of MAX_WAYPOINTS free for the human-trail tools (hl2dm-trail propose) to add to
+DEFAULT_WAYPOINT_BUDGET = 1900
 
 # Default waypoint spacing (units)
 DEFAULT_WAYPOINT_SPACING = 150.0

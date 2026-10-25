@@ -18,6 +18,7 @@ from .constants import (
     DEFAULT_PLAYER_DIMS,
     DEFAULT_WAYPOINT_SPACING,
     FLAGGED_SPAWN_AREA_WARN,
+    DEFAULT_WAYPOINT_BUDGET,
     MAX_WAYPOINTS,
     SPAWN_REACH_COVERAGE,
     PlayerDimensions,
@@ -71,6 +72,14 @@ def _waypoint_budget(text: str) -> int:
     value = int(text)
     if not 2 <= value <= MAX_WAYPOINTS:
         raise argparse.ArgumentTypeError(f"must be 2..{MAX_WAYPOINTS}")
+    return value
+
+
+def _budget_arg(text: str) -> int:
+    """argparse type: a waypoint budget, or 0 for the old grid cap."""
+    value = int(text)
+    if value != 0 and not 2 <= value <= MAX_WAYPOINTS:
+        raise argparse.ArgumentTypeError(f"must be 0 or 2..{MAX_WAYPOINTS}")
     return value
 
 
@@ -142,6 +151,18 @@ Examples:
         help=f"Maximum waypoints, 2..{MAX_WAYPOINTS} (RCBot3's limit; default: {MAX_WAYPOINTS})",
     )
 
+    general.add_argument(
+        "-b", "--budget",
+        type=_budget_arg,
+        default=DEFAULT_WAYPOINT_BUDGET,
+        metavar="N",
+        help=(
+            "Waypoints to spend (ADR-0378), 2..max-waypoints. Past it the generator drops "
+            "samples no spawn reaches and thins the dense open ground, with connectivity kept "
+            "and every spawn and pickup protected; the rest of max-waypoints stays free for "
+            "hl2dm-trail propose. 0 = the old grid cap at max-waypoints (default: %(default)s)"
+        ),
+    )
     general.add_argument(
         "--game-dir",
         type=Path,
@@ -429,6 +450,14 @@ def log_connectivity_report(report: dict, total_waypoints: int) -> None:
         f"{report['bridges']} bridge edges (all traversal-checked), "
         f"{report['spawn_coverage']:.0%} of spawns can reach it"
     )
+    if report.get("pockets"):
+        logger.info(
+            f"  Pockets: {report['pockets']} holding a pickup or spawn searched, "
+            f"{report['pockets_joined']} joined by {report['pocket_waypoints']} route waypoints and "
+            f"{report['pocket_edges']} edges; {report['pocket_standoffs']} pickups moved off a prop"
+            + (f"; {report['pocket_over_budget']} routes dropped at the cap"
+               if report.get("pocket_over_budget") else "")
+        )
     if report["unreachable_flagged"]:
         logger.warning(
             f"  {report['unreachable_flagged']} waypoints flagged unreachable "
@@ -497,6 +526,7 @@ def _analyze_entities(bsp, include_entities, include_chargers, include_ammo, inc
         if not include_ammo:
             entities.ammo_pickups = []
             entities.ammo_crates = []
+            entities.extra_pickups = [e for e in entities.extra_pickups if "ammo" not in e[0]]
         if not include_teleporters:
             entities.teleporters = []
     else:
@@ -511,6 +541,7 @@ def generate_waypoints(
     author: str = "BSP-Waypoint-Generator-HL2DM",
     density: float = 0.5,
     max_waypoints: int = MAX_WAYPOINTS,
+    budget: Optional[int] = DEFAULT_WAYPOINT_BUDGET,
     agent_height: float = DEFAULT_PLAYER_DIMS.standing_height,
     agent_radius: float = DEFAULT_PLAYER_DIMS.radius,
     step_height: float = DEFAULT_PLAYER_DIMS.step_height,
@@ -674,6 +705,7 @@ def generate_waypoints(
             use_ray_tracing=use_ray_tracing,
             region=region,
             avoid_points=avoid_list,
+            budget=budget or None,
         )
         waypoints = converter.convert(navmesh, entities, ladders, objectives=objectives)
         logger.info(f"  Total waypoints: {len(waypoints)}")
@@ -683,7 +715,9 @@ def generate_waypoints(
                 f"  Grounding: {grounding['embedded']} in solid or player clip, "
                 f"{grounding['lifted']} lifted onto the slab they lay in, "
                 f"{grounding['floorless']} without a floor dropped; {grounding['snapped']} put "
-                f"on the floor ({grounding['merged']} merged); {grounding['avoided']} on avoid points"
+                f"on the floor ({grounding['merged']} merged); {grounding['avoided']} on avoid points; "
+                f"{grounding.get('wade', 0)} on a water surface lowered to the floor "
+                f"({grounding.get('wade_merged', 0)} folded into a floor sample)"
             )
             for at, kind, why in getattr(converter, "grounding_dropped", [])[:40]:
                 logger.info(f"    dropped ({why}) {kind} at {at.x:.0f} {at.y:.0f} {at.z:.0f}")
@@ -691,6 +725,13 @@ def generate_waypoints(
             logger.info(f"  CTF objectives: {len(objectives)} waypoint(s) placed on them")
         if region is not None:
             _report_region(region, converter, waypoints)
+        bud = getattr(converter, "budget_report", None)
+        if bud:
+            logger.info(
+                f"  Budget {converter.budget}: {bud['candidates']} candidates ({bud['protected']} protected), "
+                f"{bud['dropped_unreachable']} unreachable dropped, {bud['thinned']} thinned ({bud.get('floating', 0)} floating thinned first) "
+                f"(covering distance {bud['cover']} u), {bud.get('dropped_flagged', 0)} flagged dropped"
+            )
         team_hz = getattr(converter, "team_hazard_waypoints", 0)
         if team_hz:
             logger.info(f"  Team-only hazards: {team_hz} waypoint(s) barred to one team")
@@ -846,6 +887,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         author=args.author,
         density=args.density,
         max_waypoints=args.max_waypoints,
+        budget=args.budget,
         agent_height=args.agent_height,
         agent_radius=args.agent_radius,
         step_height=args.step_height,
