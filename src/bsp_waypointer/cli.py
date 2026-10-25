@@ -718,7 +718,8 @@ def generate_waypoints(
                 f"{grounding['floorless']} without a floor dropped; {grounding['snapped']} put "
                 f"on the floor ({grounding['merged']} merged); {grounding['avoided']} on avoid points; "
                 f"{grounding.get('wade', 0)} on a water surface lowered to the floor "
-                f"({grounding.get('wade_merged', 0)} folded into a floor sample)"
+                f"({grounding.get('wade_merged', 0)} folded into a floor sample); "
+                f"{grounding.get('button_reseated', 0)} button(s) moved out of a wall"
             )
             for at, kind, why in getattr(converter, "grounding_dropped", [])[:40]:
                 logger.info(f"    dropped ({why}) {kind} at {at.x:.0f} {at.y:.0f} {at.z:.0f}")
