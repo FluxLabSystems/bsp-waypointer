@@ -233,6 +233,15 @@ def drop_flagged_plain(conv) -> int:
     if not drop or 0 in drop:
         return 0
     conv._remove_waypoints(drop)
+    _refresh_connectivity(conv)
+    return len(drop)
+
+
+ROOF_MIN_COMPONENT = 1          # a flagged component of at least this many samples can be a roof sheet
+
+
+def _refresh_connectivity(conv) -> None:
+    """Recompute the connectivity report's counts after flagged waypoints were removed."""
     wps = conv._waypoints
     n = len(wps)
     adj = [[c for c in w.connections if 0 <= c < n] for w in wps]
@@ -246,6 +255,64 @@ def drop_flagged_plain(conv) -> int:
         unreachable_sinks=len(cls.sinks),
         unreachable_islands=len(cls.islands),
     )
+
+
+def drop_roof_sheets(conv, probe=None) -> int:
+    """ADR-0398: after the connectivity pass, remove the walkable surfaces on top of a building: plain
+    samples flagged W_FL_UNREACHABLE with open sky straight above (``TracerProbe.sky_above``) whose
+    flagged neighbourhood holds nothing that means something (no spawn, pickup, door, teleporter...,
+    nothing ``is_protected``). An arena's outer roof is meshed like any floor and sampled; no spawn or
+    item connects to it, nothing routes through it, and it can be hundreds of waypoints (aim_arena_big_r2
+    373, bds_glass_house1a 562). ``drop_flagged_plain`` already removes every plain flagged sample on a
+    map over its budget; this is the rule for a map under it. Outdoor ground a spawn or pickup uses is
+    never touched: a sample goes only when its whole flagged weak component is plain.
+    Returns how many samples went; refreshes the connectivity report."""
+    wps = conv._waypoints
+    tracer = conv.ray_tracer if getattr(conv, "use_ray_tracing", False) else None
+    if tracer is None or not wps:
+        return 0
+    if probe is None:
+        if not (hasattr(tracer, "trace_brushes") and hasattr(tracer, "bsp")):
+            return 0
+        from .geometry_probe import TracerProbe
+
+        probe = TracerProbe(tracer)
+    n = len(wps)
+    flagged = [bool(w.flags & WaypointFlag.W_FL_UNREACHABLE) for w in wps]
+    und: List[List[int]] = [[] for _ in range(n)]
+    for i, w in enumerate(wps):
+        for c in w.connections:
+            if 0 <= c < n and c != i:
+                und[i].append(c)
+                und[c].append(i)
+    comp = [-1] * n
+    comps: List[List[int]] = []
+    for s in range(n):
+        if not flagged[s] or comp[s] >= 0:
+            continue
+        comp[s] = len(comps)
+        mem, stack = [s], [s]
+        while stack:
+            u = stack.pop()
+            for v in und[u]:
+                if flagged[v] and comp[v] < 0:
+                    comp[v] = len(comps)
+                    mem.append(v)
+                    stack.append(v)
+        comps.append(mem)
+    drop: Set[int] = set()
+    for mem in comps:
+        if len(mem) < ROOF_MIN_COMPONENT:
+            continue
+        if any(not _only_flag_unreachable(wps[i]) for i in mem):
+            continue
+        for i in mem:
+            if probe.sky_above((wps[i].origin.x, wps[i].origin.y, wps[i].origin.z)) is True:
+                drop.add(i)
+    if not drop or 0 in drop:
+        return 0
+    conv._remove_waypoints(drop)
+    _refresh_connectivity(conv)
     return len(drop)
 
 

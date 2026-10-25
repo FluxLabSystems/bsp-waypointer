@@ -293,6 +293,7 @@ class HL2DMWaypointConverter:
         self.max_waypoints = max_waypoints
         self.budget = None if budget is None else max(2, min(int(budget), max_waypoints))
         self.budget_report: Dict[str, int] = {}
+        self.roof_dropped = 0
         self.ray_tracer = ray_tracer
         self.use_ray_tracing = use_ray_tracing
         self.region = region
@@ -427,6 +428,13 @@ class HL2DMWaypointConverter:
             from .budget import drop_flagged_plain
 
             self.budget_report["dropped_flagged"] = drop_flagged_plain(self)
+            self.budget_report["final"] = len(self._waypoints)
+
+        # ADR-0398: the roof of an arena (plain, flagged, open sky above) is no use to a bot either
+        from .budget import drop_roof_sheets
+
+        self.roof_dropped = drop_roof_sheets(self)
+        if self.roof_dropped and self.budget_report:
             self.budget_report["final"] = len(self._waypoints)
 
         # Assign additional flags based on geometry

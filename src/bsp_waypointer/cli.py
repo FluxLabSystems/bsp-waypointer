@@ -734,6 +734,11 @@ def generate_waypoints(
                 f"{bud['dropped_unreachable']} unreachable dropped, {bud['thinned']} thinned ({bud.get('floating', 0)} floating thinned first) "
                 f"(covering distance {bud['cover']} u), {bud.get('dropped_flagged', 0)} flagged dropped"
             )
+        if getattr(converter, "roof_dropped", 0):
+            logger.info(
+                f"  Roof sheets: {converter.roof_dropped} flagged plain sample(s) with open sky above "
+                f"and nothing of the match near them removed (ADR-0398)"
+            )
         team_hz = getattr(converter, "team_hazard_waypoints", 0)
         if team_hz:
             logger.info(f"  Team-only hazards: {team_hz} waypoint(s) barred to one team")
