@@ -293,7 +293,7 @@ class HL2DMWaypointConverter:
         # (origin, subtype name, reason) of every waypoint the grounding pass dropped
         self.grounding_dropped: List[Tuple[Vector3, str, str]] = []
         self.grounding_report: Dict[str, int] = {
-            "embedded": 0, "lifted": 0, "snapped": 0, "floorless": 0, "avoided": 0, "merged": 0,
+            "embedded": 0, "lifted": 0, "ledge": 0, "snapped": 0, "floorless": 0, "avoided": 0, "merged": 0,
             "wade": 0, "wade_merged": 0,
         }
         self.region_report: Dict[str, int] = {"samples_dropped": 0, "teleporters_dropped": 0}
@@ -902,6 +902,10 @@ class HL2DMWaypointConverter:
            stairs) or, when it is in a wall, a clip room or a thick block,
            dropped; the old test read CONTENTS_SOLID only, so a clip room was
            full of waypoints;
+        2b. a standing spot (a navmesh sample too) with a player-solid brush across its hull
+           within 16 units above its feet (a func_detail shelf, which no point test or leaf
+           contents shows) is put on that brush's top when a player fits there
+           (lift_onto_ledge, ADR-0379);
         3. an item, weapon, spawn or objective waypoint (not a navmesh sample,
            which is on the mesh by construction) with no world floor within
            GROUND_REACH below it is put on the floor under it if there is one
@@ -931,6 +935,14 @@ class HL2DMWaypointConverter:
                 continue
             if tracer is None or not _is_standing_spot(wp):
                 continue
+            if not (wp.flags & _AIRBORNE_BY_DESIGN) and hasattr(tracer, "lift_onto_ledge"):
+                # a detail/grate brush just above the feet is across the hull but in no point test
+                up = tracer.lift_onto_ledge(o)
+                if up is not None:
+                    wp.origin = up
+                    snapped.add(i)
+                    o = up
+                    report["ledge"] += 1
             if _blocked_at_standing_height(tracer, o, low=wp.sampled):
                 if self._lift_waypoint(wp):
                     snapped.add(i)       # may now sit on another waypoint: merged below
