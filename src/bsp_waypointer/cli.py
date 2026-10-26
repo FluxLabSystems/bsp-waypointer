@@ -339,6 +339,15 @@ Examples:
         help="Navmesh cell height in units (default: 4.0)",
     )
 
+    general.add_argument(
+        "--no-spawn-hub",
+        action="store_true",
+        help=(
+            "When fewer than a quarter of the spawns are in or reach the main component (a lobby only "
+            "teleporters leave), do not make the component holding most spawns the main one"
+        ),
+    )
+
     # Ray tracing options
     raytracing = parser.add_argument_group("Ray Tracing Options")
     raytracing.add_argument(
@@ -458,6 +467,12 @@ def log_connectivity_report(report: dict, total_waypoints: int) -> None:
         f"{report['bridges']} bridge edges (all traversal-checked), "
         f"{report['spawn_coverage']:.0%} of spawns can reach it"
     )
+    if "spawn_hub" in report:
+        logger.info(
+            "  Spawn hub: fewer than a quarter of the spawns reach the usual main component; "
+            + (f"the component holding {report['spawn_hub_spawns']} of the spawns is main"
+               if report["spawn_hub"] else f"the routes brought it only {report['spawn_hub_spawns']} spawns, the usual rule stays")
+        )
     if report.get("pockets"):
         logger.info(
             f"  Pockets: {report['pockets']} holding a pickup or spawn searched, "
@@ -579,6 +594,7 @@ def generate_waypoints(
     playable_margin: float = SKYBOX_MARGIN,
     avoid_points: Optional[Path] = None,
     engine_check: bool = True,
+    spawn_hub: bool = True,
 ) -> int:
     """
     Generate waypoints from a BSP file.
@@ -716,6 +732,7 @@ def generate_waypoints(
             avoid_points=avoid_list,
             budget=budget or None,
             engine_check=engine_check,
+            spawn_hub=spawn_hub,
         )
         waypoints = converter.convert(navmesh, entities, ladders, objectives=objectives)
         logger.info(f"  Total waypoints: {len(waypoints)}")
@@ -940,6 +957,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         playable_margin=args.playable_margin,
         avoid_points=args.avoid_points,
         engine_check=not args.no_engine_check,
+        spawn_hub=not args.no_spawn_hub,
     )
 
 

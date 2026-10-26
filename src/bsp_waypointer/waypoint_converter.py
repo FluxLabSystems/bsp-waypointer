@@ -7,6 +7,7 @@ HL2DM-specific flags and metadata.
 
 from __future__ import annotations
 
+import copy
 import math
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
@@ -99,6 +100,10 @@ _SPECIAL_ENDS = (
     WaypointFlag.W_FL_LADDER | WaypointFlag.W_FL_LIFT | WaypointFlag.W_FL_TELE_ENTRANCE
     | WaypointFlag.W_FL_TELE_EXIT
 )
+# ADR-0398: the spawn hub (see _spawn_hub_anchor)
+SPAWN_HUB_TRIGGER = 0.25
+SPAWN_HUB_KEEP = 0.5
+SPAWN_HUB_MIN_SPAWNS = 4
 # bot_nav_verify.cpp SKIP_ENDS: an edge with one of these at an end is no walk and is not swept
 _ENGINE_SKIP_ENDS = (
     WaypointFlag.W_FL_LADDER | WaypointFlag.W_FL_LIFT | WaypointFlag.W_FL_TELE_ENTRANCE
@@ -291,6 +296,7 @@ class HL2DMWaypointConverter:
         avoid_points: Optional[List[Tuple[Vector3, float]]] = None,
         budget: Optional[int] = None,
         engine_check: bool = True,
+        spawn_hub: bool = True,
     ):
         """
         Initialize the waypoint converter.
@@ -320,6 +326,8 @@ class HL2DMWaypointConverter:
         self.avoid_points = list(avoid_points or [])
         # ADR-0398: refuse an edge RCBot3's own load-time check would cut (engine_check.py)
         self.engine_check = bool(engine_check)
+        # ADR-0398: a map whose spawns the usual main component does not serve gets the component they are in
+        self.spawn_hub = bool(spawn_hub)
         self._engine: Optional[EngineEdgeCheck] = None
         self._tele_volumes: List[Tuple[Vector3, Vector3, Vector3]] = []
         self.teleport_entry_report: Dict[str, int] = {"entrances": 0, "isolated": 0, "joined": 0, "edges": 0}
@@ -1460,6 +1468,30 @@ class HL2DMWaypointConverter:
             return False                                  # the column the fall runs down
         return foot.distance_to_2d(target) < 1.0 or tracer.walk_path_clear(foot, target)
 
+    def _spawn_hub_anchor(self, sccs, spawns) -> Optional[Vector3]:
+        """
+        ADR-0398: where the match is when the usual main component is not. CLH_City, CLC_ThePlace, CLC_Hostel,
+        coop_blame log2 and cg_gravgunonly have every spawn in a lobby that only teleporters leave: the
+        largest component a spawn reaches is the city beyond, 2 % of the spawns reach it, and the lobby with
+        its spawns and pickups is flagged whole. When fewer than SPAWN_HUB_TRIGGER of the spawns are in or
+        reach the usual main component, the component holding the most spawns is made the anchor the pocket
+        routes lead to (the lanes of the lobby join its hall), and it becomes main if the routes bring it
+        SPAWN_HUB_KEEP of the spawns. Returns a point in that component, or None to keep the usual rule.
+        """
+        if len(spawns) < SPAWN_HUB_MIN_SPAWNS:
+            return None
+        adj = self._adjacency()
+        main = set(sccs[choose_main_component(adj, sccs, spawns)])
+        cls = classify_against_main(adj, main)
+        reaching = sum(1 for s in spawns if s in main or s in cls.sources)
+        if reaching >= SPAWN_HUB_TRIGGER * len(spawns):
+            return None
+        sset = set(spawns)
+        best = max(sccs, key=lambda c: (sum(1 for v in c if v in sset), len(c)))
+        if not any(v in sset for v in best):
+            return None
+        return self._waypoints[min(best)].origin
+
     def _ensure_connectivity(self) -> None:
         """
         Stage C: prove what can be proven, flag the rest (never invent).
@@ -1526,8 +1558,14 @@ class HL2DMWaypointConverter:
 
         # C1b (MC2 ADR-0377): a pocket with a pickup, a spawn or an objective gets a searched route
         # to main on the ground, every hop proven; what no route reaches stays flagged below
+        hub_anchor: Optional[Vector3] = None
+        hub_snapshot = None
+        if len(sccs) > 1 and self.spawn_hub:
+            hub_anchor = self._spawn_hub_anchor(sccs, spawns)
+            if hub_anchor is not None:
+                hub_snapshot = (copy.deepcopy(self._waypoints), list(self._push_waypoint_links))
         if len(sccs) > 1:
-            pocket = bridge_pockets(self)
+            pocket = bridge_pockets(self, anchor=hub_anchor)
             rep.update(pocket)
             n = len(self._waypoints)
             spawns = [
@@ -1536,9 +1574,34 @@ class HL2DMWaypointConverter:
             ]
             sccs = strongly_connected_components(self._adjacency())
 
+        # ADR-0398: the spawn hub stands only if the routes made it hold most of the spawns
+        hub_main: Optional[Set[int]] = None
+        if hub_anchor is not None:
+            at = min(range(n), key=lambda v: self._waypoints[v].origin.distance_to(hub_anchor))
+            comp = next(c for c in sccs if at in c)
+            held = sum(1 for s in spawns if s in comp)
+            if held >= SPAWN_HUB_KEEP * len(spawns):
+                hub_main = set(comp)
+            else:
+                self._waypoints, self._push_waypoint_links = hub_snapshot[0], hub_snapshot[1]
+                self._spatial_hash = {}
+                for i, w in enumerate(self._waypoints):
+                    self._add_to_spatial_hash(w.origin, i)
+                n = len(self._waypoints)
+                rep["pockets"] = 0
+                rep.update(bridge_pockets(self))
+                n = len(self._waypoints)
+                spawns = [
+                    i for i, wp in enumerate(self._waypoints)
+                    if wp.is_spawn or wp.metadata.subtype == HL2DMWaypointSubType.SPAWN_POINT
+                ]
+                sccs = strongly_connected_components(self._adjacency())
+            rep["spawn_hub"] = 1 if hub_main is not None else 0
+            rep["spawn_hub_spawns"] = held
+
         # C2: classify against the main component and flag the rest
         adj = self._adjacency()
-        main = set(sccs[choose_main_component(adj, sccs, spawns)])
+        main = hub_main if hub_main is not None else set(sccs[choose_main_component(adj, sccs, spawns)])
         cls = classify_against_main(adj, main)
         for v in cls.outside:
             self._waypoints[v].add_flag(WaypointFlag.W_FL_UNREACHABLE)
