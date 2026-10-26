@@ -103,6 +103,7 @@ _SPECIAL_ENDS = (
 # ADR-0398: the spawn hub (see _spawn_hub_anchor)
 SPAWN_HUB_TRIGGER = 0.25
 SPAWN_HUB_KEEP = 0.5
+SPAWN_HUB_SIZE_SHARE = 0.5      # and be at least this share of the size of the usual main component
 SPAWN_HUB_MIN_SPAWNS = 4
 # bot_nav_verify.cpp SKIP_ENDS: an edge with one of these at an end is no walk and is not swept
 _ENGINE_SKIP_ENDS = (
@@ -1476,7 +1477,7 @@ class HL2DMWaypointConverter:
         its spawns and pickups is flagged whole. When fewer than SPAWN_HUB_TRIGGER of the spawns are in or
         reach the usual main component, the component holding the most spawns is made the anchor the pocket
         routes lead to (the lanes of the lobby join its hall), and it becomes main if the routes bring it
-        SPAWN_HUB_KEEP of the spawns. Returns a point in that component, or None to keep the usual rule.
+        SPAWN_HUB_KEEP of the spawns and is at least SPAWN_HUB_SIZE_SHARE of its size (deathrun_iceworld_hl2: 23 spawns in a 30-waypoint start room is no match). Returns a point in that component, or None to keep the usual rule.
         """
         if len(spawns) < SPAWN_HUB_MIN_SPAWNS:
             return None
@@ -1486,6 +1487,7 @@ class HL2DMWaypointConverter:
         reaching = sum(1 for s in spawns if s in main or s in cls.sources)
         if reaching >= SPAWN_HUB_TRIGGER * len(spawns):
             return None
+        self._hub_default_size = len(main)
         sset = set(spawns)
         best = max(sccs, key=lambda c: (sum(1 for v in c if v in sset), len(c)))
         if not any(v in sset for v in best):
@@ -1580,7 +1582,8 @@ class HL2DMWaypointConverter:
             at = min(range(n), key=lambda v: self._waypoints[v].origin.distance_to(hub_anchor))
             comp = next(c for c in sccs if at in c)
             held = sum(1 for s in spawns if s in comp)
-            if held >= SPAWN_HUB_KEEP * len(spawns):
+            if (held >= SPAWN_HUB_KEEP * len(spawns)
+                    and len(comp) >= SPAWN_HUB_SIZE_SHARE * getattr(self, "_hub_default_size", 0)):
                 hub_main = set(comp)
             else:
                 self._waypoints, self._push_waypoint_links = hub_snapshot[0], hub_snapshot[1]

@@ -471,7 +471,7 @@ def log_connectivity_report(report: dict, total_waypoints: int) -> None:
         logger.info(
             "  Spawn hub: fewer than a quarter of the spawns reach the usual main component; "
             + (f"the component holding {report['spawn_hub_spawns']} of the spawns is main"
-               if report["spawn_hub"] else f"the routes brought it only {report['spawn_hub_spawns']} spawns, the usual rule stays")
+               if report["spawn_hub"] else f"it held {report['spawn_hub_spawns']} spawns after the routes and was not big enough: the usual rule stays")
         )
     if report.get("pockets"):
         logger.info(
