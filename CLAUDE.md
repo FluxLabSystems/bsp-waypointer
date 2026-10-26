@@ -73,6 +73,7 @@ This document provides comprehensive context for AI assistants working on the BS
 | Playable Region | `playable_region.py` | The 3D skybox's BSP area, the spawn/pickup box, mesh crop, waypoint audit (numpy only) |
 | Waypoint Converter | `waypoint_converter.py` | Navmesh + entities → waypoints |
 | Waypoint Budget | `budget.py` | ADR-0378: protect, drop unreachable samples, thin the dense ground with connectivity kept, drop flagged samples (`--budget`, default 1900) |
+| Engine Check | `engine_check.py` | ADR-0398: RCBot3's load-time edge check ported (NavSettle, a +-12 hull sweep over level stretches, the ground profile); the last test of `_connect_refusal` |
 | Pocket Bridge | `pocket_bridge.py` | Stage C1b (MC2 ADR-0377): a pocket with a pickup/spawn/objective gets an A* route over a 48-unit lattice to main; a pickup inside a prop's collision moves to a standing spot |
 | Graph Contract | `graph_contract.py` | Components, main-component choice, RCBot3 load-audit model (stdlib only) |
 | RCW Writer | `rcw_writer.py` | Waypoints → .rcw binary file |
@@ -338,6 +339,33 @@ its sky_camera). Rules to keep:
   flagged: a pickup inside a pipe or under a low ceiling, on a ledge only a lift or a jump pad reaches.
   `_connect_refusal` returns the name of the first rule that refuses an edge (`_can_connect` is
   `_connect_refusal(...) is None`).
+- **No edge RCBot3 would cut (ADR-0398).** RCBot3 sweeps every edge of the graph it loads
+  (`bot_nav_verify.cpp`): each end settles to the first of nine spots (its own, then eight 24 units round it)
+  where a standing hull (+-12, z 8..56) fits (none: EMBEDDED, every edge to it is cut); the ground is
+  sampled every 32 units; a +-12 wide, 18..36 high hull is swept over every level stretch and a block
+  is a WALL; a rise above 58 between samples a CLIMB, more than two samples with no ground a GAP.
+  `engine_check.EngineEdgeCheck` repeats it and is the last test in `_connect_refusal`
+  (`"engine_wall"`, `"engine_climb"`, `"engine_gap"`, `"engine_embedded"`), so Stage A, the degree
+  repair and the pocket bridge never propose such an edge. `walk_path_clear` (a 4-wide box at two
+  heights) was far looser: on dm_911_katv9_fix the engine cut 11.4 % of the edges. Calibrated on the
+  engine's own cut list (`rcbotd mc nav dump`): 97 % of its wall cuts and 98 % of its climbs found, 0.8 %
+  of the kept edges refused. It sees world brushes only: no static props, and a floor that is an entity
+  (a platform, a func_brush bridge) reads as no ground, so such an edge can be refused that the engine
+  keeps; HOVERING ends (no floor under a waypoint) are not judged here, because the engine finds
+  floors in entities this tracer cannot see. Feed `rcbotd mc nav dump`'s hovering/embedded list back
+  as `--avoid-points` (tools in the MC2 harness, `round18/avoid_from_dump.py`) to remove them: after the
+  check this raised the engine's main share (aim_arena_big_r2 71 % -> 99 %). `--no-engine-check` restores the old test.
+- **Roof sheets are dropped (ADR-0398).** After the connectivity pass `budget.drop_roof_sheets` removes plain
+  samples flagged W_FL_UNREACHABLE with open sky straight above (`TracerProbe.sky_above`) whose flagged component
+  holds nothing protected: the outer roof of an arena is meshed like a floor (aim_arena_big_r2 373, bds_glass_house1a 580).
+- **A teleporter at the bottom of a pit is walked into by dropping (ADR-0398).** `_add_teleport_entry_edges`
+  gives an entrance no waypoint reaches an edge from each waypoint at the rim within 400 units whose drop (45..450)
+  passes by its two legs (`drop_lip`, a clear column); the eye line to the entrance runs through the shaft wall, so
+  the ordinary test refused it and the area the exit leads to stayed flagged (cradle_of_filth 150 waypoints).
+- **The spawn hub (ADR-0398).** When fewer than a quarter of the spawns are in or reach the usual main component
+  (CLH_City, CLC_*: 49 spawns in a lobby that only teleporters leave, main = the city beyond), the component holding most
+  spawns is the anchor `bridge_pockets(anchor=...)` routes the other spawn and pickup pockets to, and is main when it ends with half
+  the spawns and half the size of the usual main (else the snapshot is restored). `--no-spawn-hub`.
 - **A sample on shallow water goes to the floor (ADR-0377).** The navmesh has a layer on a water surface
   as well as the pool's floor. `_wade_down` (in `_ground_waypoints`) lowers a sample resting on water
   or slime onto the floor within 64 units below (`BSPRayTracer.on_water_surface`) and folds it into a
