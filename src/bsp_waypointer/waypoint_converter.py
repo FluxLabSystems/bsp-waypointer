@@ -52,7 +52,7 @@ from .entity_analyzer import (
     Teleporter,
     WeaponSpawn,
 )
-from .engine_check import EngineEdgeCheck, usable as _engine_check_usable
+from .engine_check import EngineEdgeCheck, displacement_ground as _displacement_ground, usable as _engine_check_usable
 from .geometry_extractor import LadderSurface
 from .graph_contract import (
     choose_main_component,
@@ -1849,7 +1849,7 @@ class HL2DMWaypointConverter:
             # profile). Ladders, lifts and teleporter ends are not judged there either.
             if self.engine_check and not ((getattr(wp_a, "flags", 0) | getattr(wp_b, "flags", 0)) & _ENGINE_SKIP_ENDS):
                 if self._engine is None and _engine_check_usable(self.ray_tracer):
-                    self._engine = EngineEdgeCheck(self.ray_tracer)
+                    self._engine = EngineEdgeCheck(self.ray_tracer, disp=_displacement_ground(self.ray_tracer))
                 if self._engine is not None:
                     verdict = self._engine.refusal(wp_a.origin, wp_b.origin)
                     if verdict is not None:

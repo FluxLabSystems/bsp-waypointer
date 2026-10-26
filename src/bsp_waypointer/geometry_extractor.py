@@ -784,3 +784,13 @@ def extract_geometry_from_bsp(bsp_path: str | Path) -> Tuple[TriangleMesh, List[
     ladders = extractor.get_ladders()
 
     return mesh, ladders
+
+
+def displacement_mesh(bsp: BSPFile) -> TriangleMesh:
+    """The displacement surfaces of a parsed BSP alone (the engine check's ground, MC2 ADR-0399)."""
+    parser = BSPParser()
+    parser._bsp = bsp
+    extractor = GeometryExtractor()
+    extractor._bsp = bsp
+    extractor._parser = parser
+    return extractor._extract_displacements()
