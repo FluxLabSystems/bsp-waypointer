@@ -7,6 +7,7 @@ HL2DM-specific flags and metadata.
 
 from __future__ import annotations
 
+import copy
 import math
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
@@ -51,6 +52,7 @@ from .entity_analyzer import (
     Teleporter,
     WeaponSpawn,
 )
+from .engine_check import EngineEdgeCheck, usable as _engine_check_usable
 from .geometry_extractor import LadderSurface
 from .graph_contract import (
     choose_main_component,
@@ -93,6 +95,29 @@ RESEAT_NEIGHBOUR_RANGE = 250.0
 _AIRBORNE_BY_DESIGN = (
     WaypointFlag.W_FL_LADDER | WaypointFlag.W_FL_LIFT | WaypointFlag.W_FL_TELE_ENTRANCE
 )
+# Waypoints that are no ordinary standing spot: a drop edge into or out of them is judged by the entity
+_SPECIAL_ENDS = (
+    WaypointFlag.W_FL_LADDER | WaypointFlag.W_FL_LIFT | WaypointFlag.W_FL_TELE_ENTRANCE
+    | WaypointFlag.W_FL_TELE_EXIT
+)
+# ADR-0398: the spawn hub (see _spawn_hub_anchor)
+SPAWN_HUB_TRIGGER = 0.25
+SPAWN_HUB_KEEP = 0.5
+SPAWN_HUB_SIZE_SHARE = 0.5      # and be at least this share of the size of the usual main component
+SPAWN_HUB_MIN_SPAWNS = 4
+# bot_nav_verify.cpp SKIP_ENDS: an edge with one of these at an end is no walk and is not swept
+_ENGINE_SKIP_ENDS = (
+    WaypointFlag.W_FL_LADDER | WaypointFlag.W_FL_LIFT | WaypointFlag.W_FL_TELE_ENTRANCE
+    | WaypointFlag.W_FL_TELE_EXIT
+)
+# ADR-0398: a trigger_teleport at the bottom of a shaft or pit is entered by falling into it. The walker runs
+# off the rim and drops, so no straight line of sight joins the rim to the entrance (the shaft wall is in
+# the way) and the ordinary edge test refuses every rim waypoint; _add_teleport_entry_edges judges the
+# drop by its two legs instead. Fall limit: a fall past ~450 units hurts (HL2DM: fatal near 530).
+TELE_ENTRY_MAX_DROP = 450.0
+TELE_ENTRY_REACH = 400.0           # source waypoints this far (horizontally) from the trigger's box
+TELE_ENTRY_LIP_SLACK = 24.0        # the rim point must be this close to the trigger's box (the fall must meet it)
+TELE_ENTRY_MAX_SOURCES = 3
 # Default radius of an avoid point (--avoid-points): no waypoint stays this close
 AVOID_POINT_RADIUS = 40.0
 # MC2 ADR-0377: a navmesh sample on the surface of water over a floor this close below is a wading
@@ -271,6 +296,8 @@ class HL2DMWaypointConverter:
         region: Optional["PlayableRegion"] = None,
         avoid_points: Optional[List[Tuple[Vector3, float]]] = None,
         budget: Optional[int] = None,
+        engine_check: bool = True,
+        spawn_hub: bool = False,
     ):
         """
         Initialize the waypoint converter.
@@ -293,10 +320,19 @@ class HL2DMWaypointConverter:
         self.max_waypoints = max_waypoints
         self.budget = None if budget is None else max(2, min(int(budget), max_waypoints))
         self.budget_report: Dict[str, int] = {}
+        self.roof_dropped = 0
         self.ray_tracer = ray_tracer
         self.use_ray_tracing = use_ray_tracing
         self.region = region
         self.avoid_points = list(avoid_points or [])
+        # ADR-0398: refuse an edge RCBot3's own load-time check would cut (engine_check.py)
+        self.engine_check = bool(engine_check)
+        # ADR-0398 (opt-in: in the lab it made bots on CLH_City and CLC_ThePlace walk into the lobby's teleporters
+        # and be rescued 16-22 times a run): a map whose spawns the usual main does not serve gets the component they are in
+        self.spawn_hub = bool(spawn_hub)
+        self._engine: Optional[EngineEdgeCheck] = None
+        self._tele_volumes: List[Tuple[Vector3, Vector3, Vector3]] = []
+        self.teleport_entry_report: Dict[str, int] = {"entrances": 0, "isolated": 0, "joined": 0, "edges": 0}
         # (origin, subtype name, reason) of every waypoint the grounding pass dropped
         self.grounding_dropped: List[Tuple[Vector3, str, str]] = []
         self.grounding_report: Dict[str, int] = {
@@ -355,6 +391,8 @@ class HL2DMWaypointConverter:
             and getattr(h, "team", 0)
         ]
         self._push_waypoint_links: List[Tuple[int, object]] = []
+        self._tele_volumes: List[Tuple[Vector3, Vector3, Vector3]] = []
+        self.teleport_entry_report: Dict[str, int] = {"entrances": 0, "isolated": 0, "joined": 0, "edges": 0}
         self._navmesh = navmesh
         self._nav_index = None
 
@@ -399,6 +437,9 @@ class HL2DMWaypointConverter:
         # One-way connections out of push volumes (jump pads)
         self._add_push_connections()
 
+        # ADR-0398: the rim of a shaft with a trigger_teleport at its bottom is joined to it by a drop
+        self._add_teleport_entry_edges()
+
         # Optimize waypoint count if needed (BEFORE connectivity
         # finalization — culling can re-fragment the graph, so degree
         # repair and the connectivity guarantee must run on the final set)
@@ -427,6 +468,13 @@ class HL2DMWaypointConverter:
             from .budget import drop_flagged_plain
 
             self.budget_report["dropped_flagged"] = drop_flagged_plain(self)
+            self.budget_report["final"] = len(self._waypoints)
+
+        # ADR-0398: the roof of an arena (plain, flagged, open sky above) is no use to a bot either
+        from .budget import drop_roof_sheets
+
+        self.roof_dropped = drop_roof_sheets(self)
+        if self.roof_dropped and self.budget_report:
             self.budget_report["final"] = len(self._waypoints)
 
         # Assign additional flags based on geometry
@@ -731,6 +779,9 @@ class HL2DMWaypointConverter:
                 target_name=teleporter.target_name,
             )
             self._approach_origins.append(teleporter.exit_origin)
+            self._tele_volumes.append(
+                (teleporter.entrance_origin, teleporter.entrance_mins, teleporter.entrance_maxs)
+            )
             # Entrance waypoint
             entrance_meta = WaypointMetadata(
                 subtype=HL2DMWaypointSubType.TELEPORT_SOURCE,
@@ -1335,6 +1386,115 @@ class HL2DMWaypointConverter:
         n = len(self._waypoints)
         return [[c for c in wp.connections if 0 <= c < n] for wp in self._waypoints]
 
+    def _add_teleport_entry_edges(self) -> None:
+        """
+        ADR-0398: join a teleporter entrance nothing walks into to the waypoints at the rim above it.
+
+        A trigger_teleport at the bottom of a shaft (cradle_of_filth's canal, cok_base_v2's pits) is
+        entered by dropping into it, and the ordinary edge test cannot see that: the eye line from a rim
+        waypoint to the entrance runs through the shaft's wall ("los"), so the entrance has no inbound
+        edge, the area its exit leads to (cradle_of_filth: 150 waypoints up on the tiers) is only a way
+        down, and everything there is flagged. For an entrance (W_FL_TELE_ENTRANCE) that no waypoint
+        reaches by an ordinary edge, each waypoint within TELE_ENTRY_REACH of the trigger's box and above
+        it by a drop of at most TELE_ENTRY_MAX_DROP gets an edge to it when the drop is walkable by its
+        legs: the walk from the waypoint to the rim (BSPRayTracer.drop_lip) is clear, the rim lies over the
+        trigger's box, the column from the rim down to the entrance is clear and the entrance is a short
+        clear walk from the foot of that column. No other test is relaxed.
+        """
+        tracer = self.ray_tracer if self.use_ray_tracing else None
+        rep = self.teleport_entry_report
+        if tracer is None or not self._tele_volumes or not hasattr(tracer, "drop_lip"):
+            return
+        n = len(self._waypoints)
+        inbound = [0] * n
+        for i, wp in enumerate(self._waypoints):
+            if wp.flags & _SPECIAL_ENDS:
+                continue
+            for c in wp.connections:
+                if 0 <= c < n:
+                    inbound[c] += 1
+        entrances = [i for i, wp in enumerate(self._waypoints) if wp.has_flag(WaypointFlag.W_FL_TELE_ENTRANCE)]
+        for origin, mins, maxs in self._tele_volumes:
+            best = None
+            for i in entrances:
+                d = self._waypoints[i].origin.distance_to(origin)
+                if d <= 96.0 and (best is None or d < best[0]):
+                    best = (d, i)
+            if best is None:
+                continue
+            e = best[1]
+            rep["entrances"] += 1
+            if inbound[e] > 0:
+                continue
+            rep["isolated"] += 1
+            target = self._waypoints[e].origin
+            cx, cy = (mins.x + maxs.x) / 2.0, (mins.y + maxs.y) / 2.0
+            found: List[Tuple[float, int]] = []
+            for j in self._find_nearby_waypoints(Vector3(cx, cy, target.z), TELE_ENTRY_REACH + 600.0):
+                src = self._waypoints[j]
+                if j == e or src.flags & _SPECIAL_ENDS or src.has_flag(WaypointFlag.W_FL_TELE_EXIT):
+                    continue
+                drop = src.origin.z - target.z
+                if not CROUCH_JUMP_RISE < drop <= TELE_ENTRY_MAX_DROP:
+                    continue
+                if len(src.connections) >= MAX_PATHS_PER_WAYPOINT or e in src.connections:
+                    continue
+                dx = max(mins.x - src.origin.x, 0.0, src.origin.x - maxs.x)
+                dy = max(mins.y - src.origin.y, 0.0, src.origin.y - maxs.y)
+                if math.hypot(dx, dy) > TELE_ENTRY_REACH:
+                    continue
+                if self._tele_drop_ok(src, target, cx, cy, mins, maxs):
+                    found.append((math.hypot(dx, dy), j))
+            found.sort()
+            for _, j in found[:TELE_ENTRY_MAX_SOURCES]:
+                self._waypoints[j].add_connection(e)
+                rep["edges"] += 1
+            if found:
+                rep["joined"] += 1
+
+    def _tele_drop_ok(
+        self, src: Waypoint, target: Vector3, cx: float, cy: float, mins: Vector3, maxs: Vector3
+    ) -> bool:
+        """The two legs of a drop from `src` into the trigger box (see _add_teleport_entry_edges)."""
+        tracer = self.ray_tracer
+        a = src.origin
+        # the run from the source toward the trigger, at the source's height, ends where the ground does
+        lip = tracer.drop_lip(a, Vector3(cx, cy, a.z))
+        slack = TELE_ENTRY_LIP_SLACK
+        if not (mins.x - slack <= lip.x <= maxs.x + slack and mins.y - slack <= lip.y <= maxs.y + slack):
+            return False
+        if not tracer.walk_path_clear(a, lip):
+            return False
+        foot = Vector3(lip.x, lip.y, target.z)
+        if not tracer.walk_path_clear(foot, lip):
+            return False                                  # the column the fall runs down
+        return foot.distance_to_2d(target) < 1.0 or tracer.walk_path_clear(foot, target)
+
+    def _spawn_hub_anchor(self, sccs, spawns) -> Optional[Vector3]:
+        """
+        ADR-0398: where the match is when the usual main component is not. CLH_City, CLC_ThePlace, CLC_Hostel,
+        coop_blame log2 and cg_gravgunonly have every spawn in a lobby that only teleporters leave: the
+        largest component a spawn reaches is the city beyond, 2 % of the spawns reach it, and the lobby with
+        its spawns and pickups is flagged whole. When fewer than SPAWN_HUB_TRIGGER of the spawns are in or
+        reach the usual main component, the component holding the most spawns is made the anchor the pocket
+        routes lead to (the lanes of the lobby join its hall), and it becomes main if the routes bring it
+        SPAWN_HUB_KEEP of the spawns and is at least SPAWN_HUB_SIZE_SHARE of its size (deathrun_iceworld_hl2: 23 spawns in a 30-waypoint start room is no match). Returns a point in that component, or None to keep the usual rule.
+        """
+        if len(spawns) < SPAWN_HUB_MIN_SPAWNS:
+            return None
+        adj = self._adjacency()
+        main = set(sccs[choose_main_component(adj, sccs, spawns)])
+        cls = classify_against_main(adj, main)
+        reaching = sum(1 for s in spawns if s in main or s in cls.sources)
+        if reaching >= SPAWN_HUB_TRIGGER * len(spawns):
+            return None
+        self._hub_default_size = len(main)
+        sset = set(spawns)
+        best = max(sccs, key=lambda c: (sum(1 for v in c if v in sset), len(c)))
+        if not any(v in sset for v in best):
+            return None
+        return self._waypoints[min(best)].origin
+
     def _ensure_connectivity(self) -> None:
         """
         Stage C: prove what can be proven, flag the rest (never invent).
@@ -1401,8 +1561,14 @@ class HL2DMWaypointConverter:
 
         # C1b (MC2 ADR-0377): a pocket with a pickup, a spawn or an objective gets a searched route
         # to main on the ground, every hop proven; what no route reaches stays flagged below
+        hub_anchor: Optional[Vector3] = None
+        hub_snapshot = None
+        if len(sccs) > 1 and self.spawn_hub:
+            hub_anchor = self._spawn_hub_anchor(sccs, spawns)
+            if hub_anchor is not None:
+                hub_snapshot = (copy.deepcopy(self._waypoints), list(self._push_waypoint_links))
         if len(sccs) > 1:
-            pocket = bridge_pockets(self)
+            pocket = bridge_pockets(self, anchor=hub_anchor)
             rep.update(pocket)
             n = len(self._waypoints)
             spawns = [
@@ -1411,9 +1577,35 @@ class HL2DMWaypointConverter:
             ]
             sccs = strongly_connected_components(self._adjacency())
 
+        # ADR-0398: the spawn hub stands only if the routes made it hold most of the spawns
+        hub_main: Optional[Set[int]] = None
+        if hub_anchor is not None:
+            at = min(range(n), key=lambda v: self._waypoints[v].origin.distance_to(hub_anchor))
+            comp = next(c for c in sccs if at in c)
+            held = sum(1 for s in spawns if s in comp)
+            if (held >= SPAWN_HUB_KEEP * len(spawns)
+                    and len(comp) >= SPAWN_HUB_SIZE_SHARE * getattr(self, "_hub_default_size", 0)):
+                hub_main = set(comp)
+            else:
+                self._waypoints, self._push_waypoint_links = hub_snapshot[0], hub_snapshot[1]
+                self._spatial_hash = {}
+                for i, w in enumerate(self._waypoints):
+                    self._add_to_spatial_hash(w.origin, i)
+                n = len(self._waypoints)
+                rep["pockets"] = 0
+                rep.update(bridge_pockets(self))
+                n = len(self._waypoints)
+                spawns = [
+                    i for i, wp in enumerate(self._waypoints)
+                    if wp.is_spawn or wp.metadata.subtype == HL2DMWaypointSubType.SPAWN_POINT
+                ]
+                sccs = strongly_connected_components(self._adjacency())
+            rep["spawn_hub"] = 1 if hub_main is not None else 0
+            rep["spawn_hub_spawns"] = held
+
         # C2: classify against the main component and flag the rest
         adj = self._adjacency()
-        main = set(sccs[choose_main_component(adj, sccs, spawns)])
+        main = hub_main if hub_main is not None else set(sccs[choose_main_component(adj, sccs, spawns)])
         cls = classify_against_main(adj, main)
         for v in cls.outside:
             self._waypoints[v].add_flag(WaypointFlag.W_FL_UNREACHABLE)
@@ -1652,6 +1844,16 @@ class HL2DMWaypointConverter:
                 step_height=DEFAULT_PLAYER_DIMS.step_height,
             ):
                 return "ground_steps"
+
+            # ADR-0398: what RCBot3's load-time edge check would cut (a 24-wide hull sweep, the ground
+            # profile). Ladders, lifts and teleporter ends are not judged there either.
+            if self.engine_check and not ((getattr(wp_a, "flags", 0) | getattr(wp_b, "flags", 0)) & _ENGINE_SKIP_ENDS):
+                if self._engine is None and _engine_check_usable(self.ray_tracer):
+                    self._engine = EngineEdgeCheck(self.ray_tracer)
+                if self._engine is not None:
+                    verdict = self._engine.refusal(wp_a.origin, wp_b.origin)
+                    if verdict is not None:
+                        return "engine_" + verdict
 
         return None
 

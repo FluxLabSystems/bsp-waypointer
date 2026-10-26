@@ -339,8 +339,27 @@ Examples:
         help="Navmesh cell height in units (default: 4.0)",
     )
 
+    general.add_argument(
+        "--spawn-hub",
+        action="store_true",
+        help=(
+            "When fewer than a quarter of the spawns are in or reach the main component (a lobby only "
+            "teleporters leave), make the component holding most spawns the main one (MC2 ADR-0398). Off by "
+            "default: bots in the lobby of CLH_City / CLC_ThePlace walked into its teleporters and were rescued "
+            "16-22 times a run"
+        ),
+    )
+
     # Ray tracing options
     raytracing = parser.add_argument_group("Ray Tracing Options")
+    raytracing.add_argument(
+        "--no-engine-check",
+        action="store_true",
+        help=(
+            "Do not refuse the edges RCBot3's load-time edge check would cut (a 24-wide hull sweep and the "
+            "ground profile, MC2 ADR-0398); the old walk test alone"
+        ),
+    )
     raytracing.add_argument(
         "--no-raytracing",
         action="store_true",
@@ -450,6 +469,12 @@ def log_connectivity_report(report: dict, total_waypoints: int) -> None:
         f"{report['bridges']} bridge edges (all traversal-checked), "
         f"{report['spawn_coverage']:.0%} of spawns can reach it"
     )
+    if "spawn_hub" in report:
+        logger.info(
+            "  Spawn hub: fewer than a quarter of the spawns reach the usual main component; "
+            + (f"the component holding {report['spawn_hub_spawns']} of the spawns is main"
+               if report["spawn_hub"] else f"it held {report['spawn_hub_spawns']} spawns after the routes and was not big enough: the usual rule stays")
+        )
     if report.get("pockets"):
         logger.info(
             f"  Pockets: {report['pockets']} holding a pickup or spawn searched, "
@@ -570,6 +595,8 @@ def generate_waypoints(
     keep_skybox: bool = False,
     playable_margin: float = SKYBOX_MARGIN,
     avoid_points: Optional[Path] = None,
+    engine_check: bool = True,
+    spawn_hub: bool = False,
 ) -> int:
     """
     Generate waypoints from a BSP file.
@@ -706,6 +733,8 @@ def generate_waypoints(
             region=region,
             avoid_points=avoid_list,
             budget=budget or None,
+            engine_check=engine_check,
+            spawn_hub=spawn_hub,
         )
         waypoints = converter.convert(navmesh, entities, ladders, objectives=objectives)
         logger.info(f"  Total waypoints: {len(waypoints)}")
@@ -733,6 +762,17 @@ def generate_waypoints(
                 f"  Budget {converter.budget}: {bud['candidates']} candidates ({bud['protected']} protected), "
                 f"{bud['dropped_unreachable']} unreachable dropped, {bud['thinned']} thinned ({bud.get('floating', 0)} floating thinned first) "
                 f"(covering distance {bud['cover']} u), {bud.get('dropped_flagged', 0)} flagged dropped"
+            )
+        if getattr(converter, "roof_dropped", 0):
+            logger.info(
+                f"  Roof sheets: {converter.roof_dropped} flagged plain sample(s) with open sky above "
+                f"and nothing of the match near them removed (ADR-0398)"
+            )
+        tele = getattr(converter, "teleport_entry_report", None)
+        if tele and tele.get("isolated"):
+            logger.info(
+                f"  Teleporters: {tele['isolated']} of {tele['entrances']} entrance(s) had no way in; "
+                f"{tele['joined']} joined by {tele['edges']} drop edge(s) from the rim (ADR-0398)"
             )
         team_hz = getattr(converter, "team_hazard_waypoints", 0)
         if team_hz:
@@ -918,6 +958,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         keep_skybox=args.keep_skybox,
         playable_margin=args.playable_margin,
         avoid_points=args.avoid_points,
+        engine_check=not args.no_engine_check,
+        spawn_hub=args.spawn_hub,
     )
 
 

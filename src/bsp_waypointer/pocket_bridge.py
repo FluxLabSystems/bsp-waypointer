@@ -282,11 +282,12 @@ def _find_index(W, origin: Vector3) -> int:
     return min(range(len(W)), key=lambda v: W[v].origin.distance_to(origin))
 
 
-def bridge_pockets(conv) -> Dict[str, int]:
+def bridge_pockets(conv, anchor: Optional[Vector3] = None) -> Dict[str, int]:
     """Route every pocket that holds a wanted waypoint to the main component. Mutates conv._waypoints
     (appends route points, adds edges, moves boxed-in pickups, drops dead-area samples to stay under
     the cap). Returns counts. Waypoint indices change when samples are dropped: the caller must
-    recompute anything it kept."""
+    recompute anything it kept. With ``anchor`` (ADR-0398, the spawn hub) the component holding the waypoint
+    nearest that point is "main" instead of the usual choice."""
     from .graph_contract import choose_main_component
     rep = {"pockets": 0, "pockets_joined": 0, "pocket_waypoints": 0, "pocket_edges": 0, "pocket_standoffs": 0,
            "pocket_over_budget": 0, "pocket_dropped": 0}
@@ -300,6 +301,9 @@ def bridge_pockets(conv) -> Dict[str, int]:
         adj = conv._adjacency()
         sccs = strongly_connected_components(adj)
         main_ci = choose_main_component(adj, sccs, _spawn_nodes(W))
+        if anchor is not None:
+            at = _find_index(W, anchor)
+            main_ci = next(ci for ci, comp in enumerate(sccs) if at in comp)
         # a pocket worth a route that has not been tried yet: smallest first (cheapest, and a big
         # pocket often joins through a small one)
         todo = []
