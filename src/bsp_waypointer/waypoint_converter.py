@@ -297,7 +297,7 @@ class HL2DMWaypointConverter:
         avoid_points: Optional[List[Tuple[Vector3, float]]] = None,
         budget: Optional[int] = None,
         engine_check: bool = True,
-        spawn_hub: bool = True,
+        spawn_hub: bool = False,
     ):
         """
         Initialize the waypoint converter.
@@ -327,7 +327,8 @@ class HL2DMWaypointConverter:
         self.avoid_points = list(avoid_points or [])
         # ADR-0398: refuse an edge RCBot3's own load-time check would cut (engine_check.py)
         self.engine_check = bool(engine_check)
-        # ADR-0398: a map whose spawns the usual main component does not serve gets the component they are in
+        # ADR-0398 (opt-in: in the lab it made bots on CLH_City and CLC_ThePlace walk into the lobby's teleporters
+        # and be rescued 16-22 times a run): a map whose spawns the usual main does not serve gets the component they are in
         self.spawn_hub = bool(spawn_hub)
         self._engine: Optional[EngineEdgeCheck] = None
         self._tele_volumes: List[Tuple[Vector3, Vector3, Vector3]] = []

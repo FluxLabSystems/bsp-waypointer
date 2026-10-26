@@ -340,11 +340,13 @@ Examples:
     )
 
     general.add_argument(
-        "--no-spawn-hub",
+        "--spawn-hub",
         action="store_true",
         help=(
             "When fewer than a quarter of the spawns are in or reach the main component (a lobby only "
-            "teleporters leave), do not make the component holding most spawns the main one"
+            "teleporters leave), make the component holding most spawns the main one (MC2 ADR-0398). Off by "
+            "default: bots in the lobby of CLH_City / CLC_ThePlace walked into its teleporters and were rescued "
+            "16-22 times a run"
         ),
     )
 
@@ -594,7 +596,7 @@ def generate_waypoints(
     playable_margin: float = SKYBOX_MARGIN,
     avoid_points: Optional[Path] = None,
     engine_check: bool = True,
-    spawn_hub: bool = True,
+    spawn_hub: bool = False,
 ) -> int:
     """
     Generate waypoints from a BSP file.
@@ -957,7 +959,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         playable_margin=args.playable_margin,
         avoid_points=args.avoid_points,
         engine_check=not args.no_engine_check,
-        spawn_hub=not args.no_spawn_hub,
+        spawn_hub=args.spawn_hub,
     )
 
 

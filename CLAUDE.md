@@ -365,7 +365,9 @@ its sky_camera). Rules to keep:
 - **The spawn hub (ADR-0398).** When fewer than a quarter of the spawns are in or reach the usual main component
   (CLH_City, CLC_*: 49 spawns in a lobby that only teleporters leave, main = the city beyond), the component holding most
   spawns is the anchor `bridge_pockets(anchor=...)` routes the other spawn and pickup pockets to, and is main when it ends with half
-  the spawns and half the size of the usual main (else the snapshot is restored). `--no-spawn-hub`.
+  the spawns and half the size of the usual main (else the snapshot is restored). **Opt-in (`--spawn-hub`)**: in the lab
+  A/B (CLH_City, CLC_ThePlace, 10 runs per arm) the bots in the hub lobby walked into its teleporters, landed in the flagged city and were
+  rescued 16-22 times a run (give-ups 0.5 -> 44), where the old flagged lobby had 0; flag a teleporter whose exit is flagged before turning it on.
 - **A sample on shallow water goes to the floor (ADR-0377).** The navmesh has a layer on a water surface
   as well as the pool's floor. `_wade_down` (in `_ground_waypoints`) lowers a sample resting on water
   or slime onto the floor within 64 units below (`BSPRayTracer.on_water_surface`) and folds it into a
