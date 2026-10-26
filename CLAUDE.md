@@ -349,9 +349,13 @@ its sky_camera). Rules to keep:
   repair and the pocket bridge never propose such an edge. `walk_path_clear` (a 4-wide box at two
   heights) was far looser: on dm_911_katv9_fix the engine cut 11.4 % of the edges. Calibrated on the
   engine's own cut list (`rcbotd mc nav dump`): 97 % of its wall cuts and 98 % of its climbs found, 0.8 %
-  of the kept edges refused. It sees world brushes only: no static props, and a floor that is an entity
-  (a platform, a func_brush bridge) reads as no ground, so such an edge can be refused that the engine
-  keeps; HOVERING ends (no floor under a waypoint) are not judged here, because the engine finds
+  of the kept edges refused. Its floor probes also land on displacements (`DisplacementGround`, MC2
+  ADR-0399): without them a terrain map's ground read as none and every edge over it was a GAP the engine keeps
+  (CastleSiege_thc16c5 went from 1113 waypoints, 2 % flagged, to 30). The engine samples a pair once, from its
+  lower-index waypoint, and the profile depends on that end, so an edge is refused only when the profiles from
+  both ends cut it (ADR-0399). Displacements are no walls in its sweeps. It sees no static props, and a floor that is an entity
+  (a platform, a func_brush bridge, a func_conveyor) reads as no ground, so such an edge can be refused that the engine
+  keeps (academy_aerial_v1); HOVERING ends (no floor under a waypoint) are not judged here, because the engine finds
   floors in entities this tracer cannot see. Feed `rcbotd mc nav dump`'s hovering/embedded list back
   as `--avoid-points` (tools in the MC2 harness, `round18/avoid_from_dump.py`) to remove them: after the
   check this raised the engine's main share (aim_arena_big_r2 71 % -> 99 %). `--no-engine-check` restores the old test.

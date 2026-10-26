@@ -3,11 +3,12 @@ a floor slab (z -64..0) and a thick wall (x 190..290, z 0..200)."""
 
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from bsp_waypointer.bsp_parser import BSPLeaf, BSPNode, Brush, BrushSide
 from bsp_waypointer.constants import ContentFlags
-from bsp_waypointer.engine_check import EngineEdgeCheck, usable
+from bsp_waypointer.engine_check import DisplacementGround, EngineEdgeCheck, usable
 from bsp_waypointer.ray_tracer import BSPRayTracer
 from bsp_waypointer.vector import Plane, Vector3
 
@@ -101,10 +102,12 @@ def test_a_waypoint_a_little_inside_a_wall_is_moved_not_embedded(check):
     assert att is not None and floor == pytest.approx(0.0, abs=0.5)
 
 
-def test_results_are_cached_per_pair(check):
+def test_results_are_cached_per_pair_and_start(check):
     a, b = Vector3(-300, -500, 0), Vector3(-100, -500, 0)
     check.refusal(a, b)
+    check.refusal(b, a)
     n = len(check._pairs)
+    check.refusal(a, b)
     check.refusal(b, a)
     assert len(check._pairs) == n
 
@@ -150,3 +153,45 @@ class TestTeleportEntry:
         conv._add_teleport_entry_edges()
         assert ent not in conv._waypoints[rim].connections
         assert conv.teleport_entry_report["isolated"] == 0
+
+
+class TestDisplacements:
+    """MC2 ADR-0399: displacements are ground to the engine's floor probes."""
+
+    QUAD = (np.array([[100, -400, 0], [500, -400, 0], [500, 400, 0], [100, 400, 0]], dtype=np.float32),
+            np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int32))
+
+    def test_the_floor_is_the_highest_surface_in_the_probe(self):
+        g = DisplacementGround(*self.QUAD)
+        assert g.floor(300, 0, 18, -600) == pytest.approx(0.0)
+        assert g.floor(300, 0, -10, -600) is None      # the probe starts under the surface
+        assert g.floor(-300, 0, 18, -600) is None      # not over the displacement
+
+    def test_an_edge_over_displacement_terrain_is_no_gap(self):
+        # world floor only west of x = 100 and east of x = 500; the displacement fills the 400-unit hole
+        world = BSPRayTracer(World([((-2000, -2000, -64), (100, 2000, 0)), ((500, -2000, -64), (2000, 2000, 0))]))
+        a, b = Vector3(-50, 0, 0), Vector3(650, 0, 0)
+        assert EngineEdgeCheck(world).refusal(a, b) == "gap"
+        assert EngineEdgeCheck(world, disp=DisplacementGround(*self.QUAD)).refusal(a, b) is None
+
+
+class _OneSided(EngineEdgeCheck):
+    """A pair whose profile reads a climb when sampled from `bad_start` only."""
+
+    def __init__(self, tracer, bad_start):
+        super().__init__(tracer)
+        self.bad_start = bad_start
+
+    def _sweep(self, a, b):
+        if a is self.bad_start:
+            return [0.0, 0.0, 128.0], False
+        return [128.0, 128.0, 128.0], False
+
+
+def test_an_edge_is_refused_only_when_the_profiles_from_both_ends_cut_it():
+    tracer = BSPRayTracer(World([FLOOR]))
+    a, b = Vector3(0, 0, 0), Vector3(300, 0, 0)
+    assert _OneSided(tracer, bad_start=a).refusal(a, b) is None
+    assert _OneSided(tracer, bad_start=b).refusal(a, b) is None
+    check = EngineEdgeCheck(BSPRayTracer(World([FLOOR, WALL])))
+    assert check.refusal(Vector3(100, 0, 0), Vector3(330, 0, 0)) == "wall"
